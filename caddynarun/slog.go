@@ -76,7 +76,7 @@ func (s *SlogWrapper) Debug(msg string, args ...any) {
 	}
 }
 
-// --- Interface Guards ---
+// Interface Guards
 var (
 	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)

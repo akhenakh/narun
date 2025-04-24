@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/akhenakh/narun/nconsumer" // Import the updated nconsumer
@@ -25,7 +26,7 @@ type helloHandler struct{}
 // ServeHTTP handles the reconstructed HTTP request.
 // No changes needed here as it works with standard http interfaces.
 func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	slog.Info("handler received request",
+	slog.Debug("handler received request",
 		"method", r.Method,
 		"path", r.URL.Path,
 		"proto", r.Proto,
@@ -57,8 +58,7 @@ func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		slog.Info("processed valid request", "method", r.Method, "name", requestPayload.Name)
-		time.Sleep(50 * time.Millisecond) // Simulate work
+		slog.Debug("processed valid request", "method", r.Method, "name", requestPayload.Name)
 
 		replyPayload := map[string]string{
 			"message":       fmt.Sprintf("Hello, %s! (processed by %s)", requestPayload.Name, r.Method),
@@ -117,10 +117,13 @@ func main() {
 	logger := slog.New(logHandler).With("service", "hello-consumer") // Add service context
 	slog.SetDefault(logger)
 
-	// --- Flags remain the same ---
+	//  Flags remain the same
 	natsURL := flag.String("nats-url", DefaultNatsURL, "NATS server URL")
 	streamName := flag.String("stream", DefaultStreamName, "NATS JetStream stream name (must match gateway config)")
 	appName := flag.String("app", "hello", "Application name for this consumer (used for subject derivation)")
+	batchSize := flag.Int("batch-size", 10, "Number of messages to fetch in a batch")
+	maxConcurrent := flag.Int("concurrency", runtime.NumCPU(), "Maximum number of concurrent requests to process")
+	pollInterval := flag.Duration("poll-interval", 100*time.Millisecond, "Interval between fetch attempts when no messages")
 	flag.Parse()
 
 	// Validate required flags
@@ -135,30 +138,37 @@ func main() {
 
 	handler := &helloHandler{}
 
-	// --- Configure nconsumer Options ---
+	// Configure nconsumer Options
 	opts := nconsumer.Options{
-		NATSURL:    *natsURL,
-		AppName:    *appName,    // Pass the app name
-		StreamName: *streamName, // Pass the stream name
-		Logger:     logger,      // Pass the configured structured logger
+		NATSURL:       *natsURL,
+		AppName:       *appName,
+		StreamName:    *streamName,
+		Logger:        logger,
+		MaxConcurrent: *maxConcurrent,
+		BatchSize:     *batchSize,
+		PollInterval:  *pollInterval,
+
 		// AckWait: 30*time.Second // Example: Set custom AckWait if needed
 	}
 
-	// --- Start the consumer listener ---
-	// ListenAndServe will log the derived subject/queue it uses internally
-	slog.Info("starting NATS consumer",
+	// Start the consumer listener
+	// Start the consumer listener
+	logger.Info("Starting NATS batch consumer",
 		"app", opts.AppName,
 		"stream", opts.StreamName,
 		"nats_url", opts.NATSURL,
+		"batch_size", opts.BatchSize,
+		"max_concurrent", opts.MaxConcurrent,
+		"poll_interval", opts.PollInterval,
 	)
 
 	// ListenAndServe now uses Protobuf internally
 	err := nconsumer.ListenAndServe(opts, handler)
 	if err != nil {
-		slog.Error("NATS consumer listener failed", "error", err)
+		logger.Error("NATS consumer listener failed", "error", err)
 		os.Exit(1)
 	}
 
 	// This part might not be reached if ListenAndServe exits uncleanly
-	slog.Info("consumer listener stopped cleanly")
+	logger.Info("consumer listener stopped cleanly")
 }

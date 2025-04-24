@@ -11,10 +11,14 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug" // Added for stack trace
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	v1 "github.com/akhenakh/narun/gen/go/httprpc/v1" // Import generated proto types
+	"github.com/akhenakh/narun/internal/metrics"
 
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto" // Import proto package
@@ -26,6 +30,9 @@ type Options struct {
 	AppName       string          // Required: Application name (used to derive Subject, QueueGroup, DurableName)
 	StreamName    string          // Required: The JetStream stream this app consumes from
 	AckWait       time.Duration   // Optional: JetStream AckWait, defaults to 60 seconds
+	MaxConcurrent int             // Optional: Maximum number of concurrent requests to process (default: runtime.NumCPU())
+	BatchSize     int             // Optional: Number of messages to fetch in a batch (default: 10)
+	PollInterval  time.Duration   // Optional: Interval between fetch attempts when no messages (default: 10ms)
 	NATSOptions   []nats.Option   // Optional: Additional NATS connect options
 	ListenContext context.Context // Optional: External context for cancellation
 	Logger        *slog.Logger    // Logger to use
@@ -52,6 +59,16 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 		opts.AckWait = 60 * time.Second // JetStream default is 30s, use 60s to be safe? Or match JS default? Let's use 60s.
 	}
 
+	if opts.BatchSize <= 0 {
+		opts.BatchSize = 10 // Default batch size of 10
+	}
+	if opts.MaxConcurrent <= 0 {
+		opts.MaxConcurrent = runtime.NumCPU()
+	}
+	if opts.PollInterval <= 0 {
+		opts.PollInterval = 10 * time.Millisecond
+	}
+	// Derive subject, queue group, and durable name
 	derivedSubject := fmt.Sprintf("%s.%s", opts.StreamName, opts.AppName)
 	derivedQueueGroup := opts.AppName
 	derivedDurableName := fmt.Sprintf("%s-durable", derivedQueueGroup)
@@ -66,7 +83,15 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 		nats.ReconnectHandler(func(nc *nats.Conn) { logger.Debug("NATS client reconnected", "url", nc.ConnectedUrl()) }),
 		nats.ClosedHandler(func(nc *nats.Conn) { logger.Debug("NATS client connection closed") }),
 	}
+	// Create context for cancellation
+	ctx := opts.ListenContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	natsOpts = append(natsOpts, opts.NATSOptions...)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	nc, err := nats.Connect(opts.NATSURL, natsOpts...)
 	if err != nil {
@@ -75,89 +100,190 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	defer nc.Close()
 	logger.Info("Connected to NATS", "url", nc.ConnectedUrl())
 
-	// --- Get JetStream Context ---
+	// Create a worker pool with semaphore pattern
+	sem := make(chan struct{}, opts.MaxConcurrent)
+	var wg sync.WaitGroup
+
+	//  Get JetStream Context
 	js, err := nc.JetStream()
+
+	// Create a pull subscription instead of queue subscription
+	sub, err := js.PullSubscribe(
+		derivedSubject,
+		derivedDurableName, // Use durable name as second parameter (not queue group)
+		nats.ManualAck(),
+		nats.AckWait(opts.AckWait),
+		nats.BindStream(opts.StreamName),
+	)
+
 	if err != nil {
-		return fmt.Errorf("failed to get JetStream context: %w", err)
-	}
-	logger.Info("Obtained JetStream context")
-	// (Optional stream check unchanged)
-	_, err = js.StreamInfo(opts.StreamName)
-	if err == nats.ErrStreamNotFound {
-		logger.Warn("Stream not found by consumer, assuming gateway created it", "stream", opts.StreamName)
-	} else if err != nil {
-		logger.Warn("Could not get stream info", "stream", opts.StreamName, "error", err)
+		return fmt.Errorf("failed to create pull subscription: %w", err)
 	}
 
-	logger.Debug("Subscribing using JetStream QueueSubscribe", // Updated log
-		"app", opts.AppName,
-		"stream", opts.StreamName,
+	// Log successful subscription
+	logger.Info("Created pull subscription for batch processing",
 		"subject", derivedSubject,
-		"queue_group", derivedQueueGroup,
-		"durable", derivedDurableName)
+		"queue", derivedQueueGroup,
+		"durable", derivedDurableName,
+		"batch_size", opts.BatchSize,
+		"max_concurrent", opts.MaxConcurrent)
 
-	ctx := opts.ListenContext
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Create metrics for tracking
+	var currentWorkers atomic.Int32
+	var totalProcessed atomic.Int64
+	var batchesProcessed atomic.Int64
 
-	// --- Subscribe using JetStream ---
-	sub, err := js.QueueSubscribe(derivedSubject, derivedQueueGroup, func(msg *nats.Msg) {
-		protoReq := &v1.NatsHttpRequest{}
-		if err := proto.Unmarshal(msg.Data, protoReq); err != nil {
-			logger.Error("Error unmarshalling Protobuf request data", "error", err)
-			nakMsg(msg, "protobuf unmarshal error", logger) // NAK the JS message
-			return
-		}
+	// Main processing loop
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				logger.Info("Context canceled, stopping batch processing")
+				return
+			default:
+				// Fetch a batch of messages
+				msgs, err := sub.Fetch(opts.BatchSize, nats.MaxWait(opts.PollInterval))
 
-		// Extract reply subject
-		replySubject := protoReq.GetReplySubject()
-		if replySubject == "" {
-			logger.Error("Received request without reply_subject", "request_id", protoReq.GetRequestId())
-			nakMsg(msg, "missing reply subject", logger) // NAK the JS message
-			return
-		}
+				if err != nil {
+					if err == nats.ErrTimeout || err == context.DeadlineExceeded {
+						// This is normal when no messages are available - just continue
+						continue
+					}
 
-		// Process and publish reply
-		processMsgAndPublishReply(ctx, nc, msg, handler, protoReq, replySubject, logger) // Pass nc and replySubject
+					if ctx.Err() != nil {
+						// Context canceled during fetch - exit cleanly
+						return
+					}
 
-	}, nats.Durable(derivedDurableName), nats.ManualAck(), nats.AckWait(opts.AckWait)) // Use JS options
+					logger.Error("Error fetching batch", "error", err)
+					// Back off slightly on error
+					time.Sleep(opts.PollInterval)
+					continue
+				}
 
-	if err != nil {
-		return fmt.Errorf("failed to JetStream subscribe to subject '%s' queue '%s': %w", derivedSubject, derivedQueueGroup, err)
-	}
+				// Log batch received
+				batchSize := len(msgs)
+				batchID := batchesProcessed.Add(1)
+				logger.Debug("Received message batch",
+					"batch_id", batchID,
+					"size", batchSize,
+					"active_workers", currentWorkers.Load())
 
-	// (Shutdown logic unchanged)
-	defer func() {
-		logger.Info("Unsubscribing...")
-		if sub.IsValid() {
-			if err := sub.Unsubscribe(); err != nil {
-				logger.Error("Error during unsubscribe", "error", err)
+				// Process each message in the batch concurrently
+				for i, msg := range msgs {
+					// Add to waitgroup before starting goroutine
+					wg.Add(1)
+
+					// Acquire semaphore (blocks if max concurrency reached)
+					sem <- struct{}{}
+
+					// Track worker counts
+					workerID := currentWorkers.Add(1)
+
+					// Process message in goroutine
+					go func(msg *nats.Msg, msgIdx int) {
+						startTime := time.Now()
+
+						// Track active worker count in Prometheus
+						metrics.WorkerCount.WithLabelValues(opts.AppName, opts.StreamName).Inc()
+
+						// Ensure cleanup happens
+						defer func() {
+							<-sem // Release semaphore
+							currentWorkers.Add(-1)
+							wg.Done()
+							totalProcessed.Add(1)
+
+							// Log completion with timing
+							logger.Debug("Finished processing message",
+								"batch_id", batchID,
+								"msg_idx", msgIdx,
+								"worker_id", workerID,
+								"duration_ms", time.Since(startTime).Milliseconds())
+						}()
+
+						// Log start of processing
+						logger.Debug("Processing message",
+							"batch_id", batchID,
+							"msg_idx", msgIdx,
+							"worker_id", workerID)
+
+						// Unmarshal and process message (same as before)
+						protoReq := &v1.NatsHttpRequest{}
+						if err := proto.Unmarshal(msg.Data, protoReq); err != nil {
+							logger.Error("Error unmarshalling request",
+								"error", err,
+								"batch_id", batchID,
+								"msg_idx", msgIdx)
+							nakMsg(msg, "protobuf unmarshal error", logger)
+							return
+						}
+
+						// Extract reply subject
+						replySubject := protoReq.GetReplySubject()
+						if replySubject == "" {
+							logger.Error("Missing reply subject",
+								"request_id", protoReq.GetRequestId(),
+								"batch_id", batchID,
+								"msg_idx", msgIdx)
+							nakMsg(msg, "missing reply subject", logger)
+							return
+						}
+
+						// Process message and publish reply
+						processMsgAndPublishReply(ctx, nc, msg, handler, protoReq, replySubject, logger)
+
+					}(msg, i)
+				}
 			}
 		}
 	}()
-	logger.Info("Consumer ready and waiting for messages...")
+
+	// Setup signal handling for graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for shutdown signal
 	select {
 	case sig := <-quit:
 		logger.Info("Received signal, shutting down...", "signal", sig)
 	case <-ctx.Done():
 		logger.Info("Context cancelled, shutting down...", "reason", ctx.Err())
 	}
-	logger.Info("Draining subscription...")
-	if sub.IsValid() {
-		if err := sub.Drain(); err != nil {
-			logger.Error("Error draining subscription", "error", err)
-		}
-		logger.Info("Subscription drained")
-	} else {
-		logger.Info("Subscription already invalid, no draining needed.")
+
+	// Cancel context to stop batch processing
+	cancel()
+
+	// Wait for in-flight requests to complete
+	logger.Info("Waiting for in-flight requests to complete...",
+		"active_workers", currentWorkers.Load(),
+		"total_processed", totalProcessed.Load(),
+		"batches_processed", batchesProcessed.Load())
+
+	// Wait with timeout to prevent hanging forever
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	// Wait up to 30 seconds for graceful shutdown
+	select {
+	case <-waitCh:
+		logger.Info("All workers completed successfully")
+	case <-time.After(30 * time.Second):
+		logger.Warn("Timed out waiting for workers to complete")
 	}
-	logger.Info("Consumer exiting")
-	runtime.Goexit()
+
+	// Clean up subscription
+	if err := sub.Drain(); err != nil {
+		logger.Error("Error draining subscription", "error", err)
+	}
+
+	logger.Info("Consumer exiting",
+		"total_processed", totalProcessed.Load(),
+		"batches_processed", batchesProcessed.Load())
+
 	return nil
 }
 
@@ -173,11 +299,38 @@ func processMsgAndPublishReply(
 ) {
 	requestID := protoReq.GetRequestId() // For logging context
 	log := logger.With("request_id", requestID)
+
+	// Start the overall processing timer
+	startTime := time.Now()
+	processingStatus := "success" // Default to success, will change if errors occur
+
+	// Defer recording the overall processing time
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		// Record the processing time with app and stream from the message subject
+		// Parse subject to extract stream and app
+		parts := strings.Split(originalMsg.Subject, ".")
+		stream := ""
+		app := ""
+		if len(parts) >= 2 {
+			stream = parts[0]
+			app = parts[1]
+		}
+
+		metrics.RequestProcessingTime.WithLabelValues(
+			app,
+			stream,
+			processingStatus,
+		).Observe(duration)
+	}()
+
 	log.Debug("Processing JetStream message", "subject", originalMsg.Subject, "reply_to", replySubject)
 
 	httpRequest, err := reconstructHttpRequest(ctx, protoReq)
 	if err != nil {
 		log.Error("Error reconstructing HTTP request", "error", err)
+		processingStatus = "error" // Set status to error
+
 		nakMsg(originalMsg, "request reconstruction error", log)
 		return
 	}

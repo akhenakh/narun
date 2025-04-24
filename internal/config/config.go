@@ -48,7 +48,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config YAML: %w", err)
 	}
 
-	// --- Validation ---
+	// Validation
 	if cfg.RequestTimeoutSeconds <= 0 {
 		return nil, fmt.Errorf("request_timeout_seconds must be positive")
 	}

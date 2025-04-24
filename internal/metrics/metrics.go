@@ -30,6 +30,23 @@ var (
 		},
 		[]string{"subject", "status"}, // Status: success, timeout, error
 	)
+
+	WorkerCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "narun_worker_active_count",
+			Help: "Current number of active worker goroutines processing messages.",
+		},
+		[]string{"app", "stream"},
+	)
+
+	RequestProcessingTime = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "narun_request_processing_seconds",
+			Help:    "Time taken to process a request in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"app", "stream", "status"},
+	)
 )
 
 // Status values for NatsRequestsTotal
