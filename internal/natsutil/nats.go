@@ -2,13 +2,17 @@ package natsutil
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
+	"strings"
 	"time"
+
+	"slices"
 
 	"github.com/nats-io/nats.go"
 )
 
 // ConnectNATS establishes a connection to the NATS server.
+// (No changes needed here)
 func ConnectNATS(url string) (*nats.Conn, error) {
 	nc, err := nats.Connect(url,
 		nats.Name("NATS HTTP Gateway"),
@@ -18,53 +22,75 @@ func ConnectNATS(url string) (*nats.Conn, error) {
 		nats.ReconnectWait(2*time.Second),
 		nats.MaxReconnects(-1), // Retry forever
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-			log.Printf("NATS disconnected: %v. Will attempt reconnect.", err)
+			slog.Error(fmt.Sprintf("NATS disconnected: %v. Will attempt reconnect.", err))
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			log.Printf("NATS reconnected to %s", nc.ConnectedUrl())
+			slog.Info(fmt.Sprintf("NATS reconnected to %s", nc.ConnectedUrl()))
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			log.Printf("NATS connection closed.")
+			slog.Info("NATS connection closed.")
 		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS at %s: %w", url, err)
 	}
-	log.Printf("Connected to NATS at %s", nc.ConnectedUrl())
 	return nc, nil
 }
 
-// SetupJetStream ensures the required JetStream streams exist.
-func SetupJetStream(nc *nats.Conn, streamNames []string) (nats.JetStreamContext, error) {
+// SetupJetStream ensures the required JetStream stream exists.
+func SetupJetStream(logger *slog.Logger, nc *nats.Conn, natsStream string) (nats.JetStreamContext, error) {
+	if strings.TrimSpace(natsStream) == "" {
+		return nil, fmt.Errorf("stream name cannot be empty")
+	}
+
 	js, err := nc.JetStream(nats.PublishAsyncMaxPending(256))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
 
-	log.Printf("Checking/Creating JetStream Streams: %v", streamNames)
-	for _, streamName := range streamNames {
-		streamInfo, err := js.StreamInfo(streamName)
-		// If stream doesn't exist, create it
-		if err == nats.ErrStreamNotFound {
-			log.Printf("Stream %s not found, creating...", streamName)
-			_, err = js.AddStream(&nats.StreamConfig{
-				Name:     streamName,
-				Subjects: []string{fmt.Sprintf("tasks.%s.*", streamName)}, // Example: tasks.ORDERS.*
-				// Consider other options: Storage, Retention, Replicas etc.
-				Storage:   nats.FileStorage,     // Use FileStorage for persistence
-				Retention: nats.WorkQueuePolicy, // Ensures message consumed only once
-			})
-			if err != nil {
-				return nil, fmt.Errorf("failed to create stream %s: %w", streamName, err)
-			}
-			log.Printf("Stream %s created.", streamName)
-		} else if err != nil {
-			// Other error retrieving stream info
-			return nil, fmt.Errorf("failed to get stream info for %s: %w", streamName, err)
-		} else {
-			// Stream exists
-			log.Printf("Stream %s already exists. Config: %+v", streamName, streamInfo.Config)
-			// Optional: Update stream config if needed using js.UpdateStream()
+	logger.Info("Checking/Creating JetStream Stream", "stream", natsStream)
+
+	streamInfo, err := js.StreamInfo(natsStream)
+
+	// If stream doesn't exist, create it
+	if err == nats.ErrStreamNotFound {
+		logger.Info("Stream not found, creating", "stream", natsStream)
+
+		// Derive subjects based on the config prefix and stream name
+		// Example: If  natsStream="ORDERS", subject becomes "ORDERS.*"
+		streamSubject := fmt.Sprintf("%s.*", natsStream)
+
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     natsStream,
+			Subjects: []string{streamSubject},
+			// Consider other options: Storage, Retention, Replicas etc.
+			Storage:   nats.FileStorage,     // Use FileStorage for persistence
+			Retention: nats.WorkQueuePolicy, // Ensures message consumed only once per queue group
+			// Add other configurations as needed: MaxBytes, MaxMsgs, MaxAge, Replicas, etc.
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create stream %s: %w", natsStream, err)
+		}
+		logger.Info("Stream created", "stream", natsStream, "subject_pattern", streamSubject)
+	} else if err != nil {
+		// Other error retrieving stream info
+		return nil, fmt.Errorf("failed to get stream info for %s: %w", natsStream, err)
+	} else {
+		// Stream exists
+		logger.Info("Stream already exists", "stream", natsStream, "config", streamInfo.Config)
+		// Optional: Update stream config if needed using js.UpdateStream()
+		// Example check: Ensure the existing stream covers the required subject pattern
+		found := false
+		streamSubject := fmt.Sprintf("%s.*", natsStream)
+
+		if slices.Contains(streamInfo.Config.Subjects, streamSubject) {
+			found = true
+		}
+		if !found {
+			logger.Warn("Existing stream does not explicitly cover expected subject pattern",
+				"stream", natsStream, "expected_subject", streamSubject, "existing_subjects", streamInfo.Config.Subjects)
+			// Return an error to prevent using a stream without proper subject patterns
+			return nil, fmt.Errorf("existing stream %s does not have the required subject pattern %s", natsStream, streamSubject)
 		}
 	}
 

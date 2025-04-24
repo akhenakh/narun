@@ -1,3 +1,4 @@
+// narun/consumers/cmd/hello/main.go
 package main
 
 import (
@@ -5,34 +6,33 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
+
+	// Use the config constants for consistency
 
 	"github.com/akhenakh/narun/nconsumer"
 )
 
 const (
+	// Default values for flags
 	DefaultNatsURL    = "nats://localhost:4222"
-	DefaultSubject    = "tasks.ORDERS.hello" // CHANGED: Match the config.yaml subject
-	DefaultStreamName = "ORDERS"             // Must match the stream this subject belongs to
-	DefaultQueueGroup = "hello-workers"      // Use a queue group for load balancing
+	DefaultStreamName = "TASK" // Default stream name (should match gateway config)
 )
 
 // helloHandler implements the business logic as an http.Handler.
 type helloHandler struct{}
 
+// ServeHTTP remains unchanged
 func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Handler received request: Method=%s, Path=%s", r.Method, r.URL.Path)
+	slog.Info("handler received request", "method", r.Method, "path", r.URL.Path, "proto", r.Proto, "host", r.Host)
 
-	// --- The rest of your handler logic remains the same ---
-	// --- Specific Logic for /hello/ POST ---
-	if r.URL.Path == "/hello/" && r.Method == "POST" {
-		// Expecting a JSON body like {"name": "myname"}
+	if r.URL.Path == "/hello/" && (r.Method == "POST" || r.Method == "PUT") {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			log.Printf("Error reading request body: %v", err)
+			slog.Error("error reading request body", "error", err)
 			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 			return
 		}
@@ -42,66 +42,76 @@ func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Name string `json:"name"`
 		}
 		if err := json.Unmarshal(body, &requestPayload); err != nil {
-			log.Printf("Error unmarshalling JSON body: %v", err)
+			slog.Warn("error unmarshalling JSON body", "error", err, "body_snippet", string(body[:min(len(body), 100)])) // Log warning + snippet
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON payload"})
 			return
 		}
 
-		// Process valid request
-		log.Printf("Received name: %s", requestPayload.Name)
-		// Simulate some work
-		time.Sleep(50 * time.Millisecond)
+		slog.Info("processed valid request", "method", r.Method, "name", requestPayload.Name)
+		time.Sleep(50 * time.Millisecond) // Simulate work
 
-		// Create success response payload
 		replyPayload := map[string]string{
-			"message":       fmt.Sprintf("Hello, %s!", requestPayload.Name),
-			"received_path": r.URL.Path, // Access path from the request
+			"message":       fmt.Sprintf("Hello, %s! (processed by %s)", requestPayload.Name, r.Method),
+			"received_path": r.URL.Path,
 		}
 
-		// Send back a 200 OK with JSON body
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(replyPayload); err != nil {
-			// This write happens *after* WriteHeader, log error but can't change status
-			log.Printf("Error encoding JSON response: %v", err)
+			slog.Error("error encoding JSON response", "error", err)
 		}
 		return
 	}
 
-	// Handle other paths/methods this handler might receive (if subject covers more)
-	log.Printf("Handler received unexpected request: Path=%s, Method=%s", r.URL.Path, r.Method)
-	http.NotFound(w, r) // Or http.StatusNotImplemented, http.StatusMethodNotAllowed etc.
+	slog.Warn("handler received unexpected request", "path", r.URL.Path, "method", r.Method)
+	http.NotFound(w, r)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger := slog.New(logHandler)
+	slog.SetDefault(logger)
+
+	// --- Flags remain the same ---
 	natsURL := flag.String("nats-url", DefaultNatsURL, "NATS server URL")
-	subject := flag.String("subject", DefaultSubject, "NATS subject to subscribe to") // Default value is now correct
-	streamName := flag.String("stream", DefaultStreamName, "NATS JetStream stream name")
-	queueGroup := flag.String("queue", DefaultQueueGroup, "NATS queue group name")
+	streamName := flag.String("stream", DefaultStreamName, "NATS JetStream stream name (must match gateway config)")
+	appName := flag.String("app", "hello", "Application name for this consumer (used for subject derivation)")
 	flag.Parse()
 
-	// Create an instance of our handler
 	handler := &helloHandler{}
 
-	// Configure the NATS consumer listener options
+	// --- Update Options Instantiation ---
 	opts := nconsumer.Options{
 		NatsURL:    *natsURL,
-		Subject:    *subject, // Uses the (potentially overridden by flag) correct subject
-		StreamName: *streamName,
-		QueueGroup: *queueGroup,
-		// AckWait: 30*time.Second // Example: Set custom AckWait
+		AppName:    *appName,    // Pass the app name
+		StreamName: *streamName, // Pass the stream name
+		Logger:     logger,
+		// AckWait: 30*time.Second // Example: Set custom AckWait if needed
 	}
 
-	// Start the listener - this blocks until shutdown
-	log.Printf("Starting NATS consumer for subject %s...", *subject)
+	// --- Update Starting Log Message ---
+	// ListenAndServe will log the derived values it uses
+	slog.Info("starting NATS consumer",
+		"app", *appName,
+		"stream", *streamName,
+	)
+
 	err := nconsumer.ListenAndServe(opts, handler)
 	if err != nil {
-		log.Fatalf("NATS consumer listener failed: %v", err)
+		slog.Error("NATS consumer listener failed", "error", err)
+		os.Exit(1)
 	}
 
-	// ListenAndServe handles graceful shutdown internally now
-	log.Println("Consumer listener stopped.")
-	os.Exit(0) // Ensure exit after ListenAndServe returns
+	slog.Info("consumer listener stopped")
 }

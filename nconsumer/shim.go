@@ -43,11 +43,23 @@ func (rw *responseWriterShim) WriteHeader(statusCode int) {
 	rw.wroteHeader = true
 }
 
-// Export captured data
-func (rw *responseWriterShim) getResponseData() *ResponseData {
-	return &ResponseData{
-		StatusCode: rw.statusCode,
-		Headers:    rw.header,
-		Body:       rw.body.Bytes(),
+// copyTo copies the captured response data into a target ResponseData object.
+// It performs necessary copies to avoid aliasing issues with pooled objects.
+func (rw *responseWriterShim) copyTo(target *ResponseData) {
+	target.StatusCode = rw.statusCode
+
+	// Deep copy headers
+	for k, v := range rw.header {
+		// Create a copy of the slice
+		vc := make([]string, len(v))
+		copy(vc, v)
+		target.Headers[k] = vc
+	}
+
+	// Copy body bytes. rw.body.Bytes() already returns a copy.
+	if rw.body.Len() > 0 {
+		target.Body = rw.body.Bytes()
+	} else {
+		target.Body = nil // Ensure it's nil if empty
 	}
 }

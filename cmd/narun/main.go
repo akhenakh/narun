@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,26 +22,38 @@ import (
 )
 
 func main() {
+	// Setup structured JSON logger
+	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+	})
+	logger := slog.New(jsonHandler)
+	slog.SetDefault(logger)
+
 	configFile := flag.String("config", "config.yaml", "Path to the configuration file")
 	flag.Parse()
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		slog.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
 	}
 
 	nc, err := natsutil.ConnectNATS(cfg.NatsURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to NATS: %v", err)
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
 
-	_, err = natsutil.SetupJetStream(nc, cfg.GetStreamNames())
+	// Use the global NatsStream from the config
+	_, err = natsutil.SetupJetStream(logger, nc, cfg.NatsStream) // Pass the single stream name
 	if err != nil {
-		log.Fatalf("Failed to setup JetStream: %v", err)
+		slog.Error("Failed to setup JetStream", "error", err)
+		os.Exit(1)
 	}
 
-	httpHandler := handler.NewHttpHandler(nc, cfg)
+	httpHandler := handler.NewHttpHandler(logger, nc, cfg)
 
 	mainMux := http.NewServeMux()
 	mainMux.Handle("/", httpHandler) // Handle all paths through our handler
@@ -60,40 +72,42 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Starting main HTTP server on %s", cfg.ServerAddr)
+		slog.Info("Starting main HTTP server", "addr", cfg.ServerAddr)
 		if err := mainServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("Main HTTP server ListenAndServe error: %v", err)
+			slog.Error("Main HTTP server ListenAndServe error", "error", err)
+			os.Exit(1)
 		}
-		log.Println("Main HTTP server shut down.")
+		slog.Info("Main HTTP server shut down")
 	}()
 
 	go func() {
-		log.Printf("Starting metrics server on %s", cfg.MetricsAddr)
+		slog.Info("Starting metrics server", "addr", cfg.MetricsAddr)
 		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("Metrics server ListenAndServe error: %v", err)
+			slog.Error("Metrics server ListenAndServe error", "error", err)
+			os.Exit(1)
 		}
-		log.Println("Metrics server shut down.")
+		slog.Info("Metrics server shut down")
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutdown signal received, initiating graceful shutdown...")
+	slog.Info("Shutdown signal received, initiating graceful shutdown")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Adjust timeout as needed
 	defer cancel()
 
 	if err := mainServer.Shutdown(ctx); err != nil {
-		log.Printf("Main HTTP server shutdown error: %v", err)
+		slog.Error("Main HTTP server shutdown error", "error", err)
 	} else {
-		log.Println("Main HTTP server gracefully stopped.")
+		slog.Info("Main HTTP server gracefully stopped")
 	}
 
 	if err := metricsServer.Shutdown(ctx); err != nil {
-		log.Printf("Metrics server shutdown error: %v", err)
+		slog.Error("Metrics server shutdown error", "error", err)
 	} else {
-		log.Println("Metrics server gracefully stopped.")
+		slog.Info("Metrics server gracefully stopped")
 	}
 
-	log.Println("Server exiting.")
+	slog.Info("Server exiting")
 }
