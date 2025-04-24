@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt" // Added for error formatting in server error channel
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync" // Added for WaitGroup
 	"syscall"
 	"time"
 
@@ -22,9 +24,18 @@ import (
 )
 
 func main() {
-	// Setup structured JSON logger
+	// (Logging setup unchanged)
+	logLevel := slog.LevelInfo
+	if levelStr := os.Getenv("LOG_LEVEL"); levelStr != "" {
+		var level slog.Level
+		if err := level.UnmarshalText([]byte(levelStr)); err == nil {
+			logLevel = level
+		} else {
+			slog.Warn("Invalid LOG_LEVEL specified, using default", "level", levelStr, "default", logLevel.String())
+		}
+	}
 	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level:     slog.LevelInfo,
+		Level:     logLevel,
 		AddSource: true,
 	})
 	logger := slog.New(jsonHandler)
@@ -35,79 +46,120 @@ func main() {
 
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		slog.Error("Failed to load configuration", "error", err)
+		slog.Error("Failed to load configuration", "file", *configFile, "error", err)
 		os.Exit(1)
 	}
+	slog.Info("Configuration loaded successfully", "file", *configFile)
 
 	nc, err := natsutil.ConnectNATS(cfg.NatsURL)
 	if err != nil {
-		slog.Error("Failed to connect to NATS", "error", err)
+		slog.Error("Failed to connect to NATS", "url", cfg.NatsURL, "error", err)
 		os.Exit(1)
 	}
 	defer nc.Close()
+	slog.Info("Connected to NATS server", "url", nc.ConnectedUrl())
 
-	// Use the global NatsStream from the config
-	_, err = natsutil.SetupJetStream(logger, nc, cfg.NatsStream) // Pass the single stream name
+	// Setup JetStream and get the context
+	js, err := natsutil.SetupJetStream(logger, nc, cfg.NatsStream) // Get JS context
 	if err != nil {
-		slog.Error("Failed to setup JetStream", "error", err)
+		slog.Error("Failed to setup JetStream", "stream", cfg.NatsStream, "error", err)
 		os.Exit(1)
 	}
+	slog.Info("JetStream setup complete", "stream", cfg.NatsStream)
 
-	httpHandler := handler.NewHttpHandler(logger, nc, cfg)
+	// Pass the JetStream context to the handler
+	httpHandler := handler.NewHttpHandler(logger, nc, js, cfg) // Pass js context
 
+	// (Server mux and setup unchanged)
 	mainMux := http.NewServeMux()
-	mainMux.Handle("/", httpHandler) // Handle all paths through our handler
-
+	mainMux.Handle("/", httpHandler)
 	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler()) // Expose Prometheus metrics
-
+	metricsMux.Handle("/metrics", promhttp.Handler())
 	mainServer := &http.Server{
-		Addr:    cfg.ServerAddr,
-		Handler: mainMux,
+		Addr:              cfg.ServerAddr,
+		Handler:           mainMux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
-
 	metricsServer := &http.Server{
-		Addr:    cfg.MetricsAddr,
-		Handler: metricsMux,
+		Addr:              cfg.MetricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// (Server startup and shutdown logic unchanged)
+	serverErrChan := make(chan error, 2)
 	go func() {
 		slog.Info("Starting main HTTP server", "addr", cfg.ServerAddr)
-		if err := mainServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := mainServer.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Main HTTP server ListenAndServe error", "error", err)
-			os.Exit(1)
+			serverErrChan <- fmt.Errorf("main server error: %w", err)
+		} else {
+			slog.Info("Main HTTP server shut down")
+			serverErrChan <- nil
 		}
-		slog.Info("Main HTTP server shut down")
 	}()
-
 	go func() {
 		slog.Info("Starting metrics server", "addr", cfg.MetricsAddr)
-		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := metricsServer.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("Metrics server ListenAndServe error", "error", err)
-			os.Exit(1)
+			serverErrChan <- fmt.Errorf("metrics server error: %w", err)
+		} else {
+			slog.Info("Metrics server shut down")
+			serverErrChan <- nil
 		}
-		slog.Info("Metrics server shut down")
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	slog.Info("Shutdown signal received, initiating graceful shutdown")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Adjust timeout as needed
+	select {
+	case err := <-serverErrChan:
+		if err != nil {
+			slog.Error("Server failed to start or unexpectedly stopped", "error", err)
+		} else {
+			slog.Info("A server shut down cleanly (likely during shutdown process)")
+		}
+	case sig := <-quit:
+		slog.Info("Shutdown signal received", "signal", sig.String())
+	}
+	slog.Info("Initiating graceful shutdown...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	if err := mainServer.Shutdown(ctx); err != nil {
-		slog.Error("Main HTTP server shutdown error", "error", err)
-	} else {
-		slog.Info("Main HTTP server gracefully stopped")
+	shutdownWg := &sync.WaitGroup{}
+	shutdownWg.Add(2)
+	go func() {
+		defer shutdownWg.Done()
+		if err := mainServer.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Main HTTP server shutdown error", "error", err)
+		} else {
+			slog.Info("Main HTTP server gracefully stopped")
+		}
+	}()
+	go func() {
+		defer shutdownWg.Done()
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Metrics server shutdown error", "error", err)
+		} else {
+			slog.Info("Metrics server gracefully stopped")
+		}
+	}()
+	shutdownComplete := make(chan struct{})
+	go func() {
+		shutdownWg.Wait()
+		close(shutdownComplete)
+	}()
+	select {
+	case <-shutdownComplete:
+		slog.Info("All servers gracefully shut down.")
+	case <-shutdownCtx.Done():
+		slog.Error("Shutdown timeout exceeded.")
 	}
-
-	if err := metricsServer.Shutdown(ctx); err != nil {
-		slog.Error("Metrics server shutdown error", "error", err)
-	} else {
-		slog.Info("Metrics server gracefully stopped")
+	close(serverErrChan)
+	for err := range serverErrChan {
+		if err != nil {
+			slog.Warn("Server reported error during shutdown process", "error", err)
+		}
 	}
-
-	slog.Info("Server exiting")
+	slog.Info("Server exiting.")
 }

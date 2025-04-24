@@ -13,8 +13,6 @@ type RouteConfig struct {
 	Path    string   `yaml:"path"`
 	Methods []string `yaml:"methods"`
 	App     string   `yaml:"app"`
-	// NatsStream is now global
-	// NatsSubject is now derived
 }
 
 type Config struct {
@@ -67,6 +65,10 @@ func LoadConfig(path string) (*Config, error) {
 	// Build lookup map
 	cfg.routeMap = make(map[string]map[string]*RouteConfig)
 
+	if len(cfg.Routes) == 0 {
+		return nil, fmt.Errorf("at least one route must be defined in the configuration")
+	}
+
 	for i := range cfg.Routes {
 		route := &cfg.Routes[i] // Use pointer to the route in the slice
 
@@ -75,7 +77,10 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid route config at index %d: path cannot be empty", i)
 		}
 		if len(route.Methods) == 0 {
-			return nil, fmt.Errorf("invalid route config at index %d for path '%s': methods list cannot be empty", i, route.Path)
+			// Default to allow any method if none specified? Or require explicit methods?
+			// Let's require explicit methods for clarity.
+			// Alternatively, you could default to ["GET"] or ["GET", "POST"] etc.
+			return nil, fmt.Errorf("invalid route config at index %d for path '%s': methods list cannot be empty (consider using ['GET', 'POST', 'PUT', 'DELETE', ...])", i, route.Path)
 		}
 		if strings.TrimSpace(route.App) == "" {
 			return nil, fmt.Errorf("invalid route config at index %d for path '%s': app name cannot be empty", i, route.Path)
@@ -128,12 +133,12 @@ func (c *Config) GetNatsSubject(route *RouteConfig) string {
 }
 
 // GetStreamName returns the globally configured stream name.
-// Kept for potential compatibility, but GetStreamNames is now simpler.
 func (c *Config) GetStreamName() string {
 	return c.NatsStream
 }
 
 // GetStreamNames returns the single global stream name in a slice.
+// Used for compatibility with SetupJetStream which might handle multiple streams in future.
 func (c *Config) GetStreamNames() []string {
 	if c.NatsStream == "" {
 		return []string{} // Should not happen with validation, but safe

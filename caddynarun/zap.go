@@ -4,31 +4,39 @@ import (
 	"context"
 	"log/slog"
 
+	// Added for slog.Time support
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
+// ZapSlogHandler implements slog.Handler by writing records to a zap.Logger.
 type ZapSlogHandler struct {
 	zapLogger *zap.Logger
-	leveler   slog.Leveler // Handles minimum level
-	prefix    string       // For WithGroup support
-	attrs     []zap.Field  // For WithAttrs support
+	leveler   slog.Leveler // Handles minimum level filtering
+	prefix    string       // For WithGroup support (namespace)
+	attrs     []zap.Field  // For WithAttrs support (fields added to handler)
 }
 
 // NewZapSlogHandler creates a handler that writes slog records using zap.
+// It skips 2 caller frames by default (New + Handle) to show the correct source location.
 func NewZapSlogHandler(logger *zap.Logger, level slog.Leveler) *ZapSlogHandler {
 	if level == nil {
-		level = slog.LevelInfo // Default level
+		level = slog.LevelInfo // Default level if nil
 	}
 	return &ZapSlogHandler{
-		zapLogger: logger.WithOptions(zap.AddCallerSkip(1)), // Skip handler frames
+		// Skip this func and the Handle func frame
+		zapLogger: logger.WithOptions(zap.AddCallerSkip(2)),
 		leveler:   level,
+		attrs:     nil, // Initial attributes are empty
+		prefix:    "",  // Initial prefix is empty
 	}
 }
 
 // Enabled implements slog.Handler.
 func (h *ZapSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
-	return level >= h.leveler.Level() && h.zapLogger.Core().Enabled(slogLevelToZapLevel(level))
+	minLevel := h.leveler.Level()
+	// Check slog level first, then zap core level
+	return level >= minLevel && h.zapLogger.Core().Enabled(slogLevelToZapLevel(level))
 }
 
 // Handle implements slog.Handler.
@@ -36,64 +44,75 @@ func (h *ZapSlogHandler) Handle(_ context.Context, record slog.Record) error {
 	zapLevel := slogLevelToZapLevel(record.Level)
 
 	// Check if the level is enabled before doing any work
-	if !h.Enabled(context.Background(), record.Level) { // Use Enabled method
+	if !h.zapLogger.Core().Enabled(zapLevel) {
 		return nil
 	}
 
-	if ce := h.zapLogger.Check(zapLevel, record.Message); ce != nil {
-		// Allocate enough space upfront
-		finalFields := make([]zap.Field, 0, record.NumAttrs()+len(h.attrs)+1) // +1 for potential namespace
-
-		// Add attributes attached to the handler via WithAttrs
-		finalFields = append(finalFields, h.attrs...)
-
-		// Add attributes from the specific log record
-		record.Attrs(func(attr slog.Attr) bool {
-			finalFields = append(finalFields, slogAttrToZapField(attr))
-			return true
-		})
-
-		if h.prefix != "" {
-			// If there's a prefix (from WithGroup), create a Namespace field
-			// and pass IT FIRST, followed by the actual fields.
-			// The zap encoder (like JSONEncoder) will handle nesting based on the Namespace field.
-			nsField := zap.Namespace(h.prefix)
-			ce.Write(append([]zapcore.Field{nsField}, finalFields...)...) // Prepend namespace field
-		} else {
-			// No prefix, just write the collected fields directly.
-			ce.Write(finalFields...)
-		}
+	// Check log entry against zap logger
+	ce := h.zapLogger.Check(zapLevel, record.Message)
+	if ce == nil {
+		// Should not happen if Core().Enabled() returned true, but double-check
+		return nil
 	}
+
+	// Allocate space for handler attrs + record attrs + potential namespace
+	allFields := make([]zap.Field, 0, len(h.attrs)+record.NumAttrs()+1)
+
+	// Add attributes attached to the handler via WithAttrs
+	allFields = append(allFields, h.attrs...)
+
+	// Add attributes from the specific log record
+	record.Attrs(func(attr slog.Attr) bool {
+		allFields = append(allFields, slogAttrToZapField(attr))
+		return true // Continue iterating
+	})
+
+	// If a prefix exists (from WithGroup), add it as a namespace field.
+	// zap's JSON encoder handles nesting correctly when a Namespace field is present.
+	if h.prefix != "" {
+		// Write requires zapcore.Field, so create it here
+		nsField := zap.Namespace(h.prefix)
+		ce.Write(append([]zapcore.Field{nsField}, allFields...)...)
+	} else {
+		ce.Write(allFields...)
+	}
+
 	return nil
 }
 
 // WithAttrs implements slog.Handler.
 func (h *ZapSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	newAttrs := make([]zap.Field, 0, len(h.attrs)+len(attrs))
-	newAttrs = append(newAttrs, h.attrs...)
-	for _, attr := range attrs {
-		newAttrs = append(newAttrs, slogAttrToZapField(attr))
-	}
-	return &ZapSlogHandler{
-		zapLogger: h.zapLogger,
+	// Create a new handler instance with combined attributes
+	newHandler := &ZapSlogHandler{
+		zapLogger: h.zapLogger, // Keep the same logger (and caller skip)
 		leveler:   h.leveler,
 		prefix:    h.prefix,
-		attrs:     newAttrs,
+		// Allocate new slice and copy existing + new attributes
+		attrs: make([]zap.Field, 0, len(h.attrs)+len(attrs)),
 	}
+	newHandler.attrs = append(newHandler.attrs, h.attrs...)
+	for _, attr := range attrs {
+		newHandler.attrs = append(newHandler.attrs, slogAttrToZapField(attr))
+	}
+	return newHandler
 }
 
 // WithGroup implements slog.Handler.
 func (h *ZapSlogHandler) WithGroup(name string) slog.Handler {
-	newPrefix := name
-	if h.prefix != "" {
-		newPrefix = h.prefix + "." + name // Nest groups
-	}
-	return &ZapSlogHandler{
-		zapLogger: h.zapLogger,
+	// Create a new handler instance with the new group name (prefix)
+	newHandler := &ZapSlogHandler{
+		zapLogger: h.zapLogger, // Keep the same logger
 		leveler:   h.leveler,
-		prefix:    newPrefix, // Set/nest the group name
-		attrs:     h.attrs,   // Carry over existing attributes
+		attrs:     h.attrs, // Carry over existing attributes
 	}
+	if name == "" { // If group name is empty, it's a no-op according to slog docs
+		newHandler.prefix = h.prefix
+	} else if h.prefix == "" {
+		newHandler.prefix = name
+	} else {
+		newHandler.prefix = h.prefix + "." + name // Nest groups using dot separator
+	}
+	return newHandler
 }
 
 // Helper to convert slog.Level to zapcore.Level.
@@ -108,7 +127,7 @@ func slogLevelToZapLevel(level slog.Level) zapcore.Level {
 	case slog.LevelError:
 		return zapcore.ErrorLevel
 	default:
-		// Handle custom levels or treat as Info
+		// Handle custom levels based on their numeric value
 		if level < slog.LevelInfo {
 			return zapcore.DebugLevel
 		}
@@ -118,12 +137,15 @@ func slogLevelToZapLevel(level slog.Level) zapcore.Level {
 		if level < slog.LevelError {
 			return zapcore.WarnLevel
 		}
-		return zapcore.ErrorLevel
+		return zapcore.ErrorLevel // Treat >= Error as Error
 	}
 }
 
 // Helper to convert slog.Attr to zap.Field.
 func slogAttrToZapField(attr slog.Attr) zap.Field {
+	// Resolve the attribute value before converting
+	attr.Value = attr.Value.Resolve()
+
 	switch attr.Value.Kind() {
 	case slog.KindString:
 		return zap.String(attr.Key, attr.Value.String())
@@ -139,26 +161,24 @@ func slogAttrToZapField(attr slog.Attr) zap.Field {
 		return zap.Time(attr.Key, attr.Value.Time())
 	case slog.KindDuration:
 		return zap.Duration(attr.Key, attr.Value.Duration())
-	case slog.KindGroup: // Handle groups recursively if needed, or flatten
-		// Flattening for simplicity here
-		groupFields := make([]zap.Field, 0, len(attr.Value.Group()))
-		for _, groupAttr := range attr.Value.Group() {
-			// Add group prefix to key? Or use zap.Namespace?
-			// Let's keep it simple for now and potentially flatten keys
+	case slog.KindGroup:
+		// Convert group attributes into a nested zap object/map
+		groupAttrs := attr.Value.Group()
+		groupFields := make([]zap.Field, 0, len(groupAttrs))
+		for _, groupAttr := range groupAttrs {
 			groupFields = append(groupFields, slogAttrToZapField(groupAttr))
 		}
-		// This doesn't work directly, zap doesn't have a simple "Group" field type
-		// Option 1: Flatten (e.g., group.key) - More complex
-		// Option 2: Use zap.Any with a map - Simpler
-		groupMap := make(map[string]interface{})
-		for _, groupAttr := range attr.Value.Group() {
-			groupMap[groupAttr.Key] = groupAttr.Value.Any()
-		}
-		return zap.Any(attr.Key, groupMap)
-
-	case slog.KindAny:
-		fallthrough // Treat Any the same for zap.Any
-	default:
+		// Use zap.Object which takes fields directly for structured logging
+		return zap.Object(attr.Key, zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+			for _, f := range groupFields {
+				f.AddTo(enc)
+			}
+			return nil
+		}))
+	case slog.KindLogValuer: // Should have been resolved by attr.Value.Resolve()
+		// Fallback using Any if somehow still a LogValuer
+		return zap.Any(attr.Key, attr.Value.Any())
+	default: // KindAny, KindBytes, etc.
 		return zap.Any(attr.Key, attr.Value.Any())
 	}
 }

@@ -1,0 +1,35 @@
+edition = "2023";
+
+package httprpc.v1;
+
+import "google/protobuf/go_features.proto";
+option features.(pb.go).api_level = API_OPAQUE;
+option go_package = "github.com/akhenakh/narun/gen/go/httprpc/v1";
+
+// Helper message for HTTP headers which can have multiple values per key.
+message HeaderValues {
+  repeated string values = 1;
+}
+
+// Represents the essential parts of an HTTP request sent over NATS.
+message NatsHttpRequest {
+  string method      = 1; // e.g., "GET", "POST"
+  string path        = 2; // Raw path from URL.Path
+  string query       = 3; // Raw query string from URL.RawQuery
+  string proto       = 4; // e.g., "HTTP/1.1"
+  map<string, HeaderValues> headers = 5; // HTTP headers
+  bytes  body        = 6; // Request body
+  string remote_addr = 7; // Optional: Client IP:port if available
+  string request_uri = 8; // Original request URI
+  string host        = 9; // Host header or server name
+  string reply_subject = 10; // REQUIRED: Core NATS subject for the reply
+  string request_id    = 11; // Optional: Unique ID for correlation/logging
+}
+
+// Represents the essential parts of an HTTP response sent back over NATS.
+message NatsHttpResponse {
+  int32 status_code = 1; // HTTP status code (e.g., 200, 404)
+  map<string, HeaderValues> headers = 2; // HTTP headers
+  bytes body        = 3; // Response body
+  // string request_id = 4; // Optional: Echo request_id back for correlation
+}

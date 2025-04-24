@@ -3,6 +3,8 @@ package nconsumer
 import (
 	"bytes"
 	"net/http"
+
+	v1 "github.com/akhenakh/narun/gen/go/httprpc/v1"
 )
 
 // responseWriterShim implements http.ResponseWriter to capture the response
@@ -43,23 +45,24 @@ func (rw *responseWriterShim) WriteHeader(statusCode int) {
 	rw.wroteHeader = true
 }
 
-// copyTo copies the captured response data into a target ResponseData object.
-// It performs necessary copies to avoid aliasing issues with pooled objects.
-func (rw *responseWriterShim) copyTo(target *ResponseData) {
-	target.StatusCode = rw.statusCode
+// copyToProto copies the captured response data into a target NatsHttpResponse object.
+// It uses the proto setters (Opaque API style).
+func (rw *responseWriterShim) copyToProto(target *v1.NatsHttpResponse) {
+	target.SetStatusCode(int32(rw.statusCode))
 
-	// Deep copy headers
-	for k, v := range rw.header {
-		// Create a copy of the slice
-		vc := make([]string, len(v))
-		copy(vc, v)
-		target.Headers[k] = vc
+	headers := make(map[string]*v1.HeaderValues)
+	for key, values := range rw.header {
+		if len(values) > 0 {
+			headerVal := &v1.HeaderValues{}
+			headerVal.SetValues(values)
+			headers[key] = headerVal
+		}
 	}
+	target.SetHeaders(headers)
 
-	// Copy body bytes. rw.body.Bytes() already returns a copy.
 	if rw.body.Len() > 0 {
-		target.Body = rw.body.Bytes()
+		target.SetBody(rw.body.Bytes())
 	} else {
-		target.Body = nil // Ensure it's nil if empty
+		target.SetBody(nil)
 	}
 }

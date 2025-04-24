@@ -9,15 +9,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/akhenakh/narun/internal/natsutil" // Use natsutil for JetStream setup
-	"github.com/akhenakh/narun/nconsumer"         // Use nconsumer types and pooling
+	v1 "github.com/akhenakh/narun/gen/go/httprpc/v1" // Import generated proto types
+	"github.com/akhenakh/narun/internal/natsutil"    // Use natsutil for JetStream setup
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/fxamacker/cbor/v2" // CBOR encoding
 	"github.com/nats-io/nats.go"
-	"go.uber.org/zap" // Caddy uses Zap logger
+	"go.uber.org/zap"                  // Caddy uses Zap logger
+	"google.golang.org/protobuf/proto" // Import proto package
 )
 
 func init() {
@@ -48,34 +48,30 @@ type Handler struct {
 // RouteConfig defines a single routing rule from HTTP to NATS app.
 type RouteConfig struct {
 	Path    string   `json:"path"`
-	Methods []string `json:"methods"`
+	Methods []string `json:"methods"` // Should be uppercase
 	App     string   `json:"app"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID: "http.handlers.narun",
-		// This New function correctly returns a *Handler, which implements
-		// the necessary interfaces (Provisioner, Validator, etc.)
+		ID:  "http.handlers.narun",
 		New: func() caddy.Module { return new(Handler) },
 	}
 }
 
 // Provision sets up the handler instance. Connects to NATS, validates config.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger(h) // Get Caddy's zap logger
+	h.logger = ctx.Logger(h)
 	h.routesMu.Lock()
 	defer h.routesMu.Unlock()
 
-	// ... (rest of the config validation and route map building as before) ...
+	// Validate and normalize config
 	if h.NatsURL == "" {
 		h.NatsURL = nats.DefaultURL
-		h.logger.Debug("using default nats url", zap.String("url", h.NatsURL))
 	}
 	if h.RequestTimeout <= 0 {
-		h.RequestTimeout = caddy.Duration(30 * time.Second) // Default timeout
-		h.logger.Debug("using default request timeout", zap.Duration("timeout", time.Duration(h.RequestTimeout)))
+		h.RequestTimeout = caddy.Duration(30 * time.Second)
 	}
 	h.timeout = time.Duration(h.RequestTimeout)
 
@@ -86,12 +82,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("invalid nats_stream name '%s': contains invalid characters", h.NatsStream)
 	}
 	if len(h.Routes) == 0 {
-		return fmt.Errorf("at least one 'route' must be configured")
+		return fmt.Errorf("at least one 'route' must be configured within the narun block")
 	}
 
+	// Build route map
 	h.routeMap = make(map[string]map[string]*RouteConfig)
 	for i := range h.Routes {
-		route := &h.Routes[i]
+		route := &h.Routes[i] // Get pointer to modify methods in place if needed
+
 		if strings.TrimSpace(route.Path) == "" {
 			return fmt.Errorf("invalid route config at index %d: path cannot be empty", i)
 		}
@@ -109,6 +107,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			h.routeMap[route.Path] = make(map[string]*RouteConfig)
 		}
 
+		// Normalize methods to uppercase and store
+		normalizedMethods := make([]string, 0, len(route.Methods))
 		for _, method := range route.Methods {
 			upperMethod := strings.ToUpper(strings.TrimSpace(method))
 			if upperMethod == "" {
@@ -117,7 +117,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			if _, ok := h.routeMap[route.Path][upperMethod]; ok {
 				return fmt.Errorf("duplicate route defined for path '%s' and method '%s'", route.Path, upperMethod)
 			}
-			h.routeMap[route.Path][upperMethod] = route
+			h.routeMap[route.Path][upperMethod] = route // Point to the original route config struct
+			normalizedMethods = append(normalizedMethods, upperMethod)
 			h.logger.Debug("provisioned route",
 				zap.String("path", route.Path),
 				zap.String("method", upperMethod),
@@ -125,32 +126,33 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				zap.String("nats_stream", h.NatsStream),
 			)
 		}
+		// Update the route's methods to be uppercase for consistency (optional, but cleaner)
+		route.Methods = normalizedMethods
 	}
+
 	// Connect to NATS and Setup JetStream (only once per instance)
 	h.initOnce.Do(func() {
-
+		// Create slog handler wrapping Caddy's zap logger
+		// Use Info level as default, adjust if needed
 		slogHandler := NewZapSlogHandler(h.logger, slog.LevelInfo)
-
-		// Create the actual *slog.Logger instance
 		slogLogger := slog.New(slogHandler)
 
 		// Connect NATS
-		conn, err := natsutil.ConnectNATS(h.NatsURL)
+		conn, err := natsutil.ConnectNATS(h.NatsURL) // Assuming natsutil handles defaults
 		if err != nil {
 			h.initErr = fmt.Errorf("failed to connect to NATS at %s: %w", h.NatsURL, err)
-			// Use Caddy's logger directly for initialization errors
 			h.logger.Error("NATS connection failed", zap.String("url", h.NatsURL), zap.Error(h.initErr))
 			return
 		}
 		h.nc = conn
 		h.logger.Info("connected to NATS", zap.String("url", h.nc.ConnectedUrl()))
 
-		jsCtx, err := natsutil.SetupJetStream(slogLogger, h.nc, h.NatsStream) // Now passing the correct type
+		// Setup JetStream using the single stream name
+		jsCtx, err := natsutil.SetupJetStream(slogLogger, h.nc, h.NatsStream)
 		if err != nil {
 			h.initErr = fmt.Errorf("failed to setup JetStream stream '%s': %w", h.NatsStream, err)
-			// Use the slogLogger for logging the error, which routes back to zap
 			slogLogger.Error("JetStream setup failed", "stream", h.NatsStream, "error", err)
-			h.nc.Close()
+			h.nc.Close() // Clean up connection if JS setup fails
 			h.nc = nil
 			return
 		}
@@ -162,7 +164,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		return h.initErr
 	}
 	if h.nc == nil || !h.nc.IsConnected() {
-		return fmt.Errorf("NATS connection is not active")
+		// This case should ideally be covered by initErr, but check again
+		return fmt.Errorf("NATS connection is not active after initialization attempt")
 	}
 
 	return nil
@@ -177,10 +180,10 @@ func (h *Handler) Validate() error {
 		return fmt.Errorf("nats_stream is required")
 	}
 	if len(h.routeMap) == 0 && len(h.Routes) > 0 {
-		// This indicates Provisioning likely failed before building the map
-		return fmt.Errorf("routes configured but internal route map not built (provisioning error?)")
+		// This indicates Provisioning likely failed before building the map or no routes were valid
+		return fmt.Errorf("routes configured but internal route map not built (provisioning error or invalid routes?)")
 	}
-	// Note: NATS connection health is implicitly checked in ServeHTTP
+	// Note: NATS connection health is implicitly checked in ServeHTTP before use
 
 	return nil
 }
@@ -197,32 +200,38 @@ func (h *Handler) Cleanup() error {
 
 // ServeHTTP handles the incoming HTTP request.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Ensure NATS connection is still valid (it might drop after provisioning)
+	// (Keep NATS connection check unchanged)
 	if h.nc == nil || !h.nc.IsConnected() {
-		h.logger.Error("NATS connection not available", zap.String("path", r.URL.Path))
+		h.logger.Error("NATS connection not available for request handling",
+			zap.String("path", r.URL.Path),
+			zap.String("method", r.Method))
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("NATS connection unavailable"))
-		return nil // We handled the response
+		fmt.Fprint(w, "NATS connection unavailable")
+		return nil
 	}
 
 	path := r.URL.Path
 	method := r.Method
 
-	//  Find Route
-	h.routesMu.RLock() // Read lock for accessing routeMap
+	// (Keep route lookup unchanged)
+	h.routesMu.RLock()
 	methodsForPath, pathFound := h.routeMap[path]
 	var routeCfg *RouteConfig
 	if pathFound {
-		routeCfg = methodsForPath[method] // Method lookup expects uppercase already from Provision
+		routeCfg = methodsForPath[strings.ToUpper(method)]
 	}
-	h.routesMu.RUnlock() // Release lock
+	h.routesMu.RUnlock()
 
 	if routeCfg == nil {
-		// No matching route configured for this handler, pass to the next handler in the chain
+		// (Keep next handler logic unchanged)
+		h.logger.Debug("request did not match any narun routes, passing to next handler",
+			zap.String("method", method),
+			zap.String("path", path),
+		)
 		return next.ServeHTTP(w, r)
 	}
 
-	//  Route Found - Handle via NATS
+	// Route Found - Handle via NATS
 	natsSubject := fmt.Sprintf("%s.%s", h.NatsStream, routeCfg.App)
 	startTime := time.Now()
 
@@ -230,6 +239,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		zap.String("method", method),
 		zap.String("path", path),
 		zap.String("app", routeCfg.App),
+		zap.String("nats_stream", h.NatsStream),
 		zap.String("nats_subject", natsSubject),
 	)
 
@@ -238,43 +248,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if err != nil {
 		h.logger.Error("error reading request body", zap.Error(err), zap.String("path", path))
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Failed to read request body"))
-		return nil // Handled
+		fmt.Fprint(w, "Failed to read request body")
+		return nil
 	}
 	defer r.Body.Close()
 
-	//  Prepare NATS Request
-	normalizedReq := nconsumer.GetRequestData()
-	defer nconsumer.PutRequestData(normalizedReq) // Ensure it's put back
+	// Prepare NATS Request (Protobuf) using Opaque API
+	protoReq := &v1.NatsHttpRequest{}
+	protoReq.SetMethod(method)
+	protoReq.SetPath(path)
+	protoReq.SetQuery(r.URL.RawQuery)
+	protoReq.SetProto(r.Proto)
+	protoReq.SetBody(body)
+	protoReq.SetRemoteAddr(r.RemoteAddr)
+	protoReq.SetRequestUri(r.RequestURI)
+	protoReq.SetHost(r.Host)
 
-	normalizedReq.Method = method
-	normalizedReq.Path = path
-	for k, v := range r.Header {
-		vc := make([]string, len(v))
-		copy(vc, v)
-		normalizedReq.Headers[k] = vc
+	// Create headers map
+	headers := make(map[string]*v1.HeaderValues)
+	for key, values := range r.Header {
+		if len(values) > 0 {
+			// Create a HeaderValues instance and set its values
+			headerVal := &v1.HeaderValues{}
+			headerVal.SetValues(values)
+			headers[key] = headerVal
+		}
 	}
-	normalizedReq.Query = r.URL.RawQuery
-	normalizedReq.Body = body
-	normalizedReq.Proto = r.Proto
-	normalizedReq.Host = r.Host
-	normalizedReq.RequestURI = r.RequestURI
-	normalizedReq.RemoteAddr = r.RemoteAddr
+	protoReq.SetHeaders(headers)
 
-	cborReqPayload, err := cbor.Marshal(normalizedReq)
+	protoReqPayload, err := proto.Marshal(protoReq)
 	if err != nil {
-		h.logger.Error("error marshalling request to CBOR", zap.Error(err), zap.String("subject", natsSubject))
+		h.logger.Error("error marshalling request to Protobuf", zap.Error(err), zap.String("subject", natsSubject))
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Internal server error (encoding request)"))
-		return nil // Handled
+		fmt.Fprint(w, "Internal server error (encoding request)")
+		return nil
 	}
 
-	// Send NATS Request
-	natsMsg, err := h.nc.Request(natsSubject, cborReqPayload, h.timeout)
+	// Send NATS Request (unchanged)
+	natsMsg, err := h.nc.Request(natsSubject, protoReqPayload, h.timeout)
 
-	// Handle NATS Response/Error
+	// Handle NATS Response/Error (unchanged)
 	if err != nil {
-		// TODO: Add Metrics
 		statusCode := http.StatusInternalServerError
 		respBody := "Internal server error (NATS communication)"
 		if err == nats.ErrTimeout {
@@ -285,45 +299,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			h.logger.Error("NATS request error", zap.String("subject", natsSubject), zap.Error(err))
 		}
 		w.WriteHeader(statusCode)
-		w.Write([]byte(respBody))
-		return nil // Handled
+		fmt.Fprint(w, respBody)
+		return nil
 	}
 
-	// Process NATS Reply
+	// Process NATS Reply (Protobuf)
 	h.logger.Debug("received NATS reply", zap.String("subject", natsSubject), zap.Int("reply_size", len(natsMsg.Data)))
 
-	normalizedResp := nconsumer.GetResponseData()
-	defer nconsumer.PutResponseData(normalizedResp) // Ensure it's put back
-
-	err = cbor.Unmarshal(natsMsg.Data, &normalizedResp)
+	protoResp := &v1.NatsHttpResponse{}
+	err = proto.Unmarshal(natsMsg.Data, protoResp)
 	if err != nil {
-		h.logger.Error("error unmarshalling CBOR response", zap.Error(err), zap.String("subject", natsSubject))
+		h.logger.Error("error unmarshalling Protobuf response", zap.Error(err), zap.String("subject", natsSubject))
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Internal server error (decoding response)"))
-		return nil // Handled
+		fmt.Fprint(w, "Internal server error (decoding response)")
+		return nil
 	}
 
-	// Write HTTP Response
-	if normalizedResp.Headers != nil {
-		for key, values := range normalizedResp.Headers {
-			if key == "Content-Type" && len(values) > 0 {
-				w.Header().Del(key)
-			}
-			for _, value := range values {
+	// Write HTTP Response using getters
+	respHeaders := protoResp.GetHeaders()
+	for key, headerValues := range respHeaders {
+		if headerValues != nil {
+			for _, value := range headerValues.GetValues() {
 				w.Header().Add(key, value)
 			}
 		}
 	}
 
-	statusCode := normalizedResp.StatusCode
+	statusCode := int(protoResp.GetStatusCode())
 	if statusCode == 0 {
 		statusCode = http.StatusOK
 	}
 
 	w.WriteHeader(statusCode)
 
-	if normalizedResp.Body != nil {
-		_, writeErr := w.Write(normalizedResp.Body)
+	respBody := protoResp.GetBody()
+	if respBody != nil {
+		_, writeErr := w.Write(respBody)
 		if writeErr != nil {
 			h.logger.Error("error writing response body", zap.Error(writeErr), zap.Int("status", statusCode))
 		}
@@ -336,19 +347,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		zap.Duration("duration", time.Since(startTime)),
 	)
 
-	return nil // Indicate we handled the request
+	return nil
 }
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name ("narun")
+
+	// Optional arguments after directive? No, expect block.
 	if d.NextArg() {
-		return d.ArgErr()
+		return d.ArgErr() // No args expected here, only block
 	}
 
-	h.Routes = []RouteConfig{}
+	h.Routes = []RouteConfig{} // Initialize routes for this block
 
-	for d.NextBlock(0) { // Open brace {
+	// Parse the block
+	for d.NextBlock(0) {
 		option := d.Val()
 		switch option {
 		case "nats_url":
@@ -370,25 +384,37 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 		case "route":
-			var rc RouteConfig
-			args := d.RemainingArgs()
+			args := d.RemainingArgs() // Get all args on the line: path app [METHOD...]
 			if len(args) < 2 {
 				return d.Errf("route requires at least path and app name: route <path> <app> [METHOD...]")
 			}
-			rc.Path = args[0]
-			rc.App = args[1]
+			rc := RouteConfig{
+				Path: args[0],
+				App:  args[1],
+			}
 			if len(args) > 2 {
-				rc.Methods = args[2:]
+				rc.Methods = args[2:] // Methods will be normalized (uppercased) in Provision
 			} else {
-				rc.Methods = []string{} // Will be validated in Provision
+				// If no methods specified, should we default?
+				// Let's require explicit methods for clarity. Provision will check len > 0.
+				rc.Methods = []string{}
 			}
 			h.Routes = append(h.Routes, rc)
 		default:
 			return d.Errf("unrecognized narun option: %s", option)
 		}
 	}
-	// It's okay now if no routes are defined in a block, maybe it's just setting defaults?
-	// Although the top-level check in Provision will still require at least one route overall.
+
+	// Basic validation after parsing the block
+	if h.NatsStream == "" {
+		// Stream is mandatory per handler block
+		return d.Err("nats_stream is required within the narun block")
+	}
+	if len(h.Routes) == 0 {
+		// At least one route is needed per handler block
+		return d.Err("at least one 'route' directive is required within the narun block")
+	}
+
 	return nil
 }
 
@@ -399,18 +425,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	if err != nil {
 		return nil, err
 	}
-	// Methods check moved to Provision
+	// Further validation (like method checks, NATS connection) happens in Provision
 	return &m, nil
 }
 
-// Interface guards should reflect the pointer receiver for interfaces implemented by Handler
+// Interface guards
 var (
-	_ caddy.Module                = (*Handler)(nil) // Check pointer type satisfies Module
+	_ caddy.Module                = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddy.Validator             = (*Handler)(nil)
 	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
-	// Keep the ZapSlogHandler guard as is, it's a separate type
+	// Ensure ZapSlogHandler still implements slog.Handler
 	_ slog.Handler = (*ZapSlogHandler)(nil)
 )

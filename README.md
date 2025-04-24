@@ -15,13 +15,13 @@ In many architectures, services expose HTTP APIs. However, leveraging a message 
 
 1.  It listens for standard HTTP requests on a configured address.
 2.  Based on the request path and method, it looks up a corresponding NATS subject in its configuration.
-3.  It marshals the essential parts of the `http.Request` (method, path, headers, body, query params) into a structured format (CBOR).
+3.  It marshals the essential parts of the `http.Request` (method, path, headers, body, query params) into a structured format (Protocol buffer).
 4.  It sends this payload as a NATS request message to the configured subject, waiting for a reply.
 5.  Backend NATS consumers (built using the `nconsumer` library or similar logic) receive the NATS message.
 6.  The `nconsumer` library reconstructs an `http.Request` from the message payload.
 7.  This reconstructed request is passed to a standard `http.Handler` implementation within the consumer service.
 8.  The handler processes the request and writes a response using a standard `http.ResponseWriter` (internally captured by a shim).
-9.  The `nconsumer` library marshals the captured response (status code, headers, body) into CBOR.
+9.  The `nconsumer` library marshals the captured response (status code, headers, body) into Protocol Buffer.
 10. This response payload is sent back as the NATS reply message.
 11. `narun` receives the NATS reply, unmarshals the response data.
 12. It writes the status code, headers, and body back to the original HTTP client.
@@ -34,12 +34,12 @@ In many architectures, services expose HTTP APIs. However, leveraging a message 
 *   **NATS JetStream Support:** Configured streams are automatically declared (if missing) for persistence and reliable delivery. Queue groups are used for consumer load balancing.
 *   **Observability:** Exposes Prometheus metrics for HTTP requests and NATS interactions.
 *   **Graceful Shutdown:** Handles OS signals for clean termination.
-*   **Efficient Serialization:** Uses CBOR for encoding request/response data over NATS.
+*   **Efficient Serialization:** Uses Protocol Buffer for encoding request/response data over NATS.
 
 ## Architecture Overview
 
 ```
-+-------------+      HTTP Request      +---------+      NATS Request (CBOR)     +-----------------+      Handler Logic      +-----------------+      NATS Reply (CBOR)       +---------+      HTTP Response       +-------------+
++-------------+      HTTP Request      +---------+      NATS Request (PB)  g     +-----------------+      Handler Logic      +-----------------+      NATS Reply (PB)         +---------+      HTTP Response       +-------------+
 | HTTP Client | ---------------------> | narun   | ---------------------------> | NATS JetStream  | --------------------->  | Consumer        | ----------------------->     | Consumer| -----------------------> | narun       | ---------------------> | HTTP Client   |
 |             |                        | Gateway |      (Subject: task.S.X)     | (Stream: S)     | (Listens on task.S.X)   | (http.Handler)  | (ResponseWriter Shim)        | Gateway |                          |             |
 +-------------+                        +---------+                              +-----------------+                         +-----------------+                              +---------+                          +-------------+                        +---------------+
@@ -156,14 +156,23 @@ Key metrics include:
 ## Ideas
 - self registering path consumers
 - routing to grpc
-- proxying to existing Services
-- virtual hosts supports
-- routing to a file
-- auto cert acme
-- https support
-- gvisor
-- firecracker
-- caddy plugin
+
+- node runner
+  - gvisor
+  - firecracker
+  - exec
+- [X] caddy plugin
 - metrics for inflights
 - direct response NAT
 - send consumer logs to NATS
+- [X] move to protocol buffers
+- no registry needed for "images", binary can be compiled using ko and uploaded to objectstore
+- x request id
+
+### Won't
+Because of caddy providing the feature:
+- proxying to existing Services
+- auto cert acme
+- https support
+- routing to a file
+- virtual hosts supports

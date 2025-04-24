@@ -1,4 +1,3 @@
-// narun/consumers/cmd/hello/main.go
 package main
 
 import (
@@ -11,25 +10,32 @@ import (
 	"os"
 	"time"
 
-	// Use the config constants for consistency
-
-	"github.com/akhenakh/narun/nconsumer"
+	"github.com/akhenakh/narun/nconsumer" // Import the updated nconsumer
 )
 
 const (
 	// Default values for flags
 	DefaultNatsURL    = "nats://localhost:4222"
-	DefaultStreamName = "TASK" // Default stream name (should match gateway config)
+	DefaultStreamName = "TASK" // Default stream name (must match gateway config)
 )
 
 // helloHandler implements the business logic as an http.Handler.
 type helloHandler struct{}
 
-// ServeHTTP remains unchanged
+// ServeHTTP handles the reconstructed HTTP request.
+// No changes needed here as it works with standard http interfaces.
 func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	slog.Info("handler received request", "method", r.Method, "path", r.URL.Path, "proto", r.Proto, "host", r.Host)
+	slog.Info("handler received request",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"proto", r.Proto,
+		"host", r.Host,
+		"remote_addr", r.RemoteAddr, // Log remote addr passed from gateway
+		"headers", r.Header, // Log headers passed from gateway
+	)
 
-	if r.URL.Path == "/hello/" && (r.Method == "POST" || r.Method == "PUT") {
+	// Check path and method
+	if r.URL.Path == "/hello/" && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			slog.Error("error reading request body", "error", err)
@@ -38,14 +44,16 @@ func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer r.Body.Close() // Important to close the reconstructed request body
 
+		// Input validation (simple JSON check)
 		var requestPayload struct {
 			Name string `json:"name"`
 		}
-		if err := json.Unmarshal(body, &requestPayload); err != nil {
-			slog.Warn("error unmarshalling JSON body", "error", err, "body_snippet", string(body[:min(len(body), 100)])) // Log warning + snippet
+		if err := json.Unmarshal(body, &requestPayload); err != nil || requestPayload.Name == "" {
+			slog.Warn("error unmarshalling JSON body or missing name", "error", err, "body_snippet", string(body[:min(len(body), 100)]))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON payload"})
+			// Provide a more informative error message
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON payload: 'name' field is required."})
 			return
 		}
 
@@ -55,20 +63,36 @@ func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		replyPayload := map[string]string{
 			"message":       fmt.Sprintf("Hello, %s! (processed by %s)", requestPayload.Name, r.Method),
 			"received_path": r.URL.Path,
+			"consumer_host": getHostname(), // Add some consumer-specific info
 		}
 
+		slog.Debug("json response", "payload", replyPayload)
+
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Narun-Processed-By", getHostname())
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(replyPayload); err != nil {
+			// Log error, but response headers/status likely already sent
 			slog.Error("error encoding JSON response", "error", err)
 		}
 		return
 	}
 
+	// Handle unexpected paths/methods routed to this consumer
 	slog.Warn("handler received unexpected request", "path", r.URL.Path, "method", r.Method)
 	http.NotFound(w, r)
 }
 
+// Simple helper to get hostname or default
+func getHostname() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return "unknown-consumer"
+	}
+	return host
+}
+
+// Simple min function
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -77,10 +101,20 @@ func min(a, b int) int {
 }
 
 func main() {
+	// Setup structured JSON logger for the consumer
+	logLevel := slog.LevelInfo
+	if levelStr := os.Getenv("LOG_LEVEL"); levelStr != "" {
+		var level slog.Level
+		if err := level.UnmarshalText([]byte(levelStr)); err == nil {
+			logLevel = level
+		}
+	}
 	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level:     logLevel,
+		AddSource: true,
 	})
-	logger := slog.New(logHandler)
+
+	logger := slog.New(logHandler).With("service", "hello-consumer") // Add service context
 	slog.SetDefault(logger)
 
 	// --- Flags remain the same ---
@@ -89,29 +123,42 @@ func main() {
 	appName := flag.String("app", "hello", "Application name for this consumer (used for subject derivation)")
 	flag.Parse()
 
+	// Validate required flags
+	if *appName == "" {
+		slog.Error("'-app' flag is required")
+		os.Exit(1)
+	}
+	if *streamName == "" {
+		slog.Error("'-stream' flag is required")
+		os.Exit(1)
+	}
+
 	handler := &helloHandler{}
 
-	// --- Update Options Instantiation ---
+	// --- Configure nconsumer Options ---
 	opts := nconsumer.Options{
-		NatsURL:    *natsURL,
+		NATSURL:    *natsURL,
 		AppName:    *appName,    // Pass the app name
 		StreamName: *streamName, // Pass the stream name
-		Logger:     logger,
+		Logger:     logger,      // Pass the configured structured logger
 		// AckWait: 30*time.Second // Example: Set custom AckWait if needed
 	}
 
-	// --- Update Starting Log Message ---
-	// ListenAndServe will log the derived values it uses
+	// --- Start the consumer listener ---
+	// ListenAndServe will log the derived subject/queue it uses internally
 	slog.Info("starting NATS consumer",
-		"app", *appName,
-		"stream", *streamName,
+		"app", opts.AppName,
+		"stream", opts.StreamName,
+		"nats_url", opts.NATSURL,
 	)
 
+	// ListenAndServe now uses Protobuf internally
 	err := nconsumer.ListenAndServe(opts, handler)
 	if err != nil {
 		slog.Error("NATS consumer listener failed", "error", err)
 		os.Exit(1)
 	}
 
-	slog.Info("consumer listener stopped")
+	// This part might not be reached if ListenAndServe exits uncleanly
+	slog.Info("consumer listener stopped cleanly")
 }
