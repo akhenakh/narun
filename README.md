@@ -1,6 +1,6 @@
 # narun - HTTP/gRPC to NATS Micro Gateway
 
-`narun` is a lightweight gateway that bridges incoming HTTP or gRPC requests to backend services built using the [NATS Micro](https://docs.nats.io/nats-concepts/micro) framework. It allows developers to write backend services using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC) while leveraging the benefits of a NATS-based microservice architecture.
+`narun` is a lightweight gateway that bridges incoming HTTP or gRPC requests to backend services built using the [NATS Micro]([https://docs.nats.io/nats-concepts/micro](https://github.com/nats-io/nats.go/blob/main/micro/README.md)) framework. It allows developers to write backend services using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC) while leveraging the benefits of a NATS-based microservice architecture.
 
 The companion `nconsumer` library simplifies writing these backend NATS Micro services, using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC).
 
