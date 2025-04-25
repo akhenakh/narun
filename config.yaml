@@ -7,8 +7,8 @@ nats_stream: "TASK" # JetStream stream name
 routes:
   - path: "/hello/" # Note trailing slash might matter depending on router
     methods: ["POST"]
-    app: "hello"
+    service: "hello"
 
   - path: "/goodbye"
     methods: ["GET"]
-    app: "goodbye"
+    service: "goodbye"

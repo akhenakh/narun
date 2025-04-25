@@ -7,132 +7,30 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
-	v1 "github.com/akhenakh/narun/gen/go/httprpc/v1"
 	"github.com/akhenakh/narun/internal/config"
 	"github.com/akhenakh/narun/internal/metrics"
-
-	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
-	"google.golang.org/protobuf/proto"
+	// No micro import needed here for the client side
 )
 
-// pendingReply tracks a pending NATS request/reply
-type pendingReply struct {
-	created time.Time
-	doneCh  chan *nats.Msg
-}
+// Helper to check NATS errors - needed for errors.Is
+var _ error = nats.ErrTimeout // Ensure we have the nats error variables available
 
 type HttpHandler struct {
-	NatsConn *nats.Conn
-	JsCtx    nats.JetStreamContext
+	NatsConn *nats.Conn // Use the standard NATS connection
 	Config   *config.Config
 	Logger   *slog.Logger
-
-	// Reply management
-	replyPrefix    string
-	replySub       *nats.Subscription
-	replyMu        sync.RWMutex
-	pendingReplies map[string]*pendingReply
+	// Remove serviceClient, it's not part of the standard micro client pattern
 }
 
-func NewHttpHandler(logger *slog.Logger, nc *nats.Conn, js nats.JetStreamContext, cfg *config.Config) *HttpHandler {
-	h := &HttpHandler{
-		NatsConn:       nc,
-		JsCtx:          js,
-		Config:         cfg,
-		Logger:         logger,
-		replyPrefix:    nats.NewInbox(),
-		pendingReplies: make(map[string]*pendingReply),
-	}
-
-	// Create a single wildcard subscription for all replies
-	var err error
-	h.replySub, err = h.NatsConn.SubscribeSync(h.replyPrefix + ".*")
-	if err != nil {
-		logger.Error("Failed to create reply subscription", "error", err)
-		// Continue anyway, we'll create individual subscriptions as fallback
-	} else {
-		logger.Info("Created shared reply subscription", "subject", h.replyPrefix+".*")
-
-		// Start a goroutine to process replies
-		go h.processReplies()
-	}
-
-	// Start cleanup goroutine
-	go h.cleanupExpiredRequests()
-
-	return h
-}
-
-// processReplies continuously processes incoming replies from the shared subscription
-func (h *HttpHandler) processReplies() {
-	for {
-		msg, err := h.replySub.NextMsg(60 * time.Second) // Poll with timeout
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) {
-				continue // Just a timeout, keep processing
-			}
-
-			if errors.Is(err, nats.ErrBadSubscription) || errors.Is(err, nats.ErrConnectionClosed) {
-				h.Logger.Error("Reply subscription terminated", "error", err)
-				return // Exit if subscription is invalid
-			}
-
-			h.Logger.Warn("Error receiving from reply subscription", "error", err)
-			continue
-		}
-
-		// Extract request ID from subject
-		subject := msg.Subject
-		if len(subject) <= len(h.replyPrefix)+1 { // +1 for the dot
-			h.Logger.Warn("Received reply with invalid subject", "subject", subject)
-			continue
-		}
-
-		requestID := subject[len(h.replyPrefix)+1:] // Skip prefix and dot
-
-		// Find and signal the pending reply
-		h.replyMu.Lock()
-		pendingReq, exists := h.pendingReplies[requestID]
-		if exists {
-			delete(h.pendingReplies, requestID) // Remove from map
-			h.replyMu.Unlock()
-
-			// Send the message to the waiting goroutine
-			select {
-			case pendingReq.doneCh <- msg:
-				// Successfully delivered
-			default:
-				h.Logger.Warn("Reply channel was closed", "requestID", requestID)
-			}
-		} else {
-			h.replyMu.Unlock()
-			h.Logger.Warn("Received reply for unknown request", "requestID", requestID)
-		}
-	}
-}
-
-// cleanupExpiredRequests periodically removes timed-out requests
-func (h *HttpHandler) cleanupExpiredRequests() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		timeout := h.Config.RequestTimeout
-		cutoff := time.Now().Add(-timeout)
-
-		h.replyMu.Lock()
-		for id, req := range h.pendingReplies {
-			if req.created.Before(cutoff) {
-				close(req.doneCh)
-				delete(h.pendingReplies, id)
-				h.Logger.Debug("Cleaned up expired request", "requestID", id)
-			}
-		}
-		h.replyMu.Unlock()
+func NewHttpHandler(logger *slog.Logger, nc *nats.Conn, cfg *config.Config) *HttpHandler {
+	// No need to create a micro.ServiceClient
+	return &HttpHandler{
+		NatsConn: nc,
+		Config:   cfg,
+		Logger:   logger,
 	}
 }
 
@@ -146,207 +44,125 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Logger.Info("No route found", "method", method, "path", path)
 		http.NotFound(w, r)
 		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusNotFound)).Inc()
+		// Observe duration even for not found
+		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 		return
 	}
 
-	natsSubject := h.Config.GetNatsSubject(routeCfg)
-	if natsSubject == "" {
-		h.Logger.Error("Could not derive NATS subject", "method", method, "path", path, "app", routeCfg.App)
-		http.Error(w, "Internal server error (configuration)", http.StatusInternalServerError)
-		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
-		return
-	}
-
-	requestID := uuid.NewString()
-
-	// Use shared subscription if available
-	var replySubject string
-	var doneCh chan *nats.Msg
-	var replySub *nats.Subscription
-	var err error
-
-	if h.replySub != nil && h.replySub.IsValid() {
-		// Use the shared subscription approach
-		replySubject = fmt.Sprintf("%s.%s", h.replyPrefix, requestID)
-		doneCh = make(chan *nats.Msg, 1)
-
-		// Register this request in our pending map
-		h.replyMu.Lock()
-		h.pendingReplies[requestID] = &pendingReply{
-			created: time.Now(),
-			doneCh:  doneCh,
-		}
-		h.replyMu.Unlock()
-	} else {
-		// Fallback to individual subscription if shared subscription failed
-		replySubject = nats.NewInbox()
-		replySub, err = h.NatsConn.SubscribeSync(replySubject)
-		if err != nil {
-			h.Logger.Error("Error subscribing to reply subject", "reply_subject", replySubject, "request_id", requestID, "error", err)
-			http.Error(w, "Internal server error (NATS setup)", http.StatusInternalServerError)
-			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
-			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
-			return
-		}
-		defer replySub.Unsubscribe()
-		_ = replySub.AutoUnsubscribe(1)
-	}
-
+	// Read request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		h.Logger.Error("Error reading request body", "method", method, "path", path, "nats_subject", natsSubject, "request_id", requestID, "error", err)
+		h.Logger.Error("Error reading request body", "error", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
 		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
-
-		// Clean up if using shared subscription
-		if doneCh != nil {
-			h.replyMu.Lock()
-			delete(h.pendingReplies, requestID)
-			close(doneCh)
-			h.replyMu.Unlock()
-		}
 		return
 	}
 	defer r.Body.Close()
 
-	// Prepare Protobuf Request using Setters
-	protoReq := &v1.NatsHttpRequest{}
-	protoReq.SetMethod(method)
-	protoReq.SetPath(path)
-	protoReq.SetQuery(r.URL.RawQuery)
-	protoReq.SetProto(r.Proto)
-	protoReq.SetBody(body)
-	protoReq.SetRemoteAddr(r.RemoteAddr)
-	protoReq.SetRequestUri(r.RequestURI)
-	protoReq.SetHost(r.Host)
-	protoReq.SetReplySubject(replySubject)
-	protoReq.SetRequestId(requestID)
+	// --- Create NATS Request Message with Headers ---
+	// Use GetMicroSubject which handles the service name logic from config
+	subject := h.Config.GetMicroSubject(routeCfg)
+	natsRequest := nats.NewMsg(subject)
+	natsRequest.Data = body
+	natsRequest.Header = make(nats.Header) // Use nats.Header (which is http.Header)
 
-	// Populate headers
-	headers := make(map[string]*v1.HeaderValues)
+	// 1. Copy original HTTP headers to NATS headers
 	for key, values := range r.Header {
-		if len(values) > 0 {
-			hv := new(v1.HeaderValues)
-			hv.SetValues(values)
-			headers[key] = hv
+		for _, value := range values {
+			natsRequest.Header.Add(key, value)
 		}
 	}
-	protoReq.SetHeaders(headers)
 
-	protoReqPayload, err := proto.Marshal(protoReq)
+	// 2. Add custom headers needed for reconstruction on the consumer side
+	natsRequest.Header.Set("X-Original-Method", method)
+	natsRequest.Header.Set("X-Original-Path", path)
+	natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery)
+	natsRequest.Header.Set("X-Original-Host", r.Host)
+	natsRequest.Header.Set("X-Original-RemoteAddr", r.RemoteAddr)
+	// Add any other necessary context if needed
+
+	h.Logger.Debug("Sending NATS request",
+		"subject", natsRequest.Subject,
+		"headers", natsRequest.Header, // Log headers being sent
+		"body_len", len(natsRequest.Data))
+
+	// --- Send request using standard NATS RequestMsg ---
+	natsReply, err := h.NatsConn.RequestMsg(natsRequest, h.Config.RequestTimeout)
+
+	// --- Handle NATS Response/Error ---
 	if err != nil {
-		h.Logger.Error("Error marshalling request to Protobuf", "request_id", requestID, "error", err)
-		http.Error(w, "Internal server error (encoding)", http.StatusInternalServerError)
-		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
-		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+		statusCode := http.StatusInternalServerError
+		respBody := "Internal server error (NATS communication)"
+		natsStatus := metrics.StatusError // Default status for metrics
 
-		// Clean up if using shared subscription
-		if doneCh != nil {
-			h.replyMu.Lock()
-			delete(h.pendingReplies, requestID)
-			close(doneCh)
-			h.replyMu.Unlock()
+		if errors.Is(err, nats.ErrTimeout) { // Use errors.Is for checking specific NATS errors
+			statusCode = http.StatusGatewayTimeout
+			respBody = "Request timed out waiting for backend processor"
+			h.Logger.Warn("NATS request timeout", "subject", subject, "timeout", h.Config.RequestTimeout)
+			natsStatus = metrics.StatusTimeout
+		} else {
+			h.Logger.Error("NATS request error", "subject", subject, "error", err)
+			// Keep natsStatus as metrics.StatusError
 		}
+
+		// Record NATS request metric
+		metrics.NatsRequestsTotal.WithLabelValues(subject, natsStatus).Inc()
+
+		// Send HTTP error response
+		w.WriteHeader(statusCode)
+		fmt.Fprint(w, respBody)
+
+		// Record HTTP metrics for error cases
+		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
+		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 		return
 	}
 
-	h.Logger.Debug("Publishing JetStream request", "subject", natsSubject, "reply_subject", replySubject, "request_id", requestID)
-	pubAck, err := h.JsCtx.Publish(natsSubject, protoReqPayload)
+	// --- Process Successful NATS Reply ---
+	h.Logger.Debug("Received NATS reply",
+		"subject", natsReply.Subject, // Note: This is the reply subject, not the original request subject
+		"headers", natsReply.Header,
+		"body_len", len(natsReply.Data))
 
-	var statusCode int
-	var natsStatus string
+	// Record successful NATS request metric
+	metrics.NatsRequestsTotal.WithLabelValues(subject, metrics.StatusSuccess).Inc()
 
-	if err != nil {
-		h.Logger.Error("JetStream publish error", "subject", natsSubject, "request_id", requestID, "error", err)
-		http.Error(w, "Internal server error (NATS publish)", http.StatusInternalServerError)
-		statusCode = http.StatusInternalServerError
-		natsStatus = metrics.StatusError
-
-		// Clean up if using shared subscription
-		if doneCh != nil {
-			h.replyMu.Lock()
-			delete(h.pendingReplies, requestID)
-			close(doneCh)
-			h.replyMu.Unlock()
-		}
-	} else {
-		h.Logger.Debug("JetStream publish acknowledged", "stream", pubAck.Stream, "seq", pubAck.Sequence, "request_id", requestID)
-
-		// Get reply - different approaches based on subscription type
-		var natsMsg *nats.Msg
-		var err error
-
-		if doneCh != nil {
-			// Using shared subscription - wait on channel
-			h.Logger.Debug("Waiting for reply via shared subscription", "request_id", requestID, "timeout", h.Config.RequestTimeout)
-			select {
-			case natsMsg = <-doneCh:
-				// Got a reply
-			case <-time.After(h.Config.RequestTimeout):
-				err = nats.ErrTimeout
-
-				// Clean up on timeout
-				h.replyMu.Lock()
-				delete(h.pendingReplies, requestID)
-				close(doneCh)
-				h.replyMu.Unlock()
-			}
+	// Determine HTTP status code from response header
+	statusCode := http.StatusOK // Default
+	statusStr := natsReply.Header.Get("X-Response-Status-Code")
+	if statusStr != "" {
+		if code, err := strconv.Atoi(statusStr); err == nil && code >= 100 && code < 600 {
+			statusCode = code
 		} else {
-			// Using individual subscription
-			h.Logger.Debug("Waiting for reply via individual subscription", "reply_subject", replySubject, "request_id", requestID, "timeout", h.Config.RequestTimeout)
-			natsMsg, err = replySub.NextMsg(h.Config.RequestTimeout)
-		}
-
-		if err != nil {
-			if errors.Is(err, nats.ErrTimeout) {
-				h.Logger.Warn("NATS reply timeout", "reply_subject", replySubject, "request_id", requestID)
-				http.Error(w, "Request timed out waiting for backend processor", http.StatusGatewayTimeout)
-				statusCode = http.StatusGatewayTimeout
-				natsStatus = metrics.StatusTimeout
-			} else {
-				h.Logger.Error("NATS reply subscription error", "reply_subject", replySubject, "request_id", requestID, "error", err)
-				http.Error(w, "Internal server error (NATS reply)", http.StatusInternalServerError)
-				statusCode = http.StatusInternalServerError
-				natsStatus = metrics.StatusError
-			}
-		} else {
-			natsStatus = metrics.StatusSuccess
-			h.Logger.Debug("Received reply", "reply_subject", replySubject, "request_id", requestID)
-
-			protoResp := &v1.NatsHttpResponse{}
-			err = proto.Unmarshal(natsMsg.Data, protoResp)
-			if err != nil {
-				h.Logger.Error("Error unmarshalling Protobuf response", "reply_subject", replySubject, "request_id", requestID, "error", err)
-				http.Error(w, "Internal server error (decoding response)", http.StatusInternalServerError)
-				statusCode = http.StatusInternalServerError
-			} else {
-				respHeaders := protoResp.GetHeaders()
-				for key, headerValues := range respHeaders {
-					if headerValues != nil {
-						for _, value := range headerValues.GetValues() {
-							w.Header().Add(key, value)
-						}
-					}
-				}
-
-				statusCode = int(protoResp.GetStatusCode())
-				if statusCode == 0 {
-					statusCode = http.StatusOK
-				}
-				w.WriteHeader(statusCode)
-				respBody := protoResp.GetBody()
-				if respBody != nil {
-					_, writeErr := w.Write(respBody)
-					if writeErr != nil {
-						h.Logger.Error("Error writing response body", "request_id", requestID, "error", writeErr)
-					}
-				}
-			}
+			h.Logger.Warn("Invalid or missing X-Response-Status-Code header in NATS reply", "value", statusStr, "error", err)
+			// Keep default OK or consider setting an internal server error? Sticking with OK is likely safer.
 		}
 	}
 
-	metrics.NatsRequestsTotal.WithLabelValues(natsSubject, natsStatus).Inc()
+	// Copy headers from NATS reply header to HTTP response writer
+	for key, values := range natsReply.Header {
+		// Skip the internal status code header we just processed
+		if key == "X-Response-Status-Code" || key == "Nats-Service-Error-Code" || key == "Nats-Service-Error" { // Also skip standard NATS error headers
+			continue
+		}
+		// Skip other potential internal headers if needed (e.g., starting with "Nats-")
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Write HTTP response status and body
+	w.WriteHeader(statusCode)
+	if len(natsReply.Data) > 0 {
+		_, writeErr := w.Write(natsReply.Data)
+		if writeErr != nil {
+			// Log error, but headers and status are already sent
+			h.Logger.Error("Error writing HTTP response body", "error", writeErr, "status", statusCode)
+		}
+	}
+
+	// Record HTTP metrics for successful case
 	metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
 	metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 }

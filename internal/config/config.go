@@ -12,17 +12,18 @@ import (
 type RouteConfig struct {
 	Path    string   `yaml:"path"`
 	Methods []string `yaml:"methods"`
-	App     string   `yaml:"app"`
+	// App     string   `yaml:"app"` // REMOVED
+	Service string `yaml:"service"` // NATS Micro service name (REQUIRED)
 }
 
 type Config struct {
-	NatsURL               string        `yaml:"nats_url"`
-	ServerAddr            string        `yaml:"server_addr"`
-	MetricsAddr           string        `yaml:"metrics_addr"`
-	RequestTimeoutSeconds int           `yaml:"request_timeout_seconds"`
-	NatsStream            string        `yaml:"nats_stream"` // Global stream name
-	RequestTimeout        time.Duration `yaml:"-"`           // Calculated field
-	Routes                []RouteConfig `yaml:"routes"`
+	NatsURL               string `yaml:"nats_url"`
+	ServerAddr            string `yaml:"server_addr"`
+	MetricsAddr           string `yaml:"metrics_addr"`
+	RequestTimeoutSeconds int    `yaml:"request_timeout_seconds"`
+	// NatsStream            string        `yaml:"nats_stream"` // REMOVED
+	RequestTimeout time.Duration `yaml:"-"` // Calculated field
+	Routes         []RouteConfig `yaml:"routes"`
 
 	// Internal mapping for faster lookups: map[path]map[method]*RouteConfig
 	routeMap map[string]map[string]*RouteConfig `yaml:"-"`
@@ -35,7 +36,6 @@ func LoadConfig(path string) (*Config, error) {
 		ServerAddr:            ":8080",
 		MetricsAddr:           ":9090",
 		RequestTimeoutSeconds: 30,
-		NatsStream:            "DEFAULT_STREAM", // Default stream if not specified
 	}
 
 	yamlFile, err := os.ReadFile(path)
@@ -54,14 +54,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	cfg.RequestTimeout = time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 
-	if strings.TrimSpace(cfg.NatsStream) == "" {
-		return nil, fmt.Errorf("nats_stream cannot be empty")
-	}
-	// Basic validation for NATS stream name (adjust regex/rules as needed)
-	if strings.ContainsAny(cfg.NatsStream, ".*> ") {
-		return nil, fmt.Errorf("invalid nats_stream name '%s': contains invalid characters", cfg.NatsStream)
-	}
-
 	// Build lookup map
 	cfg.routeMap = make(map[string]map[string]*RouteConfig)
 
@@ -77,17 +69,16 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid route config at index %d: path cannot be empty", i)
 		}
 		if len(route.Methods) == 0 {
-			// Default to allow any method if none specified? Or require explicit methods?
-			// Let's require explicit methods for clarity.
-			// Alternatively, you could default to ["GET"] or ["GET", "POST"] etc.
-			return nil, fmt.Errorf("invalid route config at index %d for path '%s': methods list cannot be empty (consider using ['GET', 'POST', 'PUT', 'DELETE', ...])", i, route.Path)
+			return nil, fmt.Errorf("invalid route config at index %d for path '%s': methods list cannot be empty", i, route.Path)
 		}
-		if strings.TrimSpace(route.App) == "" {
-			return nil, fmt.Errorf("invalid route config at index %d for path '%s': app name cannot be empty", i, route.Path)
+		// --- Service is now REQUIRED ---
+		if strings.TrimSpace(route.Service) == "" {
+			return nil, fmt.Errorf("invalid route config at index %d for path '%s': service name cannot be empty", i, route.Path)
 		}
-		// Basic validation for app name (part of subject)
-		if strings.ContainsAny(route.App, ".*> ") {
-			return nil, fmt.Errorf("invalid app name '%s' for path '%s': contains invalid characters", route.App, route.Path)
+		// Basic validation for service name (NATS subject component)
+		// Allowing '.' for hierarchical names, but disallowing typical wildcards/spaces
+		if strings.ContainsAny(route.Service, "*> ") {
+			return nil, fmt.Errorf("invalid service name '%s' for path '%s': contains invalid characters (*, >, space)", route.Service, route.Path)
 		}
 
 		// Initialize path map if it doesn't exist
@@ -123,25 +114,17 @@ func (c *Config) FindRoute(path, method string) (*RouteConfig, bool) {
 	return nil, false
 }
 
-// GetNatsSubject derives the NATS subject for a given route.
-func (c *Config) GetNatsSubject(route *RouteConfig) string {
+// GetMicroSubject returns the NATS Micro service name (which acts as the subject).
+func (c *Config) GetMicroSubject(route *RouteConfig) string {
 	if route == nil {
 		return ""
 	}
-	// Pattern: <STREAM>.<APP>
-	return fmt.Sprintf("%s.%s", c.NatsStream, route.App)
+	// The 'service' field directly defines the target service name/subject.
+	return route.Service
 }
 
-// GetStreamName returns the globally configured stream name.
-func (c *Config) GetStreamName() string {
-	return c.NatsStream
-}
-
-// GetStreamNames returns the single global stream name in a slice.
-// Used for compatibility with SetupJetStream which might handle multiple streams in future.
-func (c *Config) GetStreamNames() []string {
-	if c.NatsStream == "" {
-		return []string{} // Should not happen with validation, but safe
-	}
-	return []string{c.NatsStream}
+// GetNatsSubject - Keep this method name for now for compatibility in handler.go,
+// but it now just returns the service name. Consider renaming later if appropriate.
+func (c *Config) GetNatsSubject(route *RouteConfig) string {
+	return c.GetMicroSubject(route)
 }

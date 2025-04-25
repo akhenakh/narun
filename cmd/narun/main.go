@@ -49,7 +49,6 @@ func main() {
 		slog.Error("Failed to load configuration", "file", *configFile, "error", err)
 		os.Exit(1)
 	}
-	slog.Info("Configuration loaded successfully", "file", *configFile)
 
 	nc, err := natsutil.ConnectNATS(cfg.NatsURL)
 	if err != nil {
@@ -57,18 +56,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer nc.Close()
-	slog.Info("Connected to NATS server", "url", nc.ConnectedUrl())
 
-	// Setup JetStream and get the context
-	js, err := natsutil.SetupJetStream(logger, nc, cfg.NatsStream) // Get JS context
-	if err != nil {
-		slog.Error("Failed to setup JetStream", "stream", cfg.NatsStream, "error", err)
-		os.Exit(1)
-	}
-	slog.Info("JetStream setup complete", "stream", cfg.NatsStream)
-
-	// Pass the JetStream context to the handler
-	httpHandler := handler.NewHttpHandler(logger, nc, js, cfg) // Pass js context
+	// No need for JetStream context with NATS Micro
+	// Create the HTTP handler with NATS Micro
+	httpHandler := handler.NewHttpHandler(logger, nc, cfg)
 
 	// (Server mux and setup unchanged)
 	mainMux := http.NewServeMux()
