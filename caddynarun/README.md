@@ -2,18 +2,8 @@
 
 
 
-```bash
-# Make sure you are in the directory that contains caddynarun
-# (Or adjust the path in --with accordingly)
-# If using replace: xcaddy build --with github.com/akhenakh/narun/caddy=./caddy
-# If using go get: xcaddy build --with github.com/akhenakh/narun/caddy@latest
-
-xcaddy build --with github.com/akhenakh/narun/caddy=. # If caddy is local dir
-
-# Example using replace directive in caddy/go.mod
-# Assuming caddy is checked out next to narun project
-# (cd caddy && go mod edit -replace github.com/akhenakh/narun=../narun)
-# xcaddy build --with github.com/akhenakh/narun/caddy=./caddynarun
+```sh
+xcaddy build --with github.com/akhenakh/narun/caddy@latest
 ```
 
 This will create a custom `caddy` binary in your current directory.
@@ -73,7 +63,7 @@ http://localhost:2080 {
 
 ## Run
 
-1.  Ensure your NATS server (with JetStream enabled) is running.
+1.  Ensure your NATS server
 2.  Run your `narun` consumer(s):
     ```bash
     # Assuming narun/consumers/cmd/hello is built
@@ -82,18 +72,18 @@ http://localhost:2080 {
     ```
 3.  Run the custom Caddy build with your Caddyfile:
     ```bash
-    ./caddy run --config Caddyfile
+    ./caddy run
     ```
 4.  Send requests:
     ```bash
     # Should hit the 'hello' consumer via narun handler
-    curl -v -X POST -H "Content-Type: application/json" -d '{"name":"Caddy User"}' http://localhost:2080/hello/
+    curl -v -X POST -H "Content-Type: application/json" -d '{"name":"Caddy User"}' http://localhost:8080/hello/
 
     # Should hit the 'goodbye' consumer via narun handler (if you run one)
-    curl -v http://localhost:2080/goodbye
+    curl -v http://localhost:8080/goodbye
 
     # Should hit the fallback handler
-    curl -v http://localhost:2080/other/path
+    curl -v http://localhost:8080/other/path
     ```
 
 You should see logs in Caddy, the NATS server, and your consumer indicating the request flow. The response from the consumer should be returned to the `curl` client.

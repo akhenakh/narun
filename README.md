@@ -65,6 +65,17 @@ routes:
     methods: ["GET"]
     service: "goodbye"
 ```
+## Caddy Plugin (caddynarun)
+
+Instead of running the standalone narun binary, you can build a custom Caddy web server binary that includes the narun gateway logic directly. This allows Caddy to handle TLS termination, virtual hosting, static file serving, and other web server tasks, while routing specific paths to your NATS Micro services.
+
+See the caddynarun/ directory.
+
+### Building
+
+```sh
+xcaddy build --with github.com/akhenakh/narun/caddy@latest
+```
 
 ## Running the Gateway
 ```sh
@@ -162,12 +173,6 @@ Use nconsumer.ListenAndServeGRPC: In your main function, create an instance of y
 nconsumer handles connecting to NATS, registering the service, receiving requests, identifying the target RPC method (using the X-Original-Grpc-Method header set by narun), decoding the protobuf request, calling your service method, encoding the protobuf response (or error), and sending the NATS reply.
 
 See `consumers/cmd/grpc-hello/main.go` for an example.
-
-## Caddy Plugin (caddynarun)
-
-Instead of running the standalone narun binary, you can build a custom Caddy web server binary that includes the narun gateway logic directly. This allows Caddy to handle TLS termination, virtual hosting, static file serving, and other web server tasks, while routing specific paths to your NATS Micro services.
-
-See the caddynarun/ directory for instructions on building and configuring the Caddy plugin.
 
 ## Metrics
 
