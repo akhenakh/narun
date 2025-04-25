@@ -1,157 +1,193 @@
-# narun - HTTP to NATS Gateway
+# narun - HTTP/gRPC to NATS Micro Gateway
 
-`narun` is a lightweight HTTP gateway designed to bridge incoming HTTP requests to backend services communicating over [NATS](https://nats.io/), including [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream). It allows developers to write backend NATS consumers using the standard Go `http.Handler` interface, simplifying the transition to or integration with a NATS-based microservice architecture.
+`narun` is a lightweight gateway that bridges incoming HTTP or gRPC requests to backend services built using the [NATS Micro](https://docs.nats.io/nats-concepts/micro) framework. It allows developers to write backend services using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC) while leveraging the benefits of a NATS-based microservice architecture.
 
-## Purpose
+The companion `nconsumer` library simplifies writing these backend NATS Micro services.
 
-In many architectures, services expose HTTP APIs. However, leveraging a message bus like NATS offers benefits such as:
+## Why NATS Micro (and narun)?
 
-*   **Decoupling:** Services don't need direct network visibility of each other.
-*   **Resilience:** NATS can handle message persistence (via JetStream) and redelivery.
-*   **Scalability:** Multiple instances of a consumer service can subscribe to the same subject (using queue groups) for load balancing.
-*   **Location Transparency:** The gateway doesn't need to know the IP/port of backend services, only the NATS subject to send requests to.
+Traditional microservice architectures often rely on direct HTTP/gRPC calls between services, requiring service discovery, client-side load balancing, and tightly coupled network visibility. NATS Micro offers an alternative approach with several advantages:
 
-`narun` acts as the translation layer:
+*   **Decoupling:** Services communicate via named NATS subjects, not direct IP addresses or ports. The gateway only needs to know the target NATS service name.
+*   **Location Transparency:** Backend services can run anywhere the NATS infrastructure reaches, without the gateway needing to know their specific location.
+*   **Scalability & Resilience:** NATS handles service discovery and load balances requests across multiple instances of a backend service automatically. If a service instance fails, NATS routes requests to healthy ones.
+*   **Simplified Backend:** Developers can focus on business logic using standard Go interfaces, while `nconsumer` handles the NATS communication details.
 
-1.  It listens for standard HTTP requests on a configured address.
-2.  Based on the request path and method, it looks up a corresponding NATS subject in its configuration.
-3.  It marshals the essential parts of the `http.Request` (method, path, headers, body, query params) into a structured format (Protocol buffer).
-4.  It sends this payload as a NATS request message to the configured subject, waiting for a reply.
-5.  Backend NATS consumers (built using the `nconsumer` library or similar logic) receive the NATS message.
-6.  The `nconsumer` library reconstructs an `http.Request` from the message payload.
-7.  This reconstructed request is passed to a standard `http.Handler` implementation within the consumer service.
-8.  The handler processes the request and writes a response using a standard `http.ResponseWriter` (internally captured by a shim).
-9.  The `nconsumer` library marshals the captured response (status code, headers, body) into Protocol Buffer.
-10. This response payload is sent back as the NATS reply message.
-11. `narun` receives the NATS reply, unmarshals the response data.
-12. It writes the status code, headers, and body back to the original HTTP client.
+`narun` acts as the entry point, translating familiar HTTP/gRPC requests into NATS Micro requests, enabling easy integration with existing tools and clients.
+
+## How it Works
+
+1.  `narun` listens for HTTP requests (on `server_addr`) and/or gRPC requests (on `grpc_addr`).
+2.  Based on the incoming request (HTTP path/method or gRPC service/method), it finds a matching route in its configuration (`config.yaml`).
+3.  It identifies the target NATS Micro service name associated with the route.
+4.  It forwards the request payload and relevant metadata (like HTTP headers or the original gRPC method name) as a NATS request message to the target service subject.
+5.  Backend NATS consumers (built using `nconsumer`) receive the NATS message.
+6.  `nconsumer` reconstructs the original request context:
+    *   For HTTP: Creates an `http.Request` object.
+    *   For gRPC: Identifies the target method and prepares to decode the payload.
+7.  The reconstructed request is passed to the developer's service logic:
+    *   For HTTP: An `http.Handler`'s `ServeHTTP` method is called.
+    *   For gRPC: The appropriate method on the gRPC service implementation is invoked.
+8.  The service logic processes the request and generates a response:
+    *   For HTTP: Writes to an `http.ResponseWriter` (captured by `nconsumer`).
+    *   For gRPC: Returns the response object and error.
+9.  `nconsumer` marshals the response (status code, headers, body for HTTP; protobuf message for gRPC) and sends it back as the NATS reply.
+10. `narun` receives the NATS reply.
+11. It reconstructs the HTTP response (status, headers, body) or gRPC response/error and sends it back to the original client.
 
 ## Key Features
 
-*   **HTTP to NATS Bridging:** Translates synchronous HTTP requests into NATS request-reply interactions.
-*   **Standard `http.Handler`:** Backend consumers use the familiar `http.Handler` interface, minimizing the learning curve for NATS integration.
-*   **Configuration Driven:** Routing from HTTP paths/methods to NATS subjects is defined in a simple YAML file.
-*   **NATS JetStream Support:** Configured streams are automatically declared (if missing) for persistence and reliable delivery. Queue groups are used for consumer load balancing.
-*   **Observability:** Exposes Prometheus metrics for HTTP requests and NATS interactions.
+*   **HTTP & gRPC Gateway:** Bridges both HTTP and gRPC requests to NATS Micro services.
+*   **Standard Interfaces:** Backend services use standard Go `http.Handler` or generated gRPC service interfaces.
+*   **Configuration Driven:** Simple YAML file maps HTTP paths/methods or gRPC services to NATS Micro service names.
+*   **NATS Micro Integration:** Leverages built-in NATS service discovery, load balancing, and observability.
+*   **Observability:** Exposes Prometheus metrics for gateway requests and NATS interactions.
 *   **Graceful Shutdown:** Handles OS signals for clean termination.
-*   **Efficient Serialization:** Uses Protocol Buffer for encoding request/response data over NATS.
-
-## Architecture Overview
-
-```
-+-------------+      HTTP Request      +---------+      NATS Request (PB)  g     +-----------------+      Handler Logic      +-----------------+      NATS Reply (PB)         +---------+      HTTP Response       +-------------+
-| HTTP Client | ---------------------> | narun   | ---------------------------> | NATS JetStream  | --------------------->  | Consumer        | ----------------------->     | Consumer| -----------------------> | narun       | ---------------------> | HTTP Client   |
-|             |                        | Gateway |      (Subject: task.S.X)     | (Stream: S)     | (Listens on task.S.X)   | (http.Handler)  | (ResponseWriter Shim)        | Gateway |                          |             |
-+-------------+                        +---------+                              +-----------------+                         +-----------------+                              +---------+                          +-------------+                        +---------------+
-                                          ^                                                                                                                                                                              |
-                                          |                                                                                                                                                                              |
-                                          +--------------------------------------- Configuration (config.yaml) ----------------------------------------------------------------------------------------------------------+
-                                          |
-                                          +--------------------------------------- Metrics (/metrics) -------------------------------------------------------------------------------------------------------------------+
-```
+*   **Caddy Plugin:** Can be integrated directly into the Caddy web server (see `caddynarun/`).
 
 ## Getting Started
 
 ### Prerequisites
 
-*   Go 1.18 or later
-*   A running NATS server (version 2.2.0+ recommended for JetStream) with JetStream enabled.
+*   A running NATS server (withl Micro v1 features)
 
 ### Configuration (`config.yaml`)
 
-The `narun` gateway requires a configuration file (default: `config.yaml`) to define routes and NATS connection details.
+Define routes mapping incoming requests to backend NATS Micro service names.
 
 ```yaml
-# config.yaml
+# config.yaml example with HTTP and gRPC routes
 
 nats_url: "nats://localhost:4222" # URL of your NATS server
-server_addr: ":8080"              # Address for the main HTTP gateway to listen on
-metrics_addr: ":9090"             # Address for the Prometheus metrics endpoint
-request_timeout_seconds: 15       # Max time (seconds) to wait for a NATS reply
-nats_stream: "TASK"       # JetStream stream the subject belongs to
+server_addr: ":8080"              # Address for the main HTTP gateway
+grpc_addr: ":8081"                # Address for the gRPC gateway (optional)
+metrics_addr: ":9090"             # Address for Prometheus metrics
+request_timeout_seconds: 15       # Max time to wait for a NATS reply
 
-# Define routes: map HTTP path/method to NATS stream/subject
+# Define routes: map HTTP path/method OR gRPC service to NATS service name
 routes:
-  - path: "/hello/"             # Incoming HTTP request path
-    method: "POST"              # Incoming HTTP request method
-    app: "hello"                # The app name will be used to construct the NATS subject
+  # --- HTTP Route Example ---
+  # Requests to POST/PUT /hello/* are sent to the NATS service named "hello"
+  - path: "/hello/"             # Incoming HTTP request path prefix/exact match
+    methods: ["POST", "PUT"]    # Incoming HTTP request methods
+    service: "hello"            # Target NATS Micro service name
+
+  # --- gRPC Route Example ---
+  # Requests for the gRPC service hello.v1.Greeter are sent to the NATS service named "greeter-service"
+  - grpc: "hello.v1.Greeter"      # Fully qualified gRPC service name
+    service: "greeter-service"  # Target NATS Micro service name
+
+  # --- Another HTTP Route ---
+  - path: "/goodbye"
+    methods: ["GET"]
+    service: "goodbye"
 ```
 
-### Running the Gateway
+## Running the Gateway
+```sh
+./narun -config config.yaml
+```
 
-1.  Clone the repository (if you haven't already).
-2.  Build the gateway:
-    ```bash
-    go build ./cmd/narun
-    ```
-3.  Run the gateway, pointing it to your configuration file:
-    ```bash
-    ./narun -config config.yaml
-    # Or using go run:
-    # go run ./cmd/narun -config config.yaml
-    ```
-    You should see logs indicating connection to NATS and the server starting.
+## Running Example Consumers
 
-### Running an Example Consumer (`hello`)
+### HTTP Consumer (hello)
+```sh
+go build ./consumers/cmd/hello
+./hello -nats-url "nats://localhost:4222" -service "hello"
+```
 
-The `consumers/cmd/hello` directory contains a simple example consumer service.
+### gRPC Consumer (grpc-hello)
+```sh
+go build ./consumers/cmd/grpc-hello
 
-1.  Build the consumer:
-    ```bash
-    go build ./consumers/cmd/hello
-    ```
-2.  Run the consumer, specifying the NATS connection details and the subject/stream/queue it should listen on (these *must* match a route in `config.yaml`):
-    ```bash
-    ./hello \
-        -nats-url "nats://localhost:4222" \
-        -stream "ORDERS" \
-        -app "hello" \
-    ```
-    You can run multiple instances of the consumer with the same queue group name, and NATS will distribute messages among them.
+/grpc-hello -nats-url "nats://localhost:4222" -service "greeter-service"
+```
 
-### Making a Request
+(The -service flag value must match the service in config.yaml)
 
-Now, send an HTTP request to the `narun` gateway that matches a configured route:
+You can run multiple instances of the same consumer (with the same -service name), and NATS will automatically load-balance requests between them.
+Making Requests
 
-```bash
+HTTP Request
+```sh
 curl -X POST \
      -H "Content-Type: application/json" \
      -d '{"name": "NATS User"}' \
      http://localhost:8080/hello/
 ```
+```json
+{"message":"Hello, NATS User! (processed by POST)","received_path":"/hello/","consumer_host":"your-hostname"}
+```
 
-You should receive a response generated by the `hello` consumer:
+## gRPC Request (using grpcurl)
 
+Assuming you have the .proto file (consumers/cmd/grpc-hello/proto/hello.proto):
+
+```sh
+grpcurl -plaintext \
+        -proto consumers/cmd/grpc-hello/proto/hello.proto \
+        -d '{"name": "gRPC User"}' \
+        localhost:8081 \
+        hello.v1.Greeter/SayHello
+```
 ```json
 {
-  "message": "Hello, NATS User!",
-  "received_path": "/hello/"
+  "message": "Hello, gRPC User!"
 }
 ```
 
-Check the logs of both `narun` and the `hello` consumer to see the request flow.
 
-## Paradigm Shift: HTTP vs. NATS Microservices
+## Developer Experience
 
-*   **Traditional HTTP Microservices:** Often involve an API Gateway that routes HTTP requests directly to other HTTP-based microservices. Services need to know each other's network addresses (often via service discovery). Scaling involves running more HTTP server instances behind a load balancer. Communication is typically synchronous request-response.
+narun and nconsumer aim for a familiar development workflow:
 
-*   **NATS-based Microservices (via `narun`):**
-    *   **Decoupling:** The `narun` gateway only needs to know the NATS subject, not the consumer's location or how many instances exist. Consumers only need to know which subject to listen on.
-    *   **Asynchronous Potential:** While `narun` uses NATS request-reply (synchronous pattern), the underlying NATS communication could be adapted for fire-and-forget or event-driven patterns for other use cases.
-    *   **Resilience & Load Balancing:** NATS JetStream provides message persistence (if a consumer is down) and queue groups automatically distribute messages across available consumer instances. Scaling is as simple as running more consumer processes listening on the same subject and queue group.
-    *   **Simplified Consumer:** Developers focus on the business logic within the `http.Handler`, letting `nconsumer` manage the NATS interactions, message (de)serialization, and request/response reconstruction.
+### HTTP Consumer Development
 
-`narun` offers a way to gain the benefits of a NATS-based architecture while retaining the familiar development pattern of `http.Handler` for the backend services themselves.
+Implement http.Handler: Write your business logic just like you would for a standard Go HTTP server. You receive a standard http.Request (reconstructed by nconsumer with original headers, method, path, body) and write your response to a standard http.ResponseWriter.
+
+Use nconsumer.ListenAndServe: In your main function, create an instance of your handler and pass it to nconsumer.ListenAndServe along with configuration (NATS URL, NATS Micro service name).
+
+nconsumer handles connecting to NATS, registering the service, receiving requests, reconstructing the http.Request, capturing the http.ResponseWriter output, and sending the NATS reply.
+
+See `consumers/cmd/hello/main.go` for an example.
+
+### gRPC Consumer Development
+
+Define Service with Protobuf: Define your service, messages, and RPCs in a .proto file as usual.
+
+Generate Go Code: Use protoc with protoc-gen-go and protoc-gen-go-grpc to generate Go interfaces and types.
+
+Implement gRPC Service: Create a struct that implements the generated *Server interface (e.g., GreeterServer). Implement your RPC methods with standard Go types (context.Context, request struct pointer, response struct pointer, error).
+
+Use nconsumer.ListenAndServeGRPC: In your main function, create an instance of your gRPC service implementation. Pass the nconsumer.Options (NATS URL, NATS Micro service name), the generated grpc.ServiceDesc (e.g., &hello_v1.Greeter_ServiceDesc), and your service implementation instance to nconsumer.ListenAndServeGRPC.
+
+nconsumer handles connecting to NATS, registering the service, receiving requests, identifying the target RPC method (using the X-Original-Grpc-Method header set by narun), decoding the protobuf request, calling your service method, encoding the protobuf response (or error), and sending the NATS reply.
+
+See `consumers/cmd/grpc-hello/main.go` for an example.
+
+## Caddy Plugin (caddynarun)
+
+Instead of running the standalone narun binary, you can build a custom Caddy web server binary that includes the narun gateway logic directly. This allows Caddy to handle TLS termination, virtual hosting, static file serving, and other web server tasks, while routing specific paths to your NATS Micro services.
+
+See the caddynarun/ directory for instructions on building and configuring the Caddy plugin.
 
 ## Metrics
 
-The gateway exposes Prometheus metrics on the address specified by `metrics_addr` (default `:9090`) at the `/metrics` path.
+The narun gateway exposes Prometheus metrics on the address specified by metrics_addr (default :9090) at the /metrics path.
 
 Key metrics include:
 
-*   `http_gateway_requests_total`: Counter of incoming HTTP requests labeled by method, path, and resulting status code.
-*   `http_gateway_request_duration_seconds`: Histogram of HTTP request latency labeled by method and path.
-*   `http_gateway_nats_requests_total`: Counter of NATS requests sent by the gateway, labeled by NATS subject and status (`success`, `timeout`, `error`).
+- `http_gateway_requests_total`: Counter of incoming HTTP requests (labels: method, path, status_code).
+
+- `http_gateway_request_duration_seconds`: Histogram of HTTP request latency (labels: method, path).
+
+- `grpc_gateway_requests_total`: Counter of incoming gRPC requests (labels: grpc_method, grpc_code).
+
+- `grpc_gateway_request_duration_seconds`: Histogram of gRPC request latency (labels: grpc_method).
+
+- `gateway_nats_requests_total`: Counter of NATS requests sent by the gateway (labels: subject, status ["success", "timeout", "error"]).
+
+The nconsumer library can also expose metrics (e.g., processing time, active workers) if configured - see its implementation for details.
 
 ## Ideas
 - self registering path consumers
