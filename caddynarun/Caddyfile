@@ -1,0 +1,43 @@
+{
+	# Optional: Global settings
+	# admin off
+	# log default {
+	#  	level INFO
+	# }
+}
+
+http://localhost:8080 {
+	log {
+	 	output stderr
+	 	level DEBUG # Enable debug for testing
+	}
+
+	# Route specific paths through narun to NATS Micro services
+	route /hello/* {
+		narun {
+			nats_url localhost:4222 # Or nats://localhost:4222
+			request_timeout 15s
+			# nats_stream TASK      # REMOVED - Not needed for NATS Micro
+
+			# Define routes: map HTTP path/method to NATS Micro service name
+			# route <path> <service_name> [METHOD...]
+			route /hello/ hello POST PUT # Handle POST/PUT for /hello/* -> service 'hello'
+			# Add more routes here if this narun block handles multiple services/paths
+		}
+	}
+
+	# Another route example
+	route /goodbye {
+		narun {
+			nats_url localhost:4222
+			request_timeout 10s
+
+			route /goodbye goodbye GET # Handle GET for /goodbye -> service 'goodbye'
+		}
+	}
+
+	# Fallback or other handlers
+	route /* {
+		respond "Not handled by narun" 404
+	}
+}
