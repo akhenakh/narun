@@ -212,22 +212,27 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
 10. `narun` receives the NATS reply.
 11. It reconstructs the HTTP response (status, headers, body) or gRPC response/error and sends it back to the original client.
 
+## TODO
+- route grpc from Caddy
+- caddy config does not need the path
+- global nats url in caddy rather than per path?
 
 ## Ideas
-- self registering path consumers
-- routing to grpc
-
-- node runner
-  - gvisor
-  - firecracker
-  - exec
+- the gw to wait for a consumer to join on a a request, useful for scale to zero
+- [X]routing to grpc
 - [X] caddy plugin
 - metrics for inflights
 - direct response NAT
 - send consumer logs to NATS
-- [X] move to protocol buffers
-- no registry needed for "images", binary can be compiled using ko and uploaded to objectstore
+- [X] move to protocol buffers, done them removed for nats micro
 - x request id
+- enable tracing
+- self registering path consumers
+- node runner
+  - gvisor
+  - firecracker
+  - exec
+- no registry needed for "images", binary can be compiled using ko and uploaded to objectstore
 
 ### Won't
 Because of caddy providing the feature:

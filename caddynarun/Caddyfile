@@ -17,8 +17,6 @@ http://localhost:8080 {
 		narun {
 			nats_url localhost:4222 # Or nats://localhost:4222
 			request_timeout 15s
-			# nats_stream TASK      # REMOVED - Not needed for NATS Micro
-
 			# Define routes: map HTTP path/method to NATS Micro service name
 			# route <path> <service_name> [METHOD...]
 			route /hello/ hello POST PUT # Handle POST/PUT for /hello/* -> service 'hello'
