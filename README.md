@@ -65,6 +65,13 @@ routes:
     methods: ["GET"]
     service: "goodbye"
 ```
+
+## Running the Narun Gateway
+```sh
+./narun -config config.yaml
+```
+
+
 ## Caddy Plugin (caddynarun)
 
 Instead of running the standalone narun binary, you can build a custom Caddy web server binary that includes the narun gateway logic directly. This allows Caddy to handle TLS termination, virtual hosting, static file serving, and other web server tasks, while routing specific paths to your NATS Micro services.
@@ -75,11 +82,6 @@ See the caddynarun/ directory.
 
 ```sh
 xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
-```
-
-## Running the Gateway
-```sh
-./narun -config config.yaml
 ```
 
 ## Running Example Consumers
