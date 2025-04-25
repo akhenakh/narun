@@ -32,7 +32,7 @@ To fully understand NATS Servcice  capabilities, you can watch [this introductio
 
 ### Prerequisites
 
-*   A running NATS server (withl Micro v1 features)
+*   A running NATS server (with Service/Micro v1 features)
 
 ### Configuration (`config.yaml`)
 
@@ -74,7 +74,7 @@ See the caddynarun/ directory.
 ### Building
 
 ```sh
-xcaddy build --with github.com/akhenakh/narun/caddy@latest
+xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
 ```
 
 ## Running the Gateway

@@ -3,7 +3,7 @@
 
 
 ```sh
-xcaddy build --with github.com/akhenakh/narun/caddy@latest
+xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
 ```
 
 This will create a custom `caddy` binary in your current directory.
