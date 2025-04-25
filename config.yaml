@@ -1,14 +1,23 @@
-nats_url: "nats://localhost:4222" # Default NATS server URL
-server_addr: ":8080" # HTTP server listen address
-metrics_addr: ":9090" # Prometheus metrics listen address
-request_timeout_seconds: 30 # Timeout for waiting NATS response
-nats_stream: "TASK" # JetStream stream name
+# config.yaml example with HTTP and gRPC routes
 
+nats_url: "nats://localhost:4222" # URL of your NATS server
+server_addr: ":8080" # Address for the main HTTP gateway to listen on
+grpc_addr: ":8081" # Address for the gRPC gateway (optional, remove if no gRPC routes)
+metrics_addr: ":9090" # Address for the Prometheus metrics endpoint
+request_timeout_seconds: 15 # Max time (seconds) to wait for a NATS reply
+
+# Define routes: map HTTP path/method OR gRPC service to NATS service
 routes:
-  - path: "/hello/" # Note trailing slash might matter depending on router
-    methods: ["POST"]
-    service: "hello"
+  # --- HTTP Route Example ---
+  - path: "/hello/" # Incoming HTTP request path
+    methods: ["POST", "PUT"] # Incoming HTTP request methods
+    service: "hello" # Target NATS service name for these HTTP requests
 
+  # --- gRPC Route Example ---
+  - grpc: "hello.v1.Greeter" # Fully qualified gRPC service name
+    service: "grpc-hello-service" # NATS Micro service name the consumer listens on
+
+  # --- Another HTTP Route ---
   - path: "/goodbye"
     methods: ["GET"]
     service: "goodbye"

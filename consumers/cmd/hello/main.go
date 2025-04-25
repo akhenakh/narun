@@ -129,10 +129,8 @@ func main() {
 
 	// --- Configure options with ServiceName ---
 	opts := nconsumer.Options{
-		NATSURL:     *natsURL,
-		ServiceName: *serviceName, // Use the new flag
-		// AppName:       *appName, // REMOVED
-		// StreamName:    *streamName, // REMOVED
+		NATSURL:       *natsURL,
+		ServiceName:   *serviceName,
 		Logger:        logger,
 		MaxConcurrent: *maxConcurrent,
 		Description:   "Hello service example using NATS Micro",

@@ -39,7 +39,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	method := r.Method
 
-	routeCfg, found := h.Config.FindRoute(path, method)
+	routeCfg, found := h.Config.FindHttpRoute(path, method)
 	if !found {
 		h.Logger.Info("No route found", "method", method, "path", path)
 		http.NotFound(w, r)
@@ -62,7 +62,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// --- Create NATS Request Message with Headers ---
 	// Use GetMicroSubject which handles the service name logic from config
-	subject := h.Config.GetMicroSubject(routeCfg)
+	subject := h.Config.GetNatsSubject(routeCfg)
 	natsRequest := nats.NewMsg(subject)
 	natsRequest.Data = body
 	natsRequest.Header = make(nats.Header) // Use nats.Header (which is http.Header)
