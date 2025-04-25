@@ -2,7 +2,7 @@
 
 `narun` is a lightweight gateway that bridges incoming HTTP or gRPC requests to backend services built using the [NATS Micro](https://docs.nats.io/nats-concepts/micro) framework. It allows developers to write backend services using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC) while leveraging the benefits of a NATS-based microservice architecture.
 
-The companion `nconsumer` library simplifies writing these backend NATS Micro services.
+The companion `nconsumer` library simplifies writing these backend NATS Micro services, using familiar interfaces (`http.Handler` for HTTP, standard service implementations for gRPC).
 
 ## Why NATS Micro (and narun)?
 
@@ -15,25 +15,8 @@ Traditional microservice architectures often rely on direct HTTP/gRPC calls betw
 
 `narun` acts as the entry point, translating familiar HTTP/gRPC requests into NATS Micro requests, enabling easy integration with existing tools and clients.
 
-## How it Works
+To fully understand NATS Servcice  capabilities, you can watch [this introduction video](https://www.youtube.com/watch?v=AiUazlrtgyU).
 
-1.  `narun` listens for HTTP requests (on `server_addr`) and/or gRPC requests (on `grpc_addr`).
-2.  Based on the incoming request (HTTP path/method or gRPC service/method), it finds a matching route in its configuration (`config.yaml`).
-3.  It identifies the target NATS Micro service name associated with the route.
-4.  It forwards the request payload and relevant metadata (like HTTP headers or the original gRPC method name) as a NATS request message to the target service subject.
-5.  Backend NATS consumers (built using `nconsumer`) receive the NATS message.
-6.  `nconsumer` reconstructs the original request context:
-    *   For HTTP: Creates an `http.Request` object.
-    *   For gRPC: Identifies the target method and prepares to decode the payload.
-7.  The reconstructed request is passed to the developer's service logic:
-    *   For HTTP: An `http.Handler`'s `ServeHTTP` method is called.
-    *   For gRPC: The appropriate method on the gRPC service implementation is invoked.
-8.  The service logic processes the request and generates a response:
-    *   For HTTP: Writes to an `http.ResponseWriter` (captured by `nconsumer`).
-    *   For gRPC: Returns the response object and error.
-9.  `nconsumer` marshals the response (status code, headers, body for HTTP; protobuf message for gRPC) and sends it back as the NATS reply.
-10. `narun` receives the NATS reply.
-11. It reconstructs the HTTP response (status, headers, body) or gRPC response/error and sends it back to the original client.
 
 ## Key Features
 
@@ -203,6 +186,27 @@ Key metrics include:
 - `gateway_nats_requests_total`: Counter of NATS requests sent by the gateway (labels: subject, status ["success", "timeout", "error"]).
 
 The nconsumer library can also expose metrics (e.g., processing time, active workers) if configured - see its implementation for details.
+
+## How it Works
+
+1.  `narun` listens for HTTP requests (on `server_addr`) and/or gRPC requests (on `grpc_addr`).
+2.  Based on the incoming request (HTTP path/method or gRPC service/method), it finds a matching route in its configuration (`config.yaml`).
+3.  It identifies the target NATS Micro service name associated with the route.
+4.  It forwards the request payload and relevant metadata (like HTTP headers or the original gRPC method name) as a NATS request message to the target service subject.
+5.  Backend NATS consumers (built using `nconsumer`) receive the NATS message.
+6.  `nconsumer` reconstructs the original request context:
+    *   For HTTP: Creates an `http.Request` object.
+    *   For gRPC: Identifies the target method and prepares to decode the payload.
+7.  The reconstructed request is passed to the developer's service logic:
+    *   For HTTP: An `http.Handler`'s `ServeHTTP` method is called.
+    *   For gRPC: The appropriate method on the gRPC service implementation is invoked.
+8.  The service logic processes the request and generates a response:
+    *   For HTTP: Writes to an `http.ResponseWriter` (captured by `nconsumer`).
+    *   For gRPC: Returns the response object and error.
+9.  `nconsumer` marshals the response (status code, headers, body for HTTP; protobuf message for gRPC) and sends it back as the NATS reply.
+10. `narun` receives the NATS reply.
+11. It reconstructs the HTTP response (status, headers, body) or gRPC response/error and sends it back to the original client.
+
 
 ## Ideas
 - self registering path consumers
