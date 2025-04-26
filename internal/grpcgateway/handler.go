@@ -158,7 +158,7 @@ func (h *GrpcHandler) HandleUnknownStream(srv interface{}, stream grpc.ServerStr
 		return status.Error(respStatus, errMsg) // Return gRPC status error
 	}
 
-	// Process NATS Reply (unchanged logic)
+	// Process NATS Reply
 	metrics.NatsRequestsTotal.WithLabelValues(natsSubject, natsStatus).Inc()
 	h.Logger.Debug("Received NATS reply for gRPC",
 		"reply_subject", natsReply.Subject,

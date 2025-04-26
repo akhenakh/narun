@@ -8,16 +8,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings" // Import strings
 	"time"
 
-	// We need the nats.go library and yaml parsing
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
-	"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v3" // Use v3 to match config parsing
 )
 
 // Configuration Constants ---
-// These should match the values used by the node-runner
 const (
 	AppConfigKVBucket   = "app-configs"
 	AppBinariesOSBucket = "app-binaries"
@@ -26,21 +25,27 @@ const (
 )
 
 // --- ServiceSpec Definition ---
-// Copied from internal/noderunner/config.go for simplicity.
-// Alternatively, you could import github.com/akhenakh/narun/internal/noderunner
-// but that might create unwanted dependencies for a simple CLI tool.
+// Keep this in sync with internal/noderunner/config.go
 
 type EnvVar struct {
 	Name  string `yaml:"name"`
 	Value string `yaml:"value"`
 }
 
+// NodeSelectorSpec defines which node should run the service and how many replicas.
+type NodeSelectorSpec struct {
+	Name     string `yaml:"name"`     // Node ID (matches node-runner's ID)
+	Replicas int    `yaml:"replicas"` // Number of instances on this node
+}
+
+// ServiceSpec defines the desired configuration for an application managed by the node runner.
 type ServiceSpec struct {
-	Name         string   `yaml:"name"`              // Name of the service/app, used as KV key
-	Command      string   `yaml:"command,omitempty"` // Optional: command to run (defaults to binary name)
-	Args         []string `yaml:"args,omitempty"`    // Arguments to pass to the command
-	Env          []EnvVar `yaml:"env,omitempty"`     // Environment variables to set
-	BinaryObject string   `yaml:"binary_object"`     // Name of the binary object in the Object Store (REQUIRED in spec)
+	Name         string             `yaml:"name"`              // Name of the service/app, used as KV key
+	Command      string             `yaml:"command,omitempty"` // Optional: command to run (defaults to binary name)
+	Args         []string           `yaml:"args,omitempty"`    // Arguments to pass to the command
+	Env          []EnvVar           `yaml:"env,omitempty"`     // Environment variables to set
+	BinaryObject string             `yaml:"binary_object"`     // Name of the binary object in the Object Store
+	Nodes        []NodeSelectorSpec `yaml:"nodes,omitempty"`   // List of nodes to deploy on and replica counts
 }
 
 func main() {
@@ -78,29 +83,46 @@ func main() {
 		log.Fatalf("Error parsing ServiceSpec YAML from %s: %v", *configFile, err)
 	}
 
-	// Validate parsed spec
+	// --- Validate parsed spec ---
 	if spec.Name == "" {
 		log.Fatalf("Error: 'name' field is missing or empty in the configuration file %s", *configFile)
 	}
 	if spec.BinaryObject == "" {
-		// Default BinaryObject to Name if not provided in the spec explicitly
-		log.Printf("Warning: 'binary_object' not specified in config, defaulting to service name '%s'", spec.Name)
-		spec.BinaryObject = spec.Name
-		// log.Fatalf("Error: 'binary_object' field is missing or empty in the configuration file %s", *configFile)
+		log.Fatalf("Error: 'binary_object' field is missing or empty in the configuration file %s", *configFile)
 	}
+
+	// Validate node selectors
+	if len(spec.Nodes) == 0 {
+		log.Printf("Warning: 'nodes' list is empty in the spec. The service will not be scheduled on any node.")
+		// Allow empty list - means "don't run"
+	}
+	nodeNames := make(map[string]bool)
+	for i, nodeSpec := range spec.Nodes {
+		if strings.TrimSpace(nodeSpec.Name) == "" {
+			log.Fatalf("Error in config %s: node selector at index %d: 'name' cannot be empty", *configFile, i)
+		}
+		if nodeSpec.Replicas <= 0 {
+			log.Fatalf("Error in config %s: node selector for '%s': 'replicas' must be positive, got %d", *configFile, nodeSpec.Name, nodeSpec.Replicas)
+		}
+		if nodeNames[nodeSpec.Name] {
+			log.Fatalf("Error in config %s: duplicate node selector for name '%s'", *configFile, nodeSpec.Name)
+		}
+		nodeNames[nodeSpec.Name] = true
+	}
+	// --- End Validation ---
 
 	appName := spec.Name
 	binaryObjectName := spec.BinaryObject
-	log.Printf("Parsed ServiceSpec: AppName='%s', BinaryObject='%s'", appName, binaryObjectName)
+	log.Printf("Parsed ServiceSpec: AppName='%s', BinaryObject='%s', TargetNodes=%+v", appName, binaryObjectName, spec.Nodes)
 
-	//  NATS Connection and JetStream Setup
+	// --- NATS Connection and JetStream Setup ---
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
 	log.Printf("Connecting to NATS server %s...", *natsURL)
 	nc, err := nats.Connect(*natsURL,
 		nats.Name("narun-deploy-cli"),
-		nats.Timeout(5*time.Second), // Shorter connect timeout
+		nats.Timeout(5*time.Second),
 	)
 	if err != nil {
 		log.Fatalf("Error connecting to NATS: %v", err)
@@ -114,7 +136,7 @@ func main() {
 	}
 	log.Println("JetStream context created.")
 
-	//  Upload Binary to Object Store
+	// --- Upload Binary to Object Store ---
 	log.Printf("Accessing Object Store bucket: %s", AppBinariesOSBucket)
 	objStore, err := js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{
 		Bucket:      AppBinariesOSBucket,
@@ -127,28 +149,23 @@ func main() {
 	binaryBaseName := filepath.Base(*binaryFile)
 	log.Printf("Uploading binary '%s' to Object Store as '%s'...", binaryBaseName, binaryObjectName)
 
-	// Open the binary file for reading
 	fileHandle, err := os.Open(*binaryFile)
 	if err != nil {
 		log.Fatalf("Error opening binary file %s for reading: %v", *binaryFile, err)
 	}
-	defer fileHandle.Close() // Ensure file handle is closed
+	defer fileHandle.Close()
 
-	// Use objStore.Put with the file handle as the io.Reader
 	meta := jetstream.ObjectMeta{
-		Name:        binaryObjectName, // The desired name in the object store
+		Name:        binaryObjectName,
 		Description: fmt.Sprintf("Binary for %s uploaded via narun-deploy", appName),
-		// Headers: map[string][]string{"Original-Filename": {binaryBaseName}}, // Optional header
 	}
-
-	// Put takes context, metadata (containing the name), and a reader
 	objInfo, err := objStore.Put(ctx, meta, fileHandle)
 	if err != nil {
 		log.Fatalf("Error uploading binary '%s' using Put: %v", binaryBaseName, err)
 	}
 	log.Printf("Binary uploaded successfully: Name=%s, Size=%d, Digest=%s", objInfo.Name, objInfo.Size, objInfo.Digest)
 
-	// Upload/Update Config to KV Store
+	// --- Upload/Update Config to KV Store ---
 	log.Printf("Accessing Key-Value Store bucket: %s", AppConfigKVBucket)
 	kvStore, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:      AppConfigKVBucket,
@@ -159,6 +176,7 @@ func main() {
 	}
 
 	log.Printf("Updating configuration key '%s' in KV store...", appName)
+	// Use the original configData read from the file
 	revision, err := kvStore.Put(ctx, appName, configData)
 	if err != nil {
 		log.Fatalf("Error updating configuration key '%s' in KV store: %v", appName, err)

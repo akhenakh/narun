@@ -142,7 +142,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 			shimPool.Put(responseShim)
 		}()
 
-		// --- (Extract HTTP info - Unchanged) ---
+		// Extract HTTP info - Unchanged
 		incomingHeaders := req.Headers()
 		method := incomingHeaders.Get("X-Original-Method")
 		if method == "" {
@@ -156,7 +156,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 		host := incomingHeaders.Get("X-Original-Host")
 		remoteAddr := incomingHeaders.Get("X-Original-RemoteAddr")
 
-		// (Reconstruct HTTP request - Unchanged, maybe pool this later if needed)
+		// Reconstruct HTTP request
 		httpReq, err := reconstructHttpRequest(context.Background(), method, path, query, host, remoteAddr, incomingHeaders, req.Data())
 		if err != nil {
 			logger.Error("Failed to reconstruct HTTP request", "error", err)

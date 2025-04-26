@@ -28,7 +28,6 @@ import (
 )
 
 func main() {
-	// (Logging setup unchanged)
 	logLevel := slog.LevelInfo
 	if levelStr := os.Getenv("LOG_LEVEL"); levelStr != "" {
 		var level slog.Level

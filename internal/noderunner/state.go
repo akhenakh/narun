@@ -2,8 +2,10 @@ package noderunner
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,12 +24,13 @@ const (
 
 // ManagedApp holds the runtime state for an application instance managed by the runner.
 type ManagedApp struct {
-	Spec          *ServiceSpec       // The configuration this instance is running with
+	InstanceID    string             // Unique ID for this instance (e.g., "appName-0")
+	Spec          *ServiceSpec       // The configuration this instance is running with (pointer to shared spec)
 	Cmd           *exec.Cmd          // The running process command
-	Status        AppStatus          // Current status of the app
+	Status        AppStatus          // Current status of the app instance
 	Pid           int                // Process ID
 	StartTime     time.Time          // When the process was last started
-	ConfigHash    string             // Hash of the ServiceSpec YAML used
+	ConfigHash    string             // Hash of the ServiceSpec YAML used for this generation
 	BinaryPath    string             // Local path to the executable being run
 	StdoutPipe    io.ReadCloser      // Pipe for stdout
 	StderrPipe    io.ReadCloser      // Pipe for stderr
@@ -35,65 +38,99 @@ type ManagedApp struct {
 	StopSignal    chan struct{}      // Signal channel to stop monitoring/restarting
 	processCtx    context.Context    // Context for the running process and its monitors
 	processCancel context.CancelFunc // Function to cancel the process context
-	restartCount  int                // Number of times restarted since last config change
+	restartCount  int                // Number of times restarted since last config change/start
 	lastExitCode  *int               // Store the last exit code
+}
+
+// appInfo holds the state for all instances of a single application on this node.
+type appInfo struct {
+	mu         sync.RWMutex
+	spec       *ServiceSpec  // Current desired spec for this app
+	instances  []*ManagedApp // Slice of currently managed instances
+	configHash string        // Hash of the spec currently applied
 }
 
 // AppStateManager manages the state of all applications on the node.
 type AppStateManager struct {
 	mu   sync.RWMutex
-	apps map[string]*ManagedApp // map[appName]*ManagedApp
+	apps map[string]*appInfo // map[appName]*appInfo
 }
 
 // NewAppStateManager creates a new state manager.
 func NewAppStateManager() *AppStateManager {
 	return &AppStateManager{
-		apps: make(map[string]*ManagedApp),
+		apps: make(map[string]*appInfo),
 	}
 }
 
-// Get retrieves the state for a given app name.
-func (m *AppStateManager) Get(appName string) (*ManagedApp, bool) {
+// GetAppInfo retrieves the appInfo struct for a given app name. Creates if not exists.
+// Ensures thread-safe access to the top-level map.
+func (m *AppStateManager) GetAppInfo(appName string) *appInfo {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	app, exists := m.apps[appName]
-	return app, exists
-}
+	info, exists := m.apps[appName]
+	m.mu.RUnlock()
 
-// GetAll returns a copy of the current state map.
-func (m *AppStateManager) GetAll() map[string]*ManagedApp {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	// Return a shallow copy to avoid race conditions on the map itself
-	appsCopy := make(map[string]*ManagedApp, len(m.apps))
-	for k, v := range m.apps {
-		appsCopy[k] = v
+	if !exists {
+		m.mu.Lock()
+		// Double-check after acquiring write lock
+		info, exists = m.apps[appName]
+		if !exists {
+			info = &appInfo{
+				instances: make([]*ManagedApp, 0),
+			}
+			m.apps[appName] = info
+		}
+		m.mu.Unlock()
 	}
-	return appsCopy
+	return info
 }
 
-// Set stores the state for a given app name.
-func (m *AppStateManager) Set(appName string, app *ManagedApp) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.apps[appName] = app
+// GetManagedInstance retrieves a specific instance by its ID.
+// Returns the instance and true if found, otherwise nil and false.
+func (m *AppStateManager) GetManagedInstance(instanceID string) (*ManagedApp, bool) {
+	appName := InstanceIDToAppName(instanceID) // Helper needed
+	appInfo := m.GetAppInfo(appName)           // Gets or creates appInfo
+
+	appInfo.mu.RLock()
+	defer appInfo.mu.RUnlock()
+
+	for _, instance := range appInfo.instances {
+		if instance.InstanceID == instanceID {
+			return instance, true
+		}
+	}
+	return nil, false
 }
 
-// Delete removes the state for a given app name.
-func (m *AppStateManager) Delete(appName string) {
+// DeleteApp removes all state for a given app name.
+func (m *AppStateManager) DeleteApp(appName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.apps, appName)
 }
 
-// UpdateStatus updates the status of a specific app.
-func (m *AppStateManager) UpdateStatus(appName string, status AppStatus, exitCode *int) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if app, exists := m.apps[appName]; exists {
-		app.Status = status
-		app.lastExitCode = exitCode // Update last exit code
-		return true
+// GetAllAppInfos returns a copy of the current state map.
+// Note: This returns pointers to appInfo, callers must handle locking on appInfo.mu.
+func (m *AppStateManager) GetAllAppInfos() map[string]*appInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	appsCopy := make(map[string]*appInfo, len(m.apps))
+	for k, v := range m.apps {
+		appsCopy[k] = v // Copy the pointer
 	}
-	return false
+	return appsCopy
+}
+
+// Generates a unique instance ID.
+func GenerateInstanceID(appName string, replicaIndex int) string {
+	return fmt.Sprintf("%s-%d", appName, replicaIndex)
+}
+
+// Extracts app name from instance ID (simple implementation).
+func InstanceIDToAppName(instanceID string) string {
+	lastDash := strings.LastIndex(instanceID, "-")
+	if lastDash == -1 {
+		return instanceID // Or handle error? Assume format is correct.
+	}
+	return instanceID[:lastDash]
 }

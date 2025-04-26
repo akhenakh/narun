@@ -51,7 +51,7 @@ var (
 		[]string{"subject", "status"}, // Status: success, timeout, error
 	)
 
-	// --- Consumer Metrics (Unchanged) ---
+	// Consumer Metrics
 	WorkerCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "narun_worker_active_count",

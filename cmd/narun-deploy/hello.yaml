@@ -1,7 +1,13 @@
 name: hello # This will be the KV key
 binary_object: hello-v1.2 # This MUST match the object name in the Object Store
+
+nodes:
+  - name: clot # Target node runner with ID 'node1'
+    replicas: 2 # Run 2 instances on node1
+
+# Original args/env
 args:
-  - -concurrency=4
+  - -concurrency=2 # Maybe adjust based on expected load per instance
 env:
   - name: GREETING
     value: "Hello from NATS!"
