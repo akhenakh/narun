@@ -1,0 +1,7 @@
+name: hello # This will be the KV key
+binary_object: hello-v1.2 # This MUST match the object name in the Object Store
+args:
+  - -concurrency=4
+env:
+  - name: GREETING
+    value: "Hello from NATS!"

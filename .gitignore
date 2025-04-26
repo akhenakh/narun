@@ -18,4 +18,6 @@
 caddynarun/caddy
 consumers/cmd/hello/hello
 consumers/cmd/grpc-hello/grpc-hello
-cmd/narun/narun
+cmd/narun-gw/narun-gw
+cmd/narun-deploy/narun-deploy
+narun-data

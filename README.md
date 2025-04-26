@@ -218,6 +218,7 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
 - route grpc from Caddy
 - caddy config does not need the path
 - global nats url in caddy rather than per path?
+- SIGTERM on an app , node runner does not restart
 
 ## Ideas
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
@@ -234,7 +235,12 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
   - gvisor
   - firecracker
   - exec
+  - systemd-nspawn
+- do not develop a node runner but interact with systemd only?
 - no registry needed for "images", binary can be compiled using ko and uploaded to objectstore
+- zig musl + static go build
+- config stored in ELF .config
+- each gateway has a name, developer can target a specific gateway in its config
 
 ### Won't
 Because of caddy providing the feature:
