@@ -15,6 +15,7 @@ const (
 	NodeStateKVBucket     = "node-runner-states"
 	NodeStateKVTTL        = 45 * time.Second   // Key expires if not updated within this duration
 	NodeHeartbeatInterval = NodeStateKVTTL / 3 // Update frequency (e.g., every 15s)
+	LogSubjectPrefix      = "logs"             // prefix for the logs
 )
 
 // EnvVar defines an environment variable for the service.

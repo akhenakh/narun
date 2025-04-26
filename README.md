@@ -18,7 +18,7 @@ It aims for simplicity and lightness targeting edge devices.
 
 ### 2. `caddynarun` (Caddy Plugin)
 
-*   **Function:** `narun-gw` embedded within Caddy.
+*   **Function:** Same as `narun-gw` but embedded within Caddy.
 *   **Mechanism:** Integrates with Caddy's request pipeline. Uses directives in the `Caddyfile` to map specific HTTP routes (path/method) to NATS Micro service names. It forwards matching requests as NATS request messages (similar to `narun-gw`) and returns the NATS reply.
 *   **Configuration:** Via the `narun` directive within a Caddyfile route block. See `caddynarun/README.md` for details and examples.
 *   **Running:** Requires building a custom Caddy binary including the plugin:
@@ -108,7 +108,7 @@ xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
 
 ## Why NATS Micro (and narun)?
 
-Traditional microservice architectures often rely on direct HTTP/gRPC calls between services, requiring service discovery, client-side load balancing, and tightly coupled network visibility. NATS Micro offers an alternative approach with several advantages:
+Traditional microservice architectures often rely on direct HTTP/gRPC calls between services, requiring service discovery, client-side or network load balancing, and tightly coupled network visibility. NATS Micro offers an alternative approach with several advantages:
 
 *   **Decoupling:** Services communicate via named NATS subjects, not direct IP addresses or ports. The gateway only needs to know the target NATS service name.
 *   **Location Transparency:** Backend services can run anywhere the NATS infrastructure reaches, without the gateway needing to know their specific location.
@@ -117,7 +117,7 @@ Traditional microservice architectures often rely on direct HTTP/gRPC calls betw
 
 `narun-gw` acts as the entry point, translating familiar HTTP/gRPC requests into NATS Micro requests, enabling easy integration with existing tools and clients.
 
-To fully understand NATS Servcice  capabilities, you can watch [this introduction video](https://www.youtube.com/watch?v=AiUazlrtgyU).
+To fully understand NATS Service capabilities, you can watch [this introduction video](https://www.youtube.com/watch?v=AiUazlrtgyU).
 
 
 ## Key Features
@@ -244,6 +244,8 @@ This project is under active development. Components and APIs may change.
 - [X] check arch before downloading binary
 - fix the version/tag system to long
 - dont store arch as GOARCH since it may be a binary coming from another language.
+- deploy without config dont start the actual app
+- after deploy it takes time for the status and running instances count to appear in list-apps
 
 ## Ideas
 - the gw to wait for a consumer to join on a a request, useful for scale to zero

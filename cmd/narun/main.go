@@ -1,3 +1,5 @@
+// narun/cmd/narun/main.go
+
 package main
 
 import (
@@ -7,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 	"text/tabwriter" // Added for tabular output
 	"time"
 
+	"github.com/akhenakh/narun/internal/noderunner"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3"
@@ -23,47 +27,9 @@ import (
 
 // Configuration Constants (Shared) - Copied from noderunner/config.go
 const (
-	AppConfigKVBucket   = "app-configs"
-	AppBinariesOSBucket = "app-binaries"
-	NodeStateKVBucket   = "node-runner-states" // Needed for list-apps
-	DefaultNatsURL      = "nats://localhost:4222"
-	DefaultTimeout      = 15 * time.Second
-	LogSubjectPrefix    = "logs"
+	DefaultNatsURL = "nats://localhost:4222"
+	DefaultTimeout = 15 * time.Second
 )
-
-// --- Struct Definitions (Copied/Adapted for reuse across commands) ---
-
-type EnvVar struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
-}
-
-type NodeSelectorSpec struct {
-	Name     string `yaml:"name"`
-	Replicas int    `yaml:"replicas"`
-}
-
-// ServiceSpec as defined in noderunner/config.go
-type ServiceSpec struct {
-	Name             string             `yaml:"name"`
-	Command          string             `yaml:"command,omitempty"`
-	Args             []string           `yaml:"args,omitempty"`
-	Env              []EnvVar           `yaml:"env,omitempty"`
-	BinaryVersionTag string             `yaml:"binary_version_tag"`
-	Nodes            []NodeSelectorSpec `yaml:"nodes,omitempty"`
-}
-
-// NodeState as defined in noderunner/config.go
-type NodeState struct {
-	NodeID           string    `json:"node_id"`
-	LastSeen         time.Time `json:"last_seen"`
-	Version          string    `json:"version"`
-	StartTime        time.Time `json:"start_time"`
-	ManagedInstances []string  `json:"managed_instances"`
-	Status           string    `json:"status"`
-	GOOS             string    `json:"goos"`
-	GOARCH           string    `json:"goarch"`
-}
 
 // LogEntry structure (for logs command)
 type logEntry struct {
@@ -80,6 +46,22 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+
+	logLevel := slog.LevelInfo
+	if levelStr := os.Getenv("LOG_LEVEL"); levelStr != "" {
+		var level slog.Level
+		if err := level.UnmarshalText([]byte(levelStr)); err == nil {
+			logLevel = level
+		}
+	}
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     logLevel,
+		AddSource: true,
+	})
+
+	// Logger setup
+	logger := slog.New(logHandler).With("service", "hello-consumer") // Keep this logical name for logging
+	slog.SetDefault(logger)
 
 	command := os.Args[1]
 	args := os.Args[2:]
@@ -113,7 +95,7 @@ Options:
 		os.Exit(0)          // Exit successfully after showing help
 	}
 
-	// --- Normal Command Handling ---
+	// Normal Command Handling
 	switch command {
 	case "deploy":
 		handleDeployCmd(args)
@@ -126,6 +108,8 @@ Options:
 	case "list-apps":
 		// Add -h check for list-apps if desired
 		handleListAppsCmd(args)
+	case "delete-app":
+		handleAppDeleteCmd(args)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -146,6 +130,7 @@ Commands:
   logs          Stream logs from node runners.
   list-images   List application binaries stored in NATS Object Store.
   list-apps     List deployed applications and their status on nodes.
+  delete-app    Delete an application configuration from NATS KV.
   help          Show this help message.
 
 Common Options (apply to multiple commands where relevant):
@@ -186,6 +171,13 @@ Options for deploy:
 	listAppsFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	// Add filtering options later if needed
 	listAppsFlags.PrintDefaults()
+
+	fmt.Fprintln(os.Stderr, "\nOptions for delete:")
+	deleteFlags := flag.NewFlagSet("delete", flag.ExitOnError)
+	deleteFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	deleteFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+	deleteFlags.Bool("y", false, "Skip confirmation prompt")
+	deleteFlags.PrintDefaults()
 }
 
 // Deploy Command Logic
@@ -226,12 +218,12 @@ Options:
 		os.Exit(1)
 	}
 
-	var spec ServiceSpec
+	var spec noderunner.ServiceSpec
 	var configData []byte
 	var err error
 
 	if *configFile != "" {
-		// --- Mode 1: Using -config file ---
+		// Mode 1: Using -config file
 		log.Printf("Starting Deployment using Config File: Config='%s', Binaries=%v, NATS='%s'", *configFile, binaryFiles, *natsURL)
 		if _, err = os.Stat(*configFile); os.IsNotExist(err) {
 			log.Fatalf("Deploy Error: Config file not found at %s", *configFile)
@@ -265,7 +257,7 @@ Options:
 			*configFile, spec.Name, spec.BinaryVersionTag, spec.Nodes)
 
 	} else {
-		// --- Mode 2: Using flags ---
+		// Mode 2: Using flags
 		log.Printf("Starting Deployment using Flags: Binaries=%v, NATS='%s'", binaryFiles, *natsURL)
 		// Validate required flags for this mode
 		if *appNameFlag == "" {
@@ -290,10 +282,10 @@ Options:
 		}
 
 		// Generate the ServiceSpec in memory
-		spec = ServiceSpec{
+		spec = noderunner.ServiceSpec{
 			Name:             *appNameFlag,
 			BinaryVersionTag: *tagFlag,
-			Nodes: []NodeSelectorSpec{
+			Nodes: []noderunner.NodeSelectorSpec{
 				{
 					Name:     *nodeFlag,
 					Replicas: *replicasFlag,
@@ -312,7 +304,7 @@ Options:
 		}
 	}
 
-	// --- Common Deployment Logic ---
+	// Common Deployment Logic
 	appName := spec.Name                      // Use name from loaded or generated spec
 	binaryVersionTag := spec.BinaryVersionTag // Use tag from loaded or generated spec
 
@@ -329,14 +321,14 @@ Options:
 
 	// Get Object Store handle (remains the same)
 	osCtx, osCancel := context.WithTimeout(ctxAll, 5*time.Second)
-	objStore, err := js.ObjectStore(osCtx, AppBinariesOSBucket)
+	objStore, err := js.ObjectStore(osCtx, noderunner.AppBinariesOSBucket)
 	osCancel()
 	if err != nil {
 		createCtx, createCancel := context.WithTimeout(ctxAll, 10*time.Second)
-		objStore, err = js.CreateObjectStore(createCtx, jetstream.ObjectStoreConfig{Bucket: AppBinariesOSBucket, Description: "Narun binaries"})
+		objStore, err = js.CreateObjectStore(createCtx, jetstream.ObjectStoreConfig{Bucket: noderunner.AppBinariesOSBucket, Description: "Narun binaries"})
 		createCancel()
 		if err != nil {
-			log.Fatalf("Deploy Error: accessing/creating Object Store '%s': %v", AppBinariesOSBucket, err)
+			log.Fatalf("Deploy Error: accessing/creating Object Store '%s': %v", noderunner.AppBinariesOSBucket, err)
 		}
 	}
 
@@ -403,14 +395,14 @@ Options:
 
 	// Upload/Update Config to KV Store (remains the same, uses appName and configData)
 	kvCtx, kvCancel := context.WithTimeout(ctxAll, 10*time.Second)
-	kvStore, err := js.KeyValue(kvCtx, AppConfigKVBucket)
+	kvStore, err := js.KeyValue(kvCtx, noderunner.AppConfigKVBucket)
 	kvCancel()
 	if err != nil {
 		createCtx, createCancel := context.WithTimeout(ctxAll, 10*time.Second)
-		kvStore, err = js.CreateKeyValue(createCtx, jetstream.KeyValueConfig{Bucket: AppConfigKVBucket, Description: "Narun configs"})
+		kvStore, err = js.CreateKeyValue(createCtx, jetstream.KeyValueConfig{Bucket: noderunner.AppConfigKVBucket, Description: "Narun configs"})
 		createCancel()
 		if err != nil {
-			log.Fatalf("Deploy Error: accessing/creating Key-Value Store '%s': %v", AppConfigKVBucket, err)
+			log.Fatalf("Deploy Error: accessing/creating Key-Value Store '%s': %v", noderunner.AppConfigKVBucket, err)
 		}
 	}
 	log.Printf("Updating configuration key '%s' in KV store...", appName)
@@ -442,7 +434,7 @@ func handleLogsCmd(args []string) {
 		log.Fatal("Logs Error: -instance flag requires the -app flag to be set.")
 	}
 
-	subjectParts := []string{LogSubjectPrefix}
+	subjectParts := []string{noderunner.LogSubjectPrefix}
 	if *appName != "" {
 		subjectParts = append(subjectParts, *appName)
 	} else {
@@ -519,7 +511,7 @@ func handleListImagesCmd(args []string) {
 		log.Fatalf("Error parsing list-images flags: %v", err)
 	}
 
-	log.Printf("Listing images from NATS Object Store '%s'...", AppBinariesOSBucket)
+	log.Printf("Listing images from NATS Object Store '%s'...", noderunner.AppBinariesOSBucket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -530,14 +522,14 @@ func handleListImagesCmd(args []string) {
 	}
 	defer nc.Close()
 
-	objStore, err := js.ObjectStore(ctx, AppBinariesOSBucket)
+	objStore, err := js.ObjectStore(ctx, noderunner.AppBinariesOSBucket)
 	if err != nil {
 		// If the bucket doesn't exist, treat as no images found
 		if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, nats.ErrBucketNotFound) { // Check both errors
-			log.Printf("Object Store '%s' not found. No images to list.", AppBinariesOSBucket)
+			log.Printf("Object Store '%s' not found. No images to list.", noderunner.AppBinariesOSBucket)
 			return
 		}
-		log.Fatalf("Error accessing Object Store '%s': %v", AppBinariesOSBucket, err)
+		log.Fatalf("Error accessing Object Store '%s': %v", noderunner.AppBinariesOSBucket, err)
 	}
 
 	// List objects
@@ -550,7 +542,7 @@ func handleListImagesCmd(args []string) {
 			log.Println("No images found in the object store.")
 			return
 		}
-		log.Fatalf("Error listing objects in store '%s': %v", AppBinariesOSBucket, err)
+		log.Fatalf("Error listing objects in store '%s': %v", noderunner.AppBinariesOSBucket, err)
 	}
 
 	// Prepare Tabular Output
@@ -596,7 +588,7 @@ func handleListImagesCmd(args []string) {
 	log.Printf("Found %d image(s).", count)
 }
 
-// --- List Apps Command Logic ---
+// List Apps Command Logic
 func handleListAppsCmd(args []string) {
 	listAppsFlags := flag.NewFlagSet("list-apps", flag.ExitOnError)
 	natsURL := listAppsFlags.String("nats", DefaultNatsURL, "NATS server URL")
@@ -607,7 +599,7 @@ func handleListAppsCmd(args []string) {
 		log.Fatalf("Error parsing list-apps flags: %v", err)
 	}
 
-	log.Println("Listing deployed applications and node status...")
+	slog.Debug("Listing deployed applications and node status...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -618,22 +610,22 @@ func handleListAppsCmd(args []string) {
 	}
 	defer nc.Close()
 
-	// --- Get Node States ---
-	nodeStates := make(map[string]NodeState)
-	kvNodeStates, err := js.KeyValue(ctx, NodeStateKVBucket)
+	// Get Node States
+	nodeStates := make(map[string]noderunner.NodeState)
+	kvNodeStates, err := js.KeyValue(ctx, noderunner.NodeStateKVBucket)
 	if err != nil {
-		log.Printf("Warning: Could not access Node State KV '%s': %v. Node status will be unavailable.", NodeStateKVBucket, err)
+		slog.Warn(fmt.Sprintf("Could not access Node State KV '%s': %v. Node status will be unavailable.", noderunner.NodeStateKVBucket, err))
 	} else {
 		nodeKeysWatcher, err := kvNodeStates.ListKeys(ctx)
 		if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
-			log.Printf("Warning: Failed to list node keys from '%s': %v", NodeStateKVBucket, err)
+			slog.Warn(fmt.Sprintf("Failed to list node keys from '%s': %v", noderunner.NodeStateKVBucket, err))
 		} else if err == nil { // Only proceed if ListKeys didn't fail immediately
 			nodeKeysChan := nodeKeysWatcher.Keys()
 		nodeLoop:
 			for {
 				select {
 				case <-ctx.Done():
-					log.Printf("Warning: Timed out listing node keys: %v", ctx.Err())
+					slog.Warn(fmt.Sprintf("Timed out listing node keys: %v", ctx.Err()))
 					break nodeLoop
 				case nodeKey, ok := <-nodeKeysChan:
 					if !ok {
@@ -645,12 +637,12 @@ func handleListAppsCmd(args []string) {
 
 					entry, err := kvNodeStates.Get(ctx, nodeKey)
 					if err != nil {
-						log.Printf("Warning: Failed to get node state for key '%s': %v", nodeKey, err)
+						slog.Warn(fmt.Sprintf("Failed to get node state for key '%s': %v", nodeKey, err))
 						continue
 					}
-					var state NodeState
+					var state noderunner.NodeState
 					if err := json.Unmarshal(entry.Value(), &state); err != nil {
-						log.Printf("Warning: Failed to unmarshal node state for key '%s': %v", nodeKey, err)
+						slog.Warn(fmt.Sprintf("Failed to unmarshal node state for key '%s': %v", nodeKey, err))
 						continue
 					}
 					nodeStates[nodeKey] = state
@@ -659,10 +651,10 @@ func handleListAppsCmd(args []string) {
 			nodeKeysWatcher.Stop() // Ensure watcher is stopped
 		}
 	}
-	log.Printf("Found %d active node(s).", len(nodeStates))
+	slog.Debug(fmt.Sprintf("Found %d active node(s).", len(nodeStates)))
 
-	// --- Get App Configs and Correlate ---
-	appConfigs := make(map[string]ServiceSpec)
+	// Get App Configs and Correlate
+	appConfigs := make(map[string]noderunner.ServiceSpec)
 	appInstanceCounts := make(map[string]map[string]int) // map[appName][nodeID]count
 
 	// Pre-calculate instance counts per node
@@ -677,20 +669,20 @@ func handleListAppsCmd(args []string) {
 	}
 
 	// Get app configs
-	kvAppConfigs, err := js.KeyValue(ctx, AppConfigKVBucket)
+	kvAppConfigs, err := js.KeyValue(ctx, noderunner.AppConfigKVBucket)
 	if err != nil {
-		log.Printf("Warning: Could not access App Config KV '%s': %v. Cannot list app details.", AppConfigKVBucket, err)
+		slog.Warn(fmt.Sprintf("Could not access App Config KV '%s': %v. Cannot list app details.", noderunner.AppConfigKVBucket, err))
 	} else {
 		appKeysWatcher, err := kvAppConfigs.ListKeys(ctx)
 		if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
-			log.Printf("Warning: Failed to list app keys from '%s': %v", AppConfigKVBucket, err)
+			slog.Warn(fmt.Sprintf("Failed to list app keys from '%s': %v", noderunner.AppConfigKVBucket, err))
 		} else if err == nil { // Only proceed if ListKeys didn't fail immediately
 			appKeysChan := appKeysWatcher.Keys()
 		appLoop:
 			for {
 				select {
 				case <-ctx.Done():
-					log.Printf("Warning: Timed out listing app keys: %v", ctx.Err())
+					slog.Warn(fmt.Sprintf("Timed out listing app keys: %v", ctx.Err()))
 					break appLoop
 				case appKey, ok := <-appKeysChan:
 					if !ok {
@@ -702,12 +694,12 @@ func handleListAppsCmd(args []string) {
 
 					entry, err := kvAppConfigs.Get(ctx, appKey)
 					if err != nil {
-						log.Printf("Warning: Failed to get app config for key '%s': %v", appKey, err)
+						slog.Warn(fmt.Sprintf("Failed to get app config for key '%s': %v", appKey, err))
 						continue
 					}
-					var spec ServiceSpec
+					var spec noderunner.ServiceSpec
 					if err := yaml.Unmarshal(entry.Value(), &spec); err != nil {
-						log.Printf("Warning: Failed to unmarshal app config for key '%s': %v", appKey, err)
+						slog.Warn(fmt.Sprintf("Failed to unmarshal app config for key '%s': %v", appKey, err))
 						continue
 					}
 					appConfigs[appKey] = spec
@@ -717,7 +709,7 @@ func handleListAppsCmd(args []string) {
 		}
 	}
 
-	// --- Display Results ---
+	// Display Results
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	fmt.Fprintln(tw, "APPLICATION\tVERSION TAG\tNODE\tNODE STATUS\tNODE PLATFORM\tRUNNING INSTANCES")
 	fmt.Fprintln(tw, "-----------\t-----------\t----\t-----------\t-------------\t-----------------")
@@ -776,12 +768,101 @@ func handleListAppsCmd(args []string) {
 	tw.Flush()
 }
 
+// Delete App Command Logic
+func handleAppDeleteCmd(args []string) {
+	deleteAppFlags := flag.NewFlagSet("delete-app", flag.ExitOnError)
+	natsURL := deleteAppFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	timeout := deleteAppFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+	skipConfirm := deleteAppFlags.Bool("y", false, "Skip confirmation prompt")
+
+	deleteAppFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s delete-app [options] <app_name>
+
+Deletes an application configuration from NATS KV. This will cause node runners
+to stop and remove instances of this application.
+
+Arguments:
+  <app_name>   Name of the application configuration to delete (required).
+
+Options:
+`, os.Args[0])
+		deleteAppFlags.PrintDefaults()
+	}
+
+	if err := deleteAppFlags.Parse(args); err != nil {
+		return // Usage already printed by ExitOnError
+	}
+
+	if deleteAppFlags.NArg() != 1 {
+		log.Println("Delete App Error: Exactly one application name argument is required.")
+		deleteAppFlags.Usage()
+		os.Exit(1)
+	}
+	appName := deleteAppFlags.Arg(0)
+
+	// Confirmation Prompt
+	if !*skipConfirm {
+		fmt.Printf("WARNING: This will permanently delete the configuration for application '%s'.\n", appName)
+		fmt.Printf("Node runners watching this configuration will stop all instances of this application.\n")
+		fmt.Print("Are you sure you want to proceed? (yes/no): ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "yes" {
+			log.Println("Delete operation cancelled.")
+			os.Exit(0)
+		}
+	}
+
+	log.Printf("Deleting application configuration '%s'...", appName)
+
+	// NATS Connection and JetStream Setup
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli")
+	if err != nil {
+		log.Fatalf("Delete Error: %v", err)
+	}
+	defer nc.Close()
+
+	// Get KV Store handle
+	kvCtx, kvCancel := context.WithTimeout(ctx, 5*time.Second)
+	kvStore, err := js.KeyValue(kvCtx, noderunner.AppConfigKVBucket)
+	kvCancel()
+	if err != nil {
+		log.Fatalf("Delete Error: accessing Key-Value Store '%s': %v", noderunner.AppConfigKVBucket, err)
+	}
+
+	// Check if key exists before deleting
+	getCtx, getCancel := context.WithTimeout(ctx, 5*time.Second)
+	_, getErr := kvStore.Get(getCtx, appName)
+	getCancel()
+	if getErr != nil {
+		if errors.Is(getErr, jetstream.ErrKeyNotFound) {
+			log.Printf("Application configuration '%s' not found. Nothing to delete.", appName)
+			os.Exit(0)
+		}
+		log.Fatalf("Delete Error: failed to check if key '%s' exists: %v", appName, getErr)
+	}
+
+	// Delete the key
+	log.Printf("Deleting key '%s' from KV store '%s'...", appName, noderunner.AppConfigKVBucket)
+	delCtx, delCancel := context.WithTimeout(ctx, 10*time.Second)
+	err = kvStore.Delete(delCtx, appName)
+	delCancel()
+	if err != nil {
+		log.Fatalf("Delete Error: failed to delete key '%s': %v", appName, err)
+	}
+
+	log.Printf("Successfully deleted application configuration '%s'.", appName)
+	log.Println("Node runners will now stop instances for this application.")
+}
+
 func connectNATS(ctx context.Context, url string, clientName string) (*nats.Conn, jetstream.JetStream, error) {
 	// Add client name suffix if empty
 	if clientName == "" {
 		clientName = "narun-cli-unknown"
 	}
-	log.Printf("Connecting to NATS server %s as %s...", url, clientName)
+	slog.Debug(fmt.Sprintf("Connecting to NATS server %s as %s...", url, clientName))
 	nc, err := nats.Connect(url,
 		nats.Name(clientName),
 		nats.Timeout(5*time.Second), // Use shorter timeout for CLI
@@ -790,20 +871,20 @@ func connectNATS(ctx context.Context, url string, clientName string) (*nats.Conn
 				log.Printf("WARN: NATS disconnected: %v", err)
 			}
 		}),
-		nats.ReconnectHandler(func(nc *nats.Conn) { log.Printf("INFO: NATS reconnected to %s", nc.ConnectedUrl()) }),
-		nats.ClosedHandler(func(nc *nats.Conn) { log.Printf("INFO: NATS connection closed.") }),
+		nats.ReconnectHandler(func(nc *nats.Conn) { slog.Debug(fmt.Sprintf("INFO: NATS reconnected to %s", nc.ConnectedUrl())) }),
+		nats.ClosedHandler(func(nc *nats.Conn) { slog.Debug(fmt.Sprintf("INFO: NATS connection closed.")) }),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to NATS: %w", err)
 	}
-	log.Println("Connected to NATS successfully.")
+	slog.Debug(fmt.Sprintf("Connected to NATS successfully."))
 
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
 		return nil, nil, fmt.Errorf("creating JetStream context: %w", err)
 	}
-	log.Println("JetStream context created.")
+	slog.Debug(fmt.Sprintf("JetStream context created."))
 	return nc, js, nil
 }
 
