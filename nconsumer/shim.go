@@ -9,7 +9,7 @@ import (
 
 // Pool for response body buffers to reduce allocations.
 var bufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		// Preallocate slightly to avoid initial growth for common small responses
 		return bytes.NewBuffer(make([]byte, 0, 4096))
 	},
@@ -22,17 +22,6 @@ type responseWriterShim struct {
 	body        *bytes.Buffer // Will be obtained from bufferPool
 	statusCode  int
 	wroteHeader bool
-}
-
-// newResponseWriterShim creates a shim, getting the buffer from the pool.
-// Note: This function might not be called directly if using a pool for the shim itself.
-func newResponseWriterShim() *responseWriterShim {
-	return &responseWriterShim{
-		header: make(http.Header),
-		body:   bufferPool.Get().(*bytes.Buffer),
-		// Default status code if WriteHeader is not called
-		statusCode: http.StatusOK,
-	}
 }
 
 // Reset prepares the shim for reuse by clearing headers, resetting the buffer,

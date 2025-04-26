@@ -1,4 +1,4 @@
-package config
+package gwconfig
 
 import (
 	"fmt"
@@ -37,7 +37,7 @@ type Config struct {
 	NatsURL               string        `yaml:"nats_url"`
 	ServerAddr            string        `yaml:"server_addr"`
 	GrpcAddr              string        `yaml:"grpc_addr,omitempty"` // Optional gRPC listen address
-	MetricsAddr           string        `yaml:"metrics_addr"`
+	MetricsAddr           string        `yaml:"metrics_addr"`        // metrics server listen address
 	RequestTimeoutSeconds int           `yaml:"request_timeout_seconds"`
 	RequestTimeout        time.Duration `yaml:"-"` // Calculated field
 	Routes                []RouteConfig `yaml:"routes"`
@@ -85,7 +85,7 @@ func LoadConfig(path string) (*Config, error) {
 	for i := range cfg.Routes {
 		route := &cfg.Routes[i] // Use pointer to the route in the slice
 
-		// --- Common Validation ---
+		// Common Validation
 		if strings.TrimSpace(route.Service) == "" {
 			return nil, fmt.Errorf("invalid route config at index %d: target NATS 'service' name cannot be empty", i)
 		}
@@ -93,7 +93,7 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid target NATS 'service' name '%s' for route at index %d: contains invalid characters (*, >, space)", route.Service, i)
 		}
 
-		// --- Determine Route Type and Validate Specific Fields ---
+		// Determine Route Type and Validate Specific Fields
 		isHTTP := route.Path != ""
 		isGRPC := route.GrpcService != ""
 
@@ -106,7 +106,7 @@ func LoadConfig(path string) (*Config, error) {
 
 		if isHTTP {
 			route.Type = RouteTypeHTTP
-			// --- HTTP Specific Validation ---
+			// HTTP Specific Validation
 			if strings.TrimSpace(route.Path) == "" {
 				// This check is technically redundant due to isHTTP check, but kept for clarity
 				return nil, fmt.Errorf("invalid HTTP route config at index %d: path cannot be empty", i)
@@ -138,7 +138,7 @@ func LoadConfig(path string) (*Config, error) {
 		} else { // isGRPC
 			route.Type = RouteTypeGRPC
 			hasGrpcRoutes = true
-			// --- gRPC Specific Validation ---
+			// gRPC Specific Validation
 			trimmedGrpcService := strings.TrimSpace(route.GrpcService)
 			if trimmedGrpcService == "" {
 				// Redundant due to isGRPC check

@@ -28,7 +28,7 @@ import (
 
 // Pool for responseWriterShim objects
 var shimPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		// Called when pool is empty
 		return &responseWriterShim{
 			header: make(http.Header), // Initialize header map
@@ -116,7 +116,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	}
 
 	httpHandlerAdapter := func(req micro.Request) {
-		// --- Acquire Concurrency Semaphore ---
+		// Acquire Concurrency Semaphore
 		concurrencySem <- struct{}{}
 		metrics.WorkerCount.WithLabelValues(opts.ServiceName, "default").Inc() // Increment active worker gauge
 		defer func() {
@@ -327,7 +327,7 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 	defer nc.Close()
 	logger.Info("Connected to NATS", "url", nc.ConnectedUrl())
 
-	// --- The Core NATS Micro Handler using gRPC Desc ---
+	// The Core NATS Micro Handler using gRPC Desc
 	grpcAdapter := func(req micro.Request) {
 		// Acquire semaphore
 		concurrencySem <- struct{}{}
@@ -451,9 +451,9 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 			"duration_ms", time.Since(startTime).Milliseconds(),
 			"grpc_status_code", statusCode)
 
-	} // end grpcAdapter
+	}
 
-	// --- Add NATS Micro Service ---
+	// Add NATS Micro Service
 	serviceConfig := micro.Config{
 		Name:        opts.ServiceName,
 		Version:     opts.Version,
@@ -477,7 +477,7 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 
 	logger.Info("NATS Micro service started, wrapping gRPC service", "nats_subject", opts.ServiceName)
 
-	// --- Graceful Shutdown (same as ListenAndServe) ---
+	// Graceful Shutdown (same as ListenAndServe)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

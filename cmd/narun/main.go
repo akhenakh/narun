@@ -192,7 +192,7 @@ func handleDeployCmd(args []string) {
 	nodeFlag := deployFlags.String("node", "local", "Target node name (used if -config is not used)")
 	replicasFlag := deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
 
-	// --- Usage function specific to deploy ---
+	// Usage function specific to deploy
 	deployFlags.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: %s deploy [options] <binary_path> [<binary_path>...]
 
@@ -872,19 +872,19 @@ func connectNATS(ctx context.Context, url string, clientName string) (*nats.Conn
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) { slog.Debug(fmt.Sprintf("INFO: NATS reconnected to %s", nc.ConnectedUrl())) }),
-		nats.ClosedHandler(func(nc *nats.Conn) { slog.Debug(fmt.Sprintf("INFO: NATS connection closed.")) }),
+		nats.ClosedHandler(func(nc *nats.Conn) { slog.Debug("INFO: NATS connection closed.") }),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to NATS: %w", err)
 	}
-	slog.Debug(fmt.Sprintf("Connected to NATS successfully."))
+	slog.Debug("Connected to NATS successfully.")
 
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
 		return nil, nil, fmt.Errorf("creating JetStream context: %w", err)
 	}
-	slog.Debug(fmt.Sprintf("JetStream context created."))
+	slog.Debug("JetStream context created.")
 	return nc, js, nil
 }
 

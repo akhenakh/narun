@@ -21,7 +21,7 @@ const (
 	DefaultNatsURL = "nats://localhost:4222"
 )
 
-// --- Simple gRPC Server Implementation ---
+// Simple gRPC Server Implementation
 // Implement the hello_v1.GreeterServer interface
 type greeterServer struct {
 	// Embed the unimplemented server type for forward compatibility

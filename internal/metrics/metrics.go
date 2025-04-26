@@ -6,7 +6,7 @@ import (
 )
 
 var (
-	// --- HTTP Metrics ---
+	// HTTP Metrics
 	HttpRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_gateway_requests_total",
@@ -24,7 +24,7 @@ var (
 		[]string{"method", "path"},
 	)
 
-	// --- gRPC Metrics ---
+	// gRPC Metrics
 	GrpcRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "grpc_gateway_requests_total",
@@ -42,7 +42,7 @@ var (
 		[]string{"grpc_method"}, // Label by full gRPC method
 	)
 
-	// --- NATS Metrics (Common for both HTTP and gRPC gateways) ---
+	// NATS Metrics (Common for both HTTP and gRPC gateways)
 	NatsRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "gateway_nats_requests_total", // Renamed for clarity

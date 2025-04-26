@@ -248,6 +248,7 @@ This project is under active development. Components and APIs may change.
 - after deploy it takes time for the status and running instances count to appear in list-apps
 
 ## Ideas
+- narun ui run a web server to interact with the cluster 
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
 - [X] routing to grpc
 - [X] caddy plugin

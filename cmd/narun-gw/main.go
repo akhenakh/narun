@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/akhenakh/narun/internal/config"
 	"github.com/akhenakh/narun/internal/grpcgateway"
+	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/handler"
 	"github.com/akhenakh/narun/internal/natsutil"
 
@@ -47,7 +47,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to the configuration file")
 	flag.Parse()
 
-	cfg, err := config.LoadConfig(*configFile)
+	cfg, err := gwconfig.LoadConfig(*configFile)
 	if err != nil {
 		slog.Error("Failed to load configuration", "file", *configFile, "error", err)
 		os.Exit(1)
@@ -90,7 +90,7 @@ func main() {
 		// Validate configuration found at least one gRPC route if addr is set
 		hasGrpcRoute := false
 		for _, r := range cfg.Routes {
-			if r.Type == config.RouteTypeGRPC {
+			if r.Type == gwconfig.RouteTypeGRPC {
 				hasGrpcRoute = true
 				break
 			}

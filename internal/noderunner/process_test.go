@@ -103,9 +103,7 @@ func TestVerifyLocalFileHash(t *testing.T) {
 			errorContains:  "unsupported digest format",
 		},
 	}
-	// --- End Test Cases Table ---
 
-	// --- Run Tests ---
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create temp directory for the test file

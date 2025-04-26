@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akhenakh/narun/internal/config"
+	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/metrics" // Import metrics
 	"github.com/nats-io/nats.go"
 	"google.golang.org/grpc"
@@ -61,11 +61,11 @@ var _ protoUnmarshaler = (*rawBytesHolder)(nil)
 
 type GrpcHandler struct {
 	NatsConn *nats.Conn
-	Config   *config.Config
+	Config   *gwconfig.Config
 	Logger   *slog.Logger
 }
 
-func NewGrpcHandler(logger *slog.Logger, nc *nats.Conn, cfg *config.Config) *GrpcHandler {
+func NewGrpcHandler(logger *slog.Logger, nc *nats.Conn, cfg *gwconfig.Config) *GrpcHandler {
 	return &GrpcHandler{
 		NatsConn: nc,
 		Config:   cfg,

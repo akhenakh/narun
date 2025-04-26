@@ -116,18 +116,16 @@ func main() {
 	logger := slog.New(logHandler).With("service", "hello-consumer") // Keep this logical name for logging
 	slog.SetDefault(logger)
 
-	// --- Updated Flags ---
+	//  Updated Flags
 	natsURL := flag.String("nats-url", DefaultNatsURL, "NATS server URL")
 	serviceName := flag.String("service", "hello", "NATS Micro service name to register/listen on")
-	// streamName := flag.String("stream", DefaultStreamName, "NATS stream name (for subject derivation)") // REMOVED
-	// appName := flag.String("app", "hello", "Application name for this consumer") // REMOVED
 	maxConcurrent := flag.Int("concurrency", runtime.NumCPU(), "Maximum number of concurrent requests")
 	flag.Parse()
 
 	// Create handler
 	handler := &helloHandler{}
 
-	// --- Configure options with ServiceName ---
+	//  Configure options with ServiceName
 	opts := nconsumer.Options{
 		NATSURL:       *natsURL,
 		ServiceName:   *serviceName,

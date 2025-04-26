@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/akhenakh/narun/internal/config"
+	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/metrics"
 	"github.com/nats-io/nats.go"
 	// No micro import needed here for the client side
@@ -20,12 +20,12 @@ var _ error = nats.ErrTimeout // Ensure we have the nats error variables availab
 
 type HttpHandler struct {
 	NatsConn *nats.Conn // Use the standard NATS connection
-	Config   *config.Config
+	Config   *gwconfig.Config
 	Logger   *slog.Logger
 	// Remove serviceClient, it's not part of the standard micro client pattern
 }
 
-func NewHttpHandler(logger *slog.Logger, nc *nats.Conn, cfg *config.Config) *HttpHandler {
+func NewHttpHandler(logger *slog.Logger, nc *nats.Conn, cfg *gwconfig.Config) *HttpHandler {
 	// No need to create a micro.ServiceClient
 	return &HttpHandler{
 		NatsConn: nc,
@@ -60,7 +60,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// --- Create NATS Request Message with Headers ---
+	// Create NATS Request Message with Headers
 	// Use GetMicroSubject which handles the service name logic from config
 	subject := h.Config.GetNatsSubject(routeCfg)
 	natsRequest := nats.NewMsg(subject)
@@ -87,10 +87,10 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"headers", natsRequest.Header, // Log headers being sent
 		"body_len", len(natsRequest.Data))
 
-	// --- Send request using standard NATS RequestMsg ---
+	// Send request using standard NATS RequestMsg
 	natsReply, err := h.NatsConn.RequestMsg(natsRequest, h.Config.RequestTimeout)
 
-	// --- Handle NATS Response/Error ---
+	// Handle NATS Response/Error
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		respBody := "Internal server error (NATS communication)"
@@ -119,7 +119,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Process Successful NATS Reply ---
+	// Process Successful NATS Reply
 	h.Logger.Debug("Received NATS reply",
 		"subject", natsReply.Subject, // Note: This is the reply subject, not the original request subject
 		"headers", natsReply.Header,

@@ -73,10 +73,6 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		spec.Command = spec.Name // We'll use the local path later
 	}
 
-	// Validate node selectors if present
-	if len(spec.Nodes) == 0 {
-		// Allow empty Nodes list? Means don't schedule anywhere. Seems reasonable.
-	}
 	nodeNames := make(map[string]bool)
 	for i, nodeSpec := range spec.Nodes {
 		if strings.TrimSpace(nodeSpec.Name) == "" {
