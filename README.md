@@ -21,7 +21,7 @@ Narun is a toolkit for building, deploying, and managing distributed application
 *   **Configuration:** See `cmd/narun-gw/config.yaml` for an example.
 *   **Running:** `go run ./cmd/narun-gw -config ./config.yaml`
 
-### 3. `caddynarun` (Caddy Plugin)
+### 2. `caddynarun` (Caddy Plugin)
 
 *   **Function:** A Caddy v2 HTTP handler plugin providing gateway functionality within Caddy.
 *   **Mechanism:** Integrates with Caddy's request pipeline. Uses directives in the `Caddyfile` to map specific HTTP routes (path/method) to NATS Micro service names. It forwards matching requests as NATS request messages (similar to `narun-gw`) and returns the NATS reply.
