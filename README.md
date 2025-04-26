@@ -1,16 +1,11 @@
 # Narun: A NATS-Based Microservice Toolkit
 
-Narun is a toolkit for building, deploying, and managing distributed applications using [NATS](https://nats.io/) as the central nervous system. It provides components for:
+A simple ecosystem to deploy, maintain and expose services.
 
-1.  **Service Communication:** Exposing backend services (consumers) via HTTP/gRPC gateways using the [NATS Micro](https://docs.nats.io/reference/nats-protocols/micro) protocol.
-2.  **Process Deployment:** Running and managing application binaries (`node-runner`) across multiple nodes using NATS for configuration and artifact storage.
-3.  **Caddy Integration:** An alternative gateway using a Caddy v2 plugin (`caddynarun`).
+It is built around an API gateway exposing backend HTTP/gRPC services (consumers) using the [NATS Micro](https://docs.nats.io/reference/nats-protocols/micro) protocol.
 
-## Core Concepts
-
-*   **NATS Microservices:** Narun leverages the NATS Micro request-reply pattern for communication between gateways and backend services (consumers). Instead of direct HTTP/gRPC calls, requests are transformed into NATS messages sent to specific service subjects. Backend services register as NATS Micro services, listening on these subjects.
-*   **Header Propagation:** HTTP headers or gRPC metadata are passed through NATS headers, allowing backend services to access original request context.
-*   **NATS for Deployment:** The `node-runner` utilizes NATS JetStream features (Key-Value Store and Object Store) as a central repository for application specifications and binaries.
+And some optional tools to manage your running services lifecycle.
+It aims for simplicity and lightness targeting edge devices.
 
 ## Components
 
@@ -23,7 +18,7 @@ Narun is a toolkit for building, deploying, and managing distributed application
 
 ### 2. `caddynarun` (Caddy Plugin)
 
-*   **Function:** A Caddy v2 HTTP handler plugin providing gateway functionality within Caddy.
+*   **Function:** `narun-gw` embedded within Caddy.
 *   **Mechanism:** Integrates with Caddy's request pipeline. Uses directives in the `Caddyfile` to map specific HTTP routes (path/method) to NATS Micro service names. It forwards matching requests as NATS request messages (similar to `narun-gw`) and returns the NATS reply.
 *   **Configuration:** Via the `narun` directive within a Caddyfile route block. See `caddynarun/README.md` for details and examples.
 *   **Running:** Requires building a custom Caddy binary including the plugin:
@@ -66,8 +61,9 @@ Narun is a toolkit for building, deploying, and managing distributed application
 1.  **Start NATS:** Ensure a NATS server (with JetStream enabled for `node-runner`) is running.
 2.  **Start `node-runner`:** Run the `node-runner` agent on one or more target nodes.
     ```bash
-    ./node-runner -nats-url <NATS_URL> -node-id node-1 -data-dir /data/narun &
-    ./node-runner -nats-url <NATS_URL> -node-id node-2 -data-dir /data/narun &
+    # mock two nodes
+    ./node-runner -nats-url <NATS_URL> -node-id node-1 -data-dir /data/narun1 &
+    ./node-runner -nats-url <NATS_URL> -node-id node-2 -data-dir /data/narun2 &
     ```
 3.  **Prepare Application:**
     *   Build your backend application binary (e.g., `./hello-consumer`).
@@ -243,11 +239,12 @@ This project is under active development. Components and APIs may change.
 - caddy config does not need the path
 - global nats url in caddy rather than per path?
 - SIGTERM on an app , node runner does not restart
-- known bug the node-runner is not downloading and hashing the binary back properly.
+- [X] known bug the node-runner is not downloading and hashing the binary back properly.
+- Log history not just live follow
 
 ## Ideas
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
-- [X]routing to grpc
+- [X] routing to grpc
 - [X] caddy plugin
 - metrics for inflights
 - direct response NAT

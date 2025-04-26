@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	RestartDelay    = 5 * time.Second  // Delay before restarting a crashed app
+	RestartDelay    = 4 * time.Second  // Delay before restarting a crashed app
 	MaxRestarts     = 5                // Max restarts before giving up (per instance)
 	StopTimeout     = 10 * time.Second // Time to wait for graceful shutdown before SIGKILL
 	LogBufferSize   = 1024             // Buffer size for log lines
@@ -728,8 +728,9 @@ func (nr *NodeRunner) fetchAndStoreBinary(ctx context.Context, objectName, appNa
 }
 
 // verifyLocalFileHash calculates the SHA256 hash of the local file, encodes it
-// using URL-safe Base64, and compares it with the expected digest string
+// using URL-safe Base64 (no padding), and compares it with the expected digest string
 // from NATS Object Store (e.g., "SHA-256=base64string").
+// It now correctly handles potential padding differences.
 func verifyLocalFileHash(filePath, expectedDigest string) (bool, error) {
 	// Extract the expected Base64 hash value
 	if !strings.HasPrefix(expectedDigest, "SHA-256=") {
@@ -756,23 +757,32 @@ func verifyLocalFileHash(filePath, expectedDigest string) (bool, error) {
 	hashBytes := hasher.Sum(nil) // Get the raw hash bytes
 
 	// Encode the calculated hash bytes using URL-safe Base64 (no padding)
+	// This is kept as NoPadding because that's what the *calculation* produces cleanly.
 	actualBase64Hash := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(hashBytes)
 	actualHexHash := fmt.Sprintf("%x", hashBytes) // Calculate hex too for logging
 
+	// *** FIX: Trim trailing padding characters for consistent comparison ***
+	trimmedExpected := strings.TrimRight(expectedBase64Hash, "=")
+	trimmedActual := strings.TrimRight(actualBase64Hash, "=") // Should already be trimmed, but do it for safety
+
 	slog.Debug("Verifying file hash",
 		"file", filePath,
-		"expected_base64", expectedBase64Hash,
-		"calculated_base64", actualBase64Hash,
+		"expected_base64_raw", expectedBase64Hash, // Log raw expected
+		"calculated_base64_raw", actualBase64Hash, // Log raw calculated
+		"expected_base64_trimmed", trimmedExpected,
+		"calculated_base64_trimmed", trimmedActual,
 		"calculated_hex", actualHexHash)
 
-	// Compare the calculated Base64 hash with the expected one
-	match := actualBase64Hash == expectedBase64Hash
+	// Compare the TRIMMED calculated Base64 hash with the TRIMMED expected one
+	match := trimmedActual == trimmedExpected
 
 	if !match {
-		slog.Warn("Hash verification failed (inside function)", // Differentiate log message
+		// Log detailed comparison info on mismatch
+		slog.Warn("Hash verification failed",
 			"file", filePath,
-			"expected_base64", expectedBase64Hash,
-			"calculated_base64", actualBase64Hash,
+			"expected_digest", expectedDigest,
+			"expected_base64_trimmed", trimmedExpected,
+			"calculated_base64_trimmed", trimmedActual,
 			"calculated_hex", actualHexHash)
 	}
 
