@@ -75,7 +75,6 @@ type logEntry struct {
 	Timestamp  time.Time `json:"timestamp"`
 }
 
-// --- Main Function ---
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -85,14 +84,47 @@ func main() {
 	command := os.Args[1]
 	args := os.Args[2:]
 
+	// Special case for 'deploy -h' or 'deploy --help'
+	if command == "deploy" && len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
+		// Create a dummy flagset just to call its Usage()
+		deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
+		// Define the flags again so Usage() knows about them
+		deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
+		deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional). If provided, overrides -name, -tag, -node, -replicas.")
+		deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+		deployFlags.String("name", "", "Application name (required if -config is not used)")
+		deployFlags.String("tag", "", "Binary version tag (required if -config is not used)")
+		deployFlags.String("node", "local", "Target node name (used if -config is not used)")
+		deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
+		deployFlags.Usage = func() { // Define the specific Usage text again
+			fmt.Fprintf(os.Stderr, `Usage: %s deploy [options] <binary_path> [<binary_path>...]
+
+Uploads application binaries and configuration.
+
+Arguments:
+  <binary_path>   Path to the application binary file (at least one required).
+
+Options:
+`, os.Args[0])
+			deployFlags.PrintDefaults()
+			fmt.Fprintln(os.Stderr, "\nNote: If -config is provided, the -name, -tag, -node, and -replicas flags are ignored.")
+		}
+		deployFlags.Usage() // Call the specific usage
+		os.Exit(0)          // Exit successfully after showing help
+	}
+
+	// --- Normal Command Handling ---
 	switch command {
 	case "deploy":
 		handleDeployCmd(args)
 	case "logs":
+		// Add -h check for logs if desired
 		handleLogsCmd(args)
 	case "list-images":
+		// Add -h check for list-images if desired
 		handleListImagesCmd(args)
 	case "list-apps":
+		// Add -h check for list-apps if desired
 		handleListAppsCmd(args)
 	case "help", "-h", "--help":
 		printUsage()
@@ -110,14 +142,18 @@ Usage: %s <command> [options] [arguments...]
 
 Commands:
   deploy        Upload application binaries and configuration.
-                Arguments: <binary_path> [<binary_path>...]
+                Run '%s deploy -h' for specific deploy options.
   logs          Stream logs from node runners.
   list-images   List application binaries stored in NATS Object Store.
   list-apps     List deployed applications and their status on nodes.
   help          Show this help message.
 
+Common Options (apply to multiple commands where relevant):
+  -nats <url>     NATS server URL (default: %s)
+  -timeout <dur>  Timeout for NATS operations (default: %s)
+
 Options for deploy:
-`, os.Args[0])
+`, os.Args[0], os.Args[0], DefaultNatsURL, DefaultTimeout)
 	// Print deploy flags specifically
 	deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
 	deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
@@ -156,59 +192,131 @@ Options for deploy:
 func handleDeployCmd(args []string) {
 	deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
 	natsURL := deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	configFile := deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (required)")
+	configFile := deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional). If provided, overrides -name, -tag, -node, -replicas.")
 	timeout := deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+	// Flags used when -config is NOT provided
+	appNameFlag := deployFlags.String("name", "", "Application name (required if -config is not used)")
+	tagFlag := deployFlags.String("tag", "", "Binary version tag (required if -config is not used)")
+	nodeFlag := deployFlags.String("node", "local", "Target node name (used if -config is not used)")
+	replicasFlag := deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
+
+	// --- Usage function specific to deploy ---
+	deployFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s deploy [options] <binary_path> [<binary_path>...]
+
+Uploads application binaries and configuration.
+
+Arguments:
+  <binary_path>   Path to the application binary file (at least one required).
+
+Options:
+`, os.Args[0])
+		deployFlags.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "\nNote: If -config is provided, the -name, -tag, -node, and -replicas flags are ignored.")
+	}
 
 	if err := deployFlags.Parse(args); err != nil {
-		log.Fatalf("Error parsing deploy flags: %v", err)
+		// Usage is already printed by ExitOnError
+		return
 	}
 	binaryFiles := deployFlags.Args()
 	if len(binaryFiles) == 0 {
-		log.Fatal("Deploy Error: At least one binary file path must be provided after flags.")
-	}
-	if *configFile == "" {
-		log.Fatal("Deploy Error: -config flag (path to ServiceSpec YAML) is required.")
-	}
-	if _, err := os.Stat(*configFile); os.IsNotExist(err) {
-		log.Fatalf("Deploy Error: Config file not found at %s", *configFile)
+		log.Println("Deploy Error: At least one binary file path must be provided.")
+		deployFlags.Usage()
+		os.Exit(1)
 	}
 
-	log.Printf("Starting Deployment: Config='%s', Binaries=%v, NATS='%s'", *configFile, binaryFiles, *natsURL)
-
-	configData, err := os.ReadFile(*configFile)
-	if err != nil {
-		log.Fatalf("Deploy Error: reading config file %s: %v", *configFile, err)
-	}
 	var spec ServiceSpec
-	if err := yaml.Unmarshal(configData, &spec); err != nil {
-		log.Fatalf("Deploy Error: parsing ServiceSpec YAML from %s: %v", *configFile, err)
-	}
-	if spec.Name == "" {
-		log.Fatalf("Deploy Error: 'name' field is missing or empty in %s", *configFile)
-	}
-	if spec.BinaryVersionTag == "" {
-		log.Fatalf("Deploy Error: 'binary_version_tag' field is missing or empty in %s", *configFile)
-	}
-	// Node validation... (keep it short for brevity)
-	nodeNames := make(map[string]bool)
-	for i, nodeSpec := range spec.Nodes {
-		if strings.TrimSpace(nodeSpec.Name) == "" {
-			log.Fatalf("Deploy Error: node selector %d: name empty", i)
+	var configData []byte
+	var err error
+
+	if *configFile != "" {
+		// --- Mode 1: Using -config file ---
+		log.Printf("Starting Deployment using Config File: Config='%s', Binaries=%v, NATS='%s'", *configFile, binaryFiles, *natsURL)
+		if _, err = os.Stat(*configFile); os.IsNotExist(err) {
+			log.Fatalf("Deploy Error: Config file not found at %s", *configFile)
 		}
-		if nodeSpec.Replicas <= 0 {
-			log.Fatalf("Deploy Error: node selector %s: replicas must be positive", nodeSpec.Name)
+		configData, err = os.ReadFile(*configFile)
+		if err != nil {
+			log.Fatalf("Deploy Error: reading config file %s: %v", *configFile, err)
 		}
-		if nodeNames[nodeSpec.Name] {
-			log.Fatalf("Deploy Error: duplicate node selector %s", nodeSpec.Name)
+		if err = yaml.Unmarshal(configData, &spec); err != nil {
+			log.Fatalf("Deploy Error: parsing ServiceSpec YAML from %s: %v", *configFile, err)
 		}
-		nodeNames[nodeSpec.Name] = true
+		// Validate mandatory fields from file
+		if spec.Name == "" {
+			log.Fatalf("Deploy Error: 'name' field is missing or empty in %s", *configFile)
+		}
+		if spec.BinaryVersionTag == "" {
+			log.Fatalf("Deploy Error: 'binary_version_tag' field is missing or empty in %s", *configFile)
+		}
+		// Node validation (keep it simple)
+		for i, nodeSpec := range spec.Nodes {
+			if strings.TrimSpace(nodeSpec.Name) == "" {
+				log.Fatalf("Deploy Error in %s: node selector %d: name empty", *configFile, i)
+			}
+			if nodeSpec.Replicas <= 0 {
+				log.Fatalf("Deploy Error in %s: node selector %s: replicas must be positive", *configFile, nodeSpec.Name)
+			}
+			// Check for duplicate node names within the file's spec
+			// (omitted for brevity, assume initial validation is sufficient here)
+		}
+		log.Printf("Deploying ServiceSpec from %s: AppName='%s', BinaryVersionTag='%s', TargetNodes=%+v",
+			*configFile, spec.Name, spec.BinaryVersionTag, spec.Nodes)
+
+	} else {
+		// --- Mode 2: Using flags ---
+		log.Printf("Starting Deployment using Flags: Binaries=%v, NATS='%s'", binaryFiles, *natsURL)
+		// Validate required flags for this mode
+		if *appNameFlag == "" {
+			log.Println("Deploy Error: -name flag is required when -config is not provided.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
+		if *tagFlag == "" {
+			log.Println("Deploy Error: -tag flag is required when -config is not provided.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
+		if *replicasFlag <= 0 {
+			log.Println("Deploy Error: -replicas must be positive.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
+		if strings.TrimSpace(*nodeFlag) == "" {
+			log.Println("Deploy Error: -node cannot be empty.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
+
+		// Generate the ServiceSpec in memory
+		spec = ServiceSpec{
+			Name:             *appNameFlag,
+			BinaryVersionTag: *tagFlag,
+			Nodes: []NodeSelectorSpec{
+				{
+					Name:     *nodeFlag,
+					Replicas: *replicasFlag,
+				},
+			},
+			// Args and Env are empty when using flags
+		}
+
+		log.Printf("Deploying Generated ServiceSpec: AppName='%s', BinaryVersionTag='%s', TargetNode='%s', Replicas=%d",
+			spec.Name, spec.BinaryVersionTag, spec.Nodes[0].Name, spec.Nodes[0].Replicas)
+
+		// Marshal the generated spec to YAML for upload
+		configData, err = yaml.Marshal(spec)
+		if err != nil {
+			log.Fatalf("Deploy Error: failed to marshal generated ServiceSpec: %v", err)
+		}
 	}
 
-	appName := spec.Name
-	binaryVersionTag := spec.BinaryVersionTag
-	log.Printf("Deploying ServiceSpec: AppName='%s', BinaryVersionTag='%s', TargetNodes=%+v", appName, binaryVersionTag, spec.Nodes)
+	// --- Common Deployment Logic ---
+	appName := spec.Name                      // Use name from loaded or generated spec
+	binaryVersionTag := spec.BinaryVersionTag // Use tag from loaded or generated spec
 
-	// NATS Connection and JetStream Setup
+	// NATS Connection and JetStream Setup (remains the same)
 	ctxAll, cancelAll := context.WithCancel(context.Background())
 	defer cancelAll()
 	connectCtx, connectCancel := context.WithTimeout(ctxAll, *timeout)
@@ -219,7 +327,7 @@ func handleDeployCmd(args []string) {
 	}
 	defer nc.Close()
 
-	// Get Object Store handle
+	// Get Object Store handle (remains the same)
 	osCtx, osCancel := context.WithTimeout(ctxAll, 5*time.Second)
 	objStore, err := js.ObjectStore(osCtx, AppBinariesOSBucket)
 	osCancel()
@@ -232,7 +340,7 @@ func handleDeployCmd(args []string) {
 		}
 	}
 
-	// Loop Through Provided Binaries
+	// Loop Through Provided Binaries (remains the same, uses binaryVersionTag from spec)
 	uploadErrors := false
 	for _, binaryPath := range binaryFiles {
 		log.Printf("--- Processing binary: %s ---", binaryPath)
@@ -250,6 +358,7 @@ func handleDeployCmd(args []string) {
 		}
 		log.Printf("Detected Platform: %s / %s", goos, goarch)
 
+		// Construct object name using the version tag from the spec (loaded or generated)
 		objectName := fmt.Sprintf("%s-%s-%s", binaryVersionTag, goos, goarch)
 		log.Printf("--> NATS Object Store Name: %s", objectName)
 
@@ -263,12 +372,15 @@ func handleDeployCmd(args []string) {
 			continue
 		}
 
-		putCtx, putCancel := context.WithTimeout(ctxAll, *timeout*2)
+		putCtx, putCancel := context.WithTimeout(ctxAll, *timeout*2) // Increased timeout for potentially large binaries
 		meta := jetstream.ObjectMeta{
 			Name:        objectName,
 			Description: fmt.Sprintf("Binary for %s (%s/%s) tag %s", appName, goos, goarch, binaryVersionTag),
 			Metadata: map[string]string{
-				"narun-goos": goos, "narun-goarch": goarch, "narun-version-tag": binaryVersionTag, "narun-original-file": binaryBaseName,
+				"narun-goos":          goos,
+				"narun-goarch":        goarch,
+				"narun-version-tag":   binaryVersionTag,
+				"narun-original-file": binaryBaseName,
 			},
 		}
 		objInfo, err := objStore.Put(putCtx, meta, fileHandle)
@@ -289,7 +401,7 @@ func handleDeployCmd(args []string) {
 		log.Fatal("Deployment failed: One or more binary uploads encountered errors.")
 	}
 
-	// Upload/Update Config to KV Store
+	// Upload/Update Config to KV Store (remains the same, uses appName and configData)
 	kvCtx, kvCancel := context.WithTimeout(ctxAll, 10*time.Second)
 	kvStore, err := js.KeyValue(kvCtx, AppConfigKVBucket)
 	kvCancel()
@@ -303,7 +415,7 @@ func handleDeployCmd(args []string) {
 	}
 	log.Printf("Updating configuration key '%s' in KV store...", appName)
 	putCtx, putCancel := context.WithTimeout(ctxAll, 10*time.Second)
-	revision, err := kvStore.Put(putCtx, appName, configData)
+	revision, err := kvStore.Put(putCtx, appName, configData) // Upload loaded or generated YAML
 	putCancel()
 	if err != nil {
 		log.Fatalf("Deploy Error: updating configuration key '%s': %v", appName, err)

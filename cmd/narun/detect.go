@@ -43,7 +43,9 @@ func detectBinaryPlatform(filePath string) (goos string, goarch string, err erro
 		switch elfFile.OSABI {
 		case elf.ELFOSABI_LINUX, elf.ELFOSABI_NONE:
 			goos = "linux"
-		// Add other OSABI mappings if needed (e.g., FreeBSD)
+		case elf.ELFOSABI_FREEBSD:
+			goos = "freebsd"
+
 		default:
 			return "", "", fmt.Errorf("unsupported ELF OSABI '%s' in %s", elfFile.OSABI, filePath)
 		}
@@ -106,6 +108,7 @@ func detectBinaryPlatform(filePath string) (goos string, goarch string, err erro
 			goarch = "arm64"
 		case pe.IMAGE_FILE_MACHINE_I386:
 			goarch = "386"
+
 		// Add other machine types if needed
 		default:
 			return "", "", fmt.Errorf("unsupported PE machine type '%#x' in %s", peFile.Machine, filePath)
