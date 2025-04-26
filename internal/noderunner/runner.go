@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime" // Import runtime
 	"sort"
 	"strings"
 	"sync"
@@ -18,7 +19,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-var runnerVersion = "0.2.0-dev" // Incremented version
+var runnerVersion = "0.2.1-dev" // Incremented version
 
 // NodeRunner manages application processes on a single node.
 type NodeRunner struct {
@@ -33,12 +34,14 @@ type NodeRunner struct {
 	dataDir      string
 	version      string
 	startTime    time.Time
+	localOS      string // ** NEW: Detected OS **
+	localArch    string // ** NEW: Detected Arch **
 	globalCtx    context.Context
 	globalCancel context.CancelFunc
 	shutdownWg   sync.WaitGroup
 }
 
-// NewNodeRunner creates and initializes a new NodeRunner. (largely unchanged)
+// NewNodeRunner creates and initializes a new NodeRunner.
 func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeRunner, error) {
 	// ... (hostname, dataDir, logger setup identical) ...
 	if nodeID == "" {
@@ -51,7 +54,6 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	if dataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
-	// Ensure dataDir exists
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory %s: %w", dataDir, err)
 	}
@@ -64,6 +66,11 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 	logger = logger.With("node_id", nodeID, "component", "node-runner")
+
+	// ** Detect Local Platform **
+	localOS := runtime.GOOS
+	localArch := runtime.GOARCH
+	logger.Info("Detected local platform", "goos", localOS, "goarch", localArch)
 
 	// ... (NATS connection setup identical) ...
 	nc, err := nats.Connect(natsURL,
@@ -89,7 +96,6 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	}
 	logger.Info("Connected to NATS", "url", natsURL)
 
-	// ... (JetStream context setup identical) ...
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
@@ -100,8 +106,6 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	// --- Bind to KV Stores (Unchanged) ---
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer setupCancel()
-
-	// App Configs KV
 	kvAppConfigs, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
 		Bucket:      AppConfigKVBucket,
 		Description: "Stores application service specifications for node runners.",
@@ -111,13 +115,8 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", AppConfigKVBucket, err)
 	}
 	logger.Info("Bound to App Config KV store", "bucket", AppConfigKVBucket)
-
-	// Node States KV (with TTL)
 	kvNodeStates, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
-		Bucket:      NodeStateKVBucket,
-		Description: "Stores node runner states and heartbeats.",
-		TTL:         NodeStateKVTTL,
-		History:     1,
+		Bucket: NodeStateKVBucket, Description: "Stores node runner states and heartbeats.", TTL: NodeStateKVTTL, History: 1,
 	})
 	if err != nil {
 		nc.Close()
@@ -127,8 +126,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 
 	// Bind to Object Store (Unchanged)
 	osBucket, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
-		Bucket:      AppBinariesOSBucket,
-		Description: "Stores application binaries.",
+		Bucket: AppBinariesOSBucket, Description: "Stores application binaries.",
 	})
 	if err != nil {
 		nc.Close()
@@ -146,11 +144,13 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		kvAppConfigs: kvAppConfigs,
 		kvNodeStates: kvNodeStates,
 		appBinaries:  osBucket,
-		state:        NewAppStateManager(), // Use new state manager
+		state:        NewAppStateManager(),
 		logger:       logger,
 		dataDir:      dataDirAbs,
 		version:      runnerVersion,
 		startTime:    runnerStartTime,
+		localOS:      localOS,   // ** Store detected OS **
+		localArch:    localArch, // ** Store detected Arch **
 		globalCtx:    gCtx,
 		globalCancel: gCancel,
 	}
@@ -160,10 +160,10 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 
 // Run starts the node runner's main loop. (Watch loop structure unchanged, but sync/handle changes)
 func (nr *NodeRunner) Run() error {
-	nr.logger.Info("Starting node runner", "version", nr.version)
+	nr.logger.Info("Starting node runner", "version", nr.version, "goos", nr.localOS, "goarch", nr.localArch) // Log platform
 	defer nr.logger.Info("Node runner stopped")
 
-	// Initial Registration and Heartbeat Loop (Unchanged)
+	// Initial Registration and Heartbeat Loop (Unchanged setup, uses updated updateNodeState)
 	if err := nr.updateNodeState("running"); err != nil {
 		nr.logger.Error("Initial node state registration failed", "error", err)
 	} else {
@@ -173,18 +173,17 @@ func (nr *NodeRunner) Run() error {
 	go nr.heartbeatLoop()
 	nr.logger.Info("Heartbeat loop started", "interval", NodeHeartbeatInterval)
 
-	// Initial sync (Uses modified handleAppConfigUpdate)
-	syncCtx, syncCancel := context.WithTimeout(nr.globalCtx, 60*time.Second) // Increased timeout
+	// Initial sync
+	syncCtx, syncCancel := context.WithTimeout(nr.globalCtx, 60*time.Second)
 	if err := nr.syncAllApps(syncCtx); err != nil {
 		nr.logger.Error("Failed initial app synchronization", "error", err)
-		// Continue running
 	} else {
 		nr.logger.Info("Initial app synchronization complete")
 	}
 	syncCancel()
 
 	// Watch for configuration changes (Unchanged setup)
-	watcher, err := nr.kvAppConfigs.WatchAll(nr.globalCtx)
+	watcher, err := nr.kvAppConfigs.WatchAll(nr.globalCtx, jetstream.IgnoreDeletes()) // Optimization: ignore deletes initially, handle sync/stop explicitly
 	if err != nil {
 		if nr.globalCtx.Err() != nil {
 			nr.logger.Info("Failed to start KV watcher due to shutdown signal")
@@ -195,7 +194,7 @@ func (nr *NodeRunner) Run() error {
 	defer watcher.Stop()
 	nr.logger.Info("Started watching for app configuration changes", "bucket", AppConfigKVBucket)
 
-	// Watcher Loop (Uses modified handleAppConfigUpdate)
+	// Watcher Loop
 	nr.shutdownWg.Add(1)
 	go func() {
 		defer nr.shutdownWg.Done()
@@ -207,13 +206,12 @@ func (nr *NodeRunner) Run() error {
 					nr.logger.Warn("Error stopping KV watcher", "error", err)
 				}
 				return
-
 			case entry, ok := <-watcher.Updates():
 				if !ok {
 					nr.logger.Warn("KV Watcher updates channel closed.")
 					if nr.globalCtx.Err() == nil {
 						nr.logger.Error("Watcher closed unexpectedly while runner context is still active.")
-						nr.globalCancel()
+						nr.globalCancel() // Trigger shutdown if watcher fails unexpectedly
 					} else {
 						nr.logger.Info("Watcher closed during shutdown.")
 					}
@@ -223,9 +221,7 @@ func (nr *NodeRunner) Run() error {
 					nr.logger.Debug("Received nil update from watcher")
 					continue
 				}
-				// *** Use the modified handler ***
 				nr.handleAppConfigUpdate(nr.globalCtx, entry) // Pass context
-
 			}
 		}
 	}()
@@ -234,12 +230,12 @@ func (nr *NodeRunner) Run() error {
 	<-nr.globalCtx.Done()
 	nr.logger.Info("Shutdown signal received, initiating shutdown...")
 
-	// Update node state (Unchanged)
+	// Update node state (Unchanged setup, uses updated updateNodeState)
 	if err := nr.updateNodeState("shutting_down"); err != nil {
 		nr.logger.Warn("Failed to update node state to shutting_down", "error", err)
 	}
 
-	// *** Initiate shutdown of managed apps (Modified) ***
+	// Initiate shutdown of managed apps
 	nr.shutdownAllAppInstances()
 
 	// Stop watcher (Unchanged)
@@ -261,14 +257,11 @@ func (nr *NodeRunner) Run() error {
 	}
 
 	// Drain NATS connection (Unchanged)
-	// ... (drain logic remains the same) ...
 	if nr.nc != nil && !nr.nc.IsClosed() {
 		nr.logger.Info("Draining NATS connection...")
-		drainTimeout := 10 * time.Second // Timeout for drain operation
+		drainTimeout := 10 * time.Second
 		drainDone := make(chan error, 1)
-		go func() {
-			drainDone <- nr.nc.Drain()
-		}()
+		go func() { drainDone <- nr.nc.Drain() }()
 		select {
 		case err := <-drainDone:
 			if err != nil {
@@ -287,14 +280,11 @@ func (nr *NodeRunner) Run() error {
 	// Return context error if any (Unchanged)
 	if nr.globalCtx.Err() != nil && nr.globalCtx.Err() != context.Canceled {
 		return fmt.Errorf("runner stopped due to context error: %w", nr.globalCtx.Err())
-	} else if nr.globalCtx.Err() == context.Canceled {
-		return nil
 	}
-
 	return nil
 }
 
-// heartbeatLoop (Unchanged)
+// heartbeatLoop (Unchanged logic, uses updated updateNodeState)
 func (nr *NodeRunner) heartbeatLoop() {
 	defer nr.shutdownWg.Done()
 	ticker := time.NewTicker(NodeHeartbeatInterval)
@@ -315,28 +305,28 @@ func (nr *NodeRunner) heartbeatLoop() {
 	}
 }
 
-// updateNodeState constructs the current node state and puts it into the KV store. (Modified)
+// updateNodeState constructs the current node state and puts it into the KV store.
 func (nr *NodeRunner) updateNodeState(status string) error {
-	// Get current list of managed instance IDs
 	allAppInfos := nr.state.GetAllAppInfos()
 	managedInstanceIDs := make([]string, 0)
 	for _, info := range allAppInfos {
 		info.mu.RLock()
 		for _, instance := range info.instances {
-			// Only include running/starting instances? Or all managed? Let's include all known.
 			managedInstanceIDs = append(managedInstanceIDs, instance.InstanceID)
 		}
 		info.mu.RUnlock()
 	}
-	sort.Strings(managedInstanceIDs) // Sort for consistent output
+	sort.Strings(managedInstanceIDs)
 
 	state := NodeState{
 		NodeID:           nr.nodeID,
 		LastSeen:         time.Now(),
 		Version:          nr.version,
 		StartTime:        nr.startTime,
-		ManagedInstances: managedInstanceIDs, // Updated field
+		ManagedInstances: managedInstanceIDs,
 		Status:           status,
+		GOOS:             nr.localOS,   // ** Include OS **
+		GOARCH:           nr.localArch, // ** Include Arch **
 	}
 
 	stateData, err := json.Marshal(state)
@@ -353,7 +343,7 @@ func (nr *NodeRunner) updateNodeState(status string) error {
 	return nil
 }
 
-// syncAllApps gets all current configurations and ensures apps are running. (Modified)
+// syncAllApps gets all current configurations and ensures apps are running.
 func (nr *NodeRunner) syncAllApps(ctx context.Context) error {
 	nr.logger.Info("Performing initial synchronization of all applications...")
 	keysLister, err := nr.kvAppConfigs.ListKeys(ctx)
@@ -366,8 +356,10 @@ func (nr *NodeRunner) syncAllApps(ctx context.Context) error {
 	}
 	defer keysLister.Stop()
 
+	// Keep track of keys seen during sync
+	keysSeen := make(map[string]bool)
 	syncWg := sync.WaitGroup{}
-	errChan := make(chan error, 1) // Channel to report first error
+	errChan := make(chan error, 1)
 
 	keysChan := keysLister.Keys()
 
@@ -376,7 +368,11 @@ syncLoop:
 		select {
 		case <-ctx.Done():
 			nr.logger.Warn("Initial synchronization canceled or timed out.", "error", ctx.Err())
-			return ctx.Err() // Return context error
+			keysLister.Stop() // Ensure lister is stopped on timeout/cancel
+			// Wait for any already running goroutines before returning
+			syncWg.Wait()
+			close(errChan)
+			return ctx.Err()
 		case key, ok := <-keysChan:
 			if !ok { // Channel closed
 				break syncLoop
@@ -384,63 +380,80 @@ syncLoop:
 			if key == "" {
 				continue
 			}
+			keysSeen[key] = true // Mark key as present in KV
 
 			syncWg.Add(1)
 			go func(k string) {
 				defer syncWg.Done()
-				entryCtx, entryCancel := context.WithTimeout(ctx, 20*time.Second) // Timeout per entry get + handle
+				entryCtx, entryCancel := context.WithTimeout(ctx, 20*time.Second)
 				defer entryCancel()
 
 				entry, getErr := nr.kvAppConfigs.Get(entryCtx, k)
 				if getErr != nil {
-					// Treat not found during sync as deleted (applies only if watcher missed delete?)
 					if errors.Is(getErr, jetstream.ErrKeyNotFound) {
+						// This case should be rare if ListKeys is consistent, but handle defensively
 						nr.logger.Warn("App config key disappeared during sync, treating as deleted", "key", k)
-						// Simulate a delete operation
 						nr.handleAppConfigUpdate(entryCtx, &simulatedDeleteEntry{key: k, bucket: AppConfigKVBucket})
 					} else {
 						nr.logger.Error("Failed to get KV entry during sync", "key", k, "error", getErr)
-						select { // Report first error
+						select {
 						case errChan <- fmt.Errorf("sync failed getting key %s: %w", k, getErr):
 						default:
 						}
 					}
-					return // Stop processing this key on error
+					return
 				}
-				// Use the context derived for this entry for handling
-				nr.handleAppConfigUpdate(entryCtx, entry)
+				nr.handleAppConfigUpdate(entryCtx, entry) // Process the update
 			}(key)
 		}
 	}
 
 	syncWg.Wait()
-	close(errChan) // Close after WaitGroup is done
+	close(errChan)
 
-	// Return the first error encountered, if any
 	if firstErr := <-errChan; firstErr != nil {
-		return firstErr
+		return firstErr // Return the first processing error encountered
 	}
 
-	// TODO: Prune apps running locally that are *no longer* in the KV store at all?
-	// Get all keys from KV again (or use the list generated during sync).
-	// Get all running apps from local state.
-	// Stop any local apps whose key doesn't exist in KV.
+	// --- Pruning Phase ---
+	nr.logger.Info("Pruning locally managed apps not found in KV store...")
+	allLocalApps := nr.state.GetAllAppInfos()
+	for appName, appInfo := range allLocalApps {
+		if !keysSeen[appName] { // If this app wasn't in the KV keys list...
+			nr.logger.Info("Pruning app no longer in KV config", "app", appName)
+			// Lock the appInfo for stopping and deleting
+			appInfo.mu.Lock()
+			nr.stopAllInstancesForApp(ctx, appInfo, nr.logger.With("app", appName))
+			// Clear state within appInfo
+			appInfo.spec = nil
+			appInfo.configHash = ""
+			appInfo.instances = make([]*ManagedApp, 0)
+			appInfo.mu.Unlock()
+			// Remove the app entry from the state manager entirely
+			nr.state.DeleteApp(appName)
+		}
+	}
+	nr.logger.Info("App pruning complete.")
 
 	return nil
 }
 
-// handleAppConfigUpdate processes a single KV entry update (PUT or DELETE). (Heavily Modified)
+// handleAppConfigUpdate processes a single KV entry update (PUT or DELETE).
 func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream.KeyValueEntry) {
 	if entry.Bucket() != AppConfigKVBucket {
 		nr.logger.Warn("Received KV update from unexpected bucket", "bucket", entry.Bucket())
 		return
 	}
 	appName := entry.Key()
-	logger := nr.logger.With("app", appName, "kv_revision", entry.Revision(), "kv_operation", entry.Operation().String())
+	// Create logger early
+	logger := nr.logger.With("app", appName)
+	if entry.Operation() != jetstream.KeyValueDelete && entry.Operation() != jetstream.KeyValuePurge { // Avoid logging revision for deletes
+		logger = logger.With("kv_revision", entry.Revision())
+	}
+	logger = logger.With("kv_operation", entry.Operation().String())
 
 	appInfo := nr.state.GetAppInfo(appName) // Gets or creates appInfo struct
-
-	appInfo.mu.Lock() // Lock the specific app's state for processing
+	appInfo.mu.Lock()                       // Lock the specific app's state for processing
 	defer appInfo.mu.Unlock()
 
 	switch entry.Operation() {
@@ -449,16 +462,14 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		spec, err := ParseServiceSpec(entry.Value())
 		if err != nil {
 			logger.Error("Failed to parse service spec from KV", "error", err)
-			// TODO: How to handle parse failure? Stop existing instances? Mark app as failed?
-			nr.stopAllInstancesForApp(ctx, appInfo, logger) // Stop existing if spec is bad
-			appInfo.spec = nil                              // Clear spec
+			nr.stopAllInstancesForApp(ctx, appInfo, logger)
+			appInfo.spec = nil
 			appInfo.configHash = ""
-			// Publish failure status for the app? Difficult without instance IDs.
 			return
 		}
 		if spec.Name != appName {
 			logger.Error("Service name in spec does not match KV key", "spec_name", spec.Name, "key", appName)
-			nr.stopAllInstancesForApp(ctx, appInfo, logger) // Stop existing if spec is invalid
+			nr.stopAllInstancesForApp(ctx, appInfo, logger)
 			appInfo.spec = nil
 			appInfo.configHash = ""
 			return
@@ -467,7 +478,6 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		newConfigHash, err := calculateSpecHash(spec)
 		if err != nil {
 			logger.Error("Failed to hash service spec", "error", err)
-			// Treat as transient error? Or stop? Let's stop.
 			nr.stopAllInstancesForApp(ctx, appInfo, logger)
 			appInfo.spec = nil
 			appInfo.configHash = ""
@@ -475,8 +485,8 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		}
 
 		// Update spec and hash in appInfo
-		appInfo.spec = spec
 		configHashChanged := appInfo.configHash != newConfigHash
+		appInfo.spec = spec // Store the parsed spec
 		appInfo.configHash = newConfigHash
 
 		// Determine target replicas for *this* node
@@ -486,81 +496,72 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 
 		if configHashChanged {
 			logger.Info("Configuration hash changed, restarting all instances")
-			nr.stopAllInstancesForApp(ctx, appInfo, logger) // Stop existing
-			// Clear the slice after stopping
+			nr.stopAllInstancesForApp(ctx, appInfo, logger)
 			appInfo.instances = make([]*ManagedApp, 0, targetReplicas)
 			currentReplicas = 0 // Reset current count
 		}
 
 		// --- Adjust Replicas ---
 		if targetReplicas > currentReplicas {
-			// Scale Up: Start new instances
 			needed := targetReplicas - currentReplicas
 			logger.Info("Scaling up instances", "needed", needed)
 			for i := 0; i < needed; i++ {
-				// Find the next available replica index
 				replicaIndex := findNextReplicaIndex(appInfo.instances, targetReplicas)
 				if replicaIndex == -1 {
-					logger.Error("Could not find available replica index slot, aborting scale up for this instance", "target", targetReplicas, "current_count", len(appInfo.instances))
-					break // Stop trying to add more if we can't find a slot
+					logger.Error("Could not find available replica index slot", "target", targetReplicas, "current_count", len(appInfo.instances))
+					break
 				}
+				// ** Pass BinaryVersionTag to startAppInstance **
 				if err := nr.startAppInstance(ctx, appInfo, replicaIndex); err != nil {
 					logger.Error("Failed to start new instance during scale up", "replica_index", replicaIndex, "error", err)
-					// Don't stop scaling up other instances if one fails? Or should we? Let's continue for now.
 				} else {
-					// Add a small delay between instance starts?
 					time.Sleep(100 * time.Millisecond)
 				}
 			}
 		} else if targetReplicas < currentReplicas {
-			// Scale Down: Stop excess instances (stop highest index first)
 			excess := currentReplicas - targetReplicas
 			logger.Info("Scaling down instances", "excess", excess)
-
-			// Create a temporary slice to sort by index easily
-			sortedInstances := append([]*ManagedApp{}, appInfo.instances...) // Shallow copy
+			sortedInstances := append([]*ManagedApp{}, appInfo.instances...)
 			sort.Slice(sortedInstances, func(i, j int) bool {
-				// Extract index from InstanceID for sorting (descending)
 				idxI := extractReplicaIndex(sortedInstances[i].InstanceID)
 				idxJ := extractReplicaIndex(sortedInstances[j].InstanceID)
-				return idxI > idxJ // Higher index first
+				return idxI > idxJ
 			})
-
-			// Select the top 'excess' instances from the sorted list
 			instancesToStop := make([]*ManagedApp, 0, excess)
 			if excess <= len(sortedInstances) {
 				instancesToStop = sortedInstances[:excess]
 			} else {
 				logger.Warn("Excess count greater than sorted instances, stopping all.", "excess", excess, "count", len(sortedInstances))
-				instancesToStop = sortedInstances // Should not happen if currentReplicas is correct
+				instancesToStop = sortedInstances
 			}
-
-			// Stop the selected instances
 			remainingInstances := make([]*ManagedApp, 0, targetReplicas)
-			stopMap := make(map[string]bool) // Track which IDs to stop
+			stopMap := make(map[string]bool)
 			for _, inst := range instancesToStop {
 				stopMap[inst.InstanceID] = true
 				logger.Info("Stopping excess instance", "instance_id", inst.InstanceID)
-				// Use a background context for stop, don't let one failure block others?
-				// Or use the passed context? Using passed ctx might time out shutdown.
-				go func(instanceToStop *ManagedApp) { // Stop concurrently
+				go func(instanceToStop *ManagedApp) {
 					if err := nr.stopAppInstance(instanceToStop, true); err != nil {
 						logger.Error("Error stopping excess instance", "instance_id", instanceToStop.InstanceID, "error", err)
 					}
-				}(inst) // Pass the instance pointer
+				}(inst)
 			}
-
-			// Rebuild the instance slice, keeping only those not marked for stopping
 			for _, inst := range appInfo.instances {
 				if !stopMap[inst.InstanceID] {
 					remainingInstances = append(remainingInstances, inst)
 				}
 			}
 			appInfo.instances = remainingInstances // Update the main slice
-
 		} else {
 			// target == current AND hash didn't change
-			logger.Info("Instance count matches target and config hash unchanged. No action needed.")
+			if targetReplicas == 0 {
+				logger.Info("Target replica count is 0. Ensuring no instances are running.")
+				if len(appInfo.instances) > 0 {
+					nr.stopAllInstancesForApp(ctx, appInfo, logger)
+					appInfo.instances = make([]*ManagedApp, 0)
+				}
+			} else {
+				logger.Info("Instance count matches target and config hash unchanged. No action needed.")
+			}
 		}
 
 	case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
@@ -569,28 +570,26 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		appInfo.spec = nil                              // Clear spec
 		appInfo.configHash = ""
 		appInfo.instances = make([]*ManagedApp, 0) // Clear instances slice
-		// Note: state manager still holds the appInfo entry unless explicitly deleted.
-		// Consider nr.state.DeleteApp(appName) here? If so, need to release lock first.
-		// Let's keep the appInfo entry but empty for now. Sync might clean it later if needed.
+		// Delete the app entry from the state manager itself upon delete/purge
+		nr.state.DeleteApp(appName) // Call this *after* lock is released by defer
+
 	default:
 		logger.Warn("Ignoring unknown KV operation")
 	}
 }
 
-// Helper to stop all running/starting instances for a specific app
+// Helper to stop all running/starting instances for a specific app (Unchanged)
 func (nr *NodeRunner) stopAllInstancesForApp(ctx context.Context, appInfo *appInfo, logger *slog.Logger) {
 	logger.Info("Stopping all instances for app")
-	instancesToStop := append([]*ManagedApp{}, appInfo.instances...) // Copy slice to avoid modifying while iterating
+	instancesToStop := append([]*ManagedApp{}, appInfo.instances...)
 
 	var wg sync.WaitGroup
 	for _, instance := range instancesToStop {
 		if instance.Status == StatusRunning || instance.Status == StatusStarting || instance.Status == StatusStopping {
 			wg.Add(1)
-			go func(inst *ManagedApp) { // Pass instance pointer
+			go func(inst *ManagedApp) {
 				defer wg.Done()
-				// Use background context for shutdown? Or passed context?
-				// Using background allows shutdown to complete even if caller ctx times out.
-				if err := nr.stopAppInstance(inst, true); err != nil { // Intentional stop
+				if err := nr.stopAppInstance(inst, true); err != nil {
 					logger.Error("Error stopping instance during cleanup/delete", "instance_id", inst.InstanceID, "error", err)
 				} else {
 					logger.Debug("Instance stopped during cleanup/delete", "instance_id", inst.InstanceID)
@@ -598,19 +597,16 @@ func (nr *NodeRunner) stopAllInstancesForApp(ctx context.Context, appInfo *appIn
 			}(instance)
 		}
 	}
-	wg.Wait() // Wait for all stops to be initiated/completed
+	wg.Wait()
 	logger.Info("Finished stopping all instances for app")
 }
 
-// shutdownAllAppInstances iterates through all apps and stops their instances.
+// shutdownAllAppInstances iterates through all apps and stops their instances. (Unchanged)
 func (nr *NodeRunner) shutdownAllAppInstances() {
 	nr.logger.Info("Stopping all managed application instances...")
 	allAppInfos := nr.state.GetAllAppInfos() // Get snapshot of all app states
 
 	var wg sync.WaitGroup
-	// Use the runner's global context for shutdown signalling
-	// stopAppInstance handles internal timeouts
-
 	for appName, info := range allAppInfos {
 		info.mu.RLock() // Lock read to get instances safely
 		instancesToStop := append([]*ManagedApp{}, info.instances...)
@@ -644,11 +640,8 @@ func (nr *NodeRunner) Stop() {
 	}
 }
 
-// --- Helper functions for replica index management ---
+// --- Helper functions for replica index management (Unchanged) ---
 
-// findNextReplicaIndex finds the smallest non-negative integer index
-// up to targetReplicas-1 that is not currently used by an instance.
-// Returns -1 if no slot is available (should not happen if target > current).
 func findNextReplicaIndex(currentInstances []*ManagedApp, targetReplicas int) int {
 	usedIndices := make(map[int]bool)
 	for _, inst := range currentInstances {
@@ -662,11 +655,9 @@ func findNextReplicaIndex(currentInstances []*ManagedApp, targetReplicas int) in
 			return i
 		}
 	}
-	return -1 // No free slot found up to targetReplicas
+	return -1
 }
 
-// extractReplicaIndex parses the index from an instance ID like "app-0".
-// Returns -1 if parsing fails.
 func extractReplicaIndex(instanceID string) int {
 	lastDash := strings.LastIndex(instanceID, "-")
 	if lastDash == -1 || lastDash == len(instanceID)-1 {
@@ -681,16 +672,16 @@ func extractReplicaIndex(instanceID string) int {
 	return index
 }
 
-// --- Helper for simulating delete entry during sync ---
+// --- Helper for simulating delete entry during sync (Unchanged) ---
 type simulatedDeleteEntry struct {
-	jetstream.KeyValueEntry // Embed to satisfy interface
-	key                     string
-	bucket                  string
+	jetstream.KeyValueEntry
+	key    string
+	bucket string
 }
 
 func (s *simulatedDeleteEntry) Key() string                     { return s.key }
 func (s *simulatedDeleteEntry) Value() []byte                   { return nil }
-func (s *simulatedDeleteEntry) Revision() uint64                { return 0 } // Revision doesn't matter for delete
+func (s *simulatedDeleteEntry) Revision() uint64                { return 0 }
 func (s *simulatedDeleteEntry) Created() time.Time              { return time.Time{} }
 func (s *simulatedDeleteEntry) Delta() uint64                   { return 0 }
 func (s *simulatedDeleteEntry) Operation() jetstream.KeyValueOp { return jetstream.KeyValueDelete }

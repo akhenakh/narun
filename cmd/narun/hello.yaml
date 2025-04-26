@@ -1,6 +1,5 @@
 name: hello # This will be the KV key
-binary_object: hello-v1.2 # This MUST match the object name in the Object Store
-
+binary_version_tag: hello-app-v1.2
 nodes:
   - name: clot # Target node runner with ID 'node1'
     replicas: 2 # Run 2 instances on node1

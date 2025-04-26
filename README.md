@@ -46,15 +46,15 @@ It aims for simplicity and lightness targeting edge devices.
 *   **Configuration:** Primarily via command-line flags: `-nats-url`, `-node-id`, `-data-dir`.
 *   **Running:** `go run ./cmd/node-runner -nats-url <NATS_URL> -node-id <NODE_ID> -data-dir /var/lib/node-runner` (on each target node).
 
-### 4. `narun-deploy` (Deployment CLI)
+### 4. `narun` (Management CLI)
 
-*   **Function:** A command-line tool to deploy or update applications managed by `node-runner`.
-*   **Mechanism:** Reads a local application specification YAML file (`ServiceSpec`) and an application binary. It uploads the binary to the configured NATS Object Store (`app-binaries`) and puts/updates the `ServiceSpec` content into the NATS Key-Value store (`app-configs`), keyed by the application name.
-*   **Configuration:** Via command-line flags: `-config <spec.yaml>`, `-binary <app_binary>`, `-nats <NATS_URL>`.
-*   **Running:** See `cmd/narun-deploy/README.md`. Example:
-    ```bash
-    ./narun-deploy -config ./hello.yaml -binary ./hello-consumer -nats nats://localhost:4222
-    ```
+*   **Function:** This tool provides commands to manage Narun application deployments, view logs, and inspect the state of binaries and running applications.
+*   **Available Commands:**
+    *   `deploy`: Upload application binaries and configuration.
+    *   `logs`: Stream logs from node runners.
+    *   `list-images`: List application binaries stored in NATS Object Store.
+    *   `list-apps`: List deployed applications and their status on nodes.
+    *   `help`: Show detailed help.
 
 ## Example Workflow
 
@@ -70,7 +70,7 @@ It aims for simplicity and lightness targeting edge devices.
     *   Create its `ServiceSpec` YAML (e.g., `hello.yaml`), specifying the `binary_object` name and targeting nodes (e.g., `node-1`).
 4.  **Deploy Application:** Use `narun-deploy` to upload the binary and spec.
     ```bash
-    ./narun-deploy -config hello.yaml -binary ./hello-consumer -nats <NATS_URL>
+    ./narun deploy -config hello.yaml -binary ./hello-consumer -nats <NATS_URL>
     ```
     *   `node-runner` on `node-1` will detect the config, download the binary, and start the `hello-consumer` process. The consumer will register itself as a NATS Micro service (e.g., named "hello").
 5.  **Start Gateway:** Run `narun-gw` configured to route `/hello/` requests to the NATS Micro service named "hello".
@@ -93,7 +93,7 @@ go build -o narun-gw ./cmd/narun-gw
 go build -o node-runner ./cmd/node-runner
 
 # Build Deployment Tool
-go build -o narun-deploy ./cmd/narun-deploy
+go build -o narun ./cmd/narun
 
 # Build Example HTTP Consumer
 go build -o hello-consumer ./consumers/cmd/hello
@@ -241,6 +241,9 @@ This project is under active development. Components and APIs may change.
 - SIGTERM on an app , node runner does not restart
 - [X] known bug the node-runner is not downloading and hashing the binary back properly.
 - Log history not just live follow
+- [X] check arch before downloading binary
+- fix the version/tag system to long
+- dont store arch as GOARCH since it may be a binary coming from another language.
 
 ## Ideas
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
