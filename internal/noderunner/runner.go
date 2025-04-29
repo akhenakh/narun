@@ -34,8 +34,8 @@ type NodeRunner struct {
 	dataDir      string
 	version      string
 	startTime    time.Time
-	localOS      string // ** NEW: Detected OS **
-	localArch    string // ** NEW: Detected Arch **
+	localOS      string // Detected OS
+	localArch    string // Detected Arch
 	globalCtx    context.Context
 	globalCancel context.CancelFunc
 	shutdownWg   sync.WaitGroup
@@ -70,7 +70,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	// ** Detect Local Platform **
 	localOS := runtime.GOOS
 	localArch := runtime.GOARCH
-	logger.Info("Detected local platform", "goos", localOS, "goarch", localArch)
+	logger.Info("Detected local platform", "os", localOS, "arch", localArch)
 
 	// ... (NATS connection setup identical) ...
 	nc, err := nats.Connect(natsURL,
@@ -160,7 +160,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 
 // Run starts the node runner's main loop. (Watch loop structure unchanged, but sync/handle changes)
 func (nr *NodeRunner) Run() error {
-	nr.logger.Info("Starting node runner", "version", nr.version, "goos", nr.localOS, "goarch", nr.localArch) // Log platform
+	nr.logger.Info("Starting node runner", "version", nr.version, "os", nr.localOS, "arch", nr.localArch) // Log platform
 	defer nr.logger.Info("Node runner stopped")
 
 	// Initial Registration and Heartbeat Loop (Unchanged setup, uses updated updateNodeState)
@@ -284,7 +284,7 @@ func (nr *NodeRunner) Run() error {
 	return nil
 }
 
-// heartbeatLoop (Unchanged logic, uses updated updateNodeState)
+// heartbeatLoop
 func (nr *NodeRunner) heartbeatLoop() {
 	defer nr.shutdownWg.Done()
 	ticker := time.NewTicker(NodeHeartbeatInterval)
@@ -325,8 +325,8 @@ func (nr *NodeRunner) updateNodeState(status string) error {
 		StartTime:        nr.startTime,
 		ManagedInstances: managedInstanceIDs,
 		Status:           status,
-		GOOS:             nr.localOS,   // ** Include OS **
-		GOARCH:           nr.localArch, // ** Include Arch **
+		OS:               nr.localOS,   // Include OS
+		Arch:             nr.localArch, // Include Arch
 	}
 
 	stateData, err := json.Marshal(state)
@@ -511,7 +511,7 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 					logger.Error("Could not find available replica index slot", "target", targetReplicas, "current_count", len(appInfo.instances))
 					break
 				}
-				// ** Pass BinaryVersionTag to startAppInstance **
+				// Pass Tag implicitly via appInfo.spec to startAppInstance
 				if err := nr.startAppInstance(ctx, appInfo, replicaIndex); err != nil {
 					logger.Error("Failed to start new instance during scale up", "replica_index", replicaIndex, "error", err)
 				} else {

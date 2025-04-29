@@ -142,7 +142,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 			shimPool.Put(responseShim)
 		}()
 
-		// Extract HTTP info - Unchanged
+		// Extract HTTP info
 		incomingHeaders := req.Headers()
 		method := incomingHeaders.Get("X-Original-Method")
 		if method == "" {

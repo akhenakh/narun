@@ -54,6 +54,7 @@ It aims for simplicity and lightness targeting edge devices.
     *   `logs`: Stream logs from node runners.
     *   `list-images`: List application binaries stored in NATS Object Store.
     *   `list-apps`: List deployed applications and their status on nodes.
+    *   `delete-app`:  Delete an application configuration from NATS KV.
     *   `help`: Show detailed help.
 
 ## Example Workflow
@@ -242,13 +243,13 @@ This project is under active development. Components and APIs may change.
 - [X] known bug the node-runner is not downloading and hashing the binary back properly.
 - Log history not just live follow
 - [X] check arch before downloading binary
-- fix the version/tag system to long
-- dont store arch as GOARCH since it may be a binary coming from another language.
+- [X] fix the version/tag system to long
+- [X] dont store arch as GOARCH since it may be a binary coming from another language.
 - deploy without config dont start the actual app
-- after deploy it takes time for the status and running instances count to appear in list-apps
+- after deploy it takes time for the status and running instances count to appear in list-apps, even after the run sometimes the status disappear
 
 ## Ideas
-- narun ui run a web server to interact with the cluster 
+- narun ui run a web server to interact with the cluster
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
 - [X] routing to grpc
 - [X] caddy plugin
@@ -260,6 +261,7 @@ This project is under active development. Components and APIs may change.
 - enable tracing
 - self registering path consumers
 - node runner
+  - landlock https://github.com/shoenig/go-landlock
   - gvisor
   - firecracker
   - exec
@@ -269,6 +271,23 @@ This project is under active development. Components and APIs may change.
 - zig musl + static go build
 - config stored in ELF .config
 - each gateway has a name, developer can target a specific gateway in its config
+  - internal
+  - external
+- SSE gateway helper handler
+- Gw ui
+- Mount config map
+- Store disk Zstd  transferable pvc, big file
+- Incoming webhook handler (bento?)
+- Proxy to existing http app via nats (using gw as a sidecar pseudo mesh)
+- Secure Enclave server store + add encrypted  secret
+  - Export secret to pgp
+- Add auth gw to nats
+- Regroup into one command
+- For debug purpose addd handler http that can listen locally pass the listening address to the node runner
+- Outgoing wiry translation
+- Narun auto gitops (argocd like)
+- Logs to vector (easy nothing to do)
+
 
 ### Won't
 Because of caddy providing the feature:

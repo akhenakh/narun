@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	RestartDelay    = 5 * time.Second  // Delay before restarting a crashed app
+	RestartDelay    = 2 * time.Second  // Delay before restarting a crashed app
 	MaxRestarts     = 5                // Max restarts before giving up (per instance)
 	StopTimeout     = 10 * time.Second // Time to wait for graceful shutdown before SIGKILL
 	LogBufferSize   = 1024             // Buffer size for log lines
@@ -41,7 +41,7 @@ type statusUpdate struct {
 }
 
 type logEntry struct {
-	InstanceID string    `json:"instance_id"` // Changed from appName
+	InstanceID string    `json:"instance_id"` // Instance ID as it will appear in logs
 	AppName    string    `json:"app_name"`    // Keep app name for context
 	NodeID     string    `json:"node_id"`
 	Stream     string    `json:"stream"` // "stdout" or "stderr"
@@ -73,9 +73,9 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return fmt.Errorf("cannot start instance, app spec is nil for %s", appInfo.configHash /* Use hash or appName */)
 	}
 	appName := spec.Name
-	binaryVersionTag := spec.BinaryVersionTag // ** Get the tag **
+	tag := spec.Tag // Get the tag
 	instanceID := GenerateInstanceID(appName, replicaIndex)
-	logger := nr.logger.With("app", appName, "instance_id", instanceID, "version_tag", binaryVersionTag)
+	logger := nr.logger.With("app", appName, "instance_id", instanceID, "tag", tag)
 	logger.Info("Attempting to start application instance")
 
 	configHash := appInfo.configHash // Get hash from locked appInfo
@@ -94,8 +94,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		}
 	}
 
-	// Fetch and Store Binary ** using version tag and local platform **
-	binaryPath, err := nr.fetchAndStoreBinary(ctx, binaryVersionTag, appName, configHash)
+	// Fetch and Store Binary ** using tag and local platform **
+	binaryPath, err := nr.fetchAndStoreBinary(ctx, tag, appName, configHash)
 	if err != nil {
 		errMsg := fmt.Sprintf("Binary fetch failed for %s/%s: %v", nr.localOS, nr.localArch, err)
 		logger.Error(errMsg, "error", err) // Log error with platform info
@@ -133,7 +133,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
 	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
 
-	// Directory Setup (Unchanged)
+	// Directory Setup
 	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
 	workDir := filepath.Join(instanceDir, "work")
 	if err := os.MkdirAll(workDir, 0755); err != nil {
@@ -147,7 +147,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	cmd.Dir = workDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Pipes (Unchanged)
+	// Pipes
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		processCancel()
@@ -168,14 +168,12 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return fmt.Errorf("stderr pipe failed for %s: %w", instanceID, err)
 	}
 
-	// Create/Update ManagedApp State (Unchanged logic, fields same)
 	appInstance := &ManagedApp{
 		InstanceID: instanceID, Spec: spec, Cmd: cmd, Status: StatusStarting, ConfigHash: configHash,
 		BinaryPath: binaryPath, StdoutPipe: stdoutPipe, StderrPipe: stderrPipe,
 		StopSignal: make(chan struct{}), processCtx: processCtx, processCancel: processCancel, restartCount: 0,
 	}
 
-	// Replace or Add the instance in appInfo (Unchanged)
 	foundAndReplaced := false
 	for i, existing := range appInfo.instances {
 		if existing.InstanceID == instanceID {
@@ -194,10 +192,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		logger.Debug("Appending new instance state to appInfo")
 	}
 
-	// Publish starting status (Unchanged)
+	// Publish starting status
 	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, "Starting process")
 
-	// Start Process (Unchanged)
+	// Start Process
 	logger.Info("Starting process", "command", cmdPath, "args", spec.Args, "env_added", 6) // Env count updated
 	if startErr := cmd.Start(); startErr != nil {
 		errMsg := fmt.Sprintf("Failed to start process: %v", startErr)
@@ -208,7 +206,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return fmt.Errorf("failed to start %s: %w", instanceID, startErr)
 	}
 
-	// Success Path (Unchanged)
+	// Success Path
 	appInstance.Pid = cmd.Process.Pid
 	appInstance.StartTime = time.Now()
 	appInstance.Status = StatusRunning
@@ -222,7 +220,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	return nil // Signal success
 }
 
-// stopAppInstance (Unchanged)
+// stopAppInstance gracefully stops an application instance process.
 func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool) error {
 	instanceID := appInstance.InstanceID
 	logger := nr.logger.With("app", InstanceIDToAppName(instanceID), "instance_id", instanceID)
@@ -233,10 +231,11 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	}
 	if appInstance.Cmd == nil || appInstance.Cmd.Process == nil {
 		logger.Warn("Stop request: Instance state inconsistent (no command/process). Cleaning up state.")
-		appInstance.Status = StatusFailed
+		appInstance.Status = StatusFailed // Mark as failed if state is broken
 		if appInstance.processCancel != nil {
-			appInstance.processCancel()
+			appInstance.processCancel() // Ensure context is cancelled
 		}
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, "Inconsistent state during stop") // Publish failure
 		return fmt.Errorf("inconsistent state for instance %s", instanceID)
 	}
 
@@ -245,47 +244,61 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	appInstance.Status = StatusStopping
 	nr.publishStatusUpdate(instanceID, StatusStopping, &pid, nil, "")
 
+	// Close stop signal channel if not already closed
 	select {
 	case <-appInstance.StopSignal:
 	default:
 		close(appInstance.StopSignal)
 	}
 
+	// Send SIGTERM to the process group
 	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			logger.Warn("Stop request: Process already exited before SIGTERM", "pid", pid)
 			appInstance.processCancel() // Ensure monitor wakes up
-			return nil
+			return nil                  // Not an error if already gone
 		}
+		// Unexpected error sending signal
 		logger.Error("Failed to send SIGTERM", "pid", pid, "error", err)
-		appInstance.processCancel()
+		appInstance.processCancel() // Cancel context anyway
+		// Don't necessarily mark as failed yet, monitor loop will handle final state
 		return fmt.Errorf("failed to send SIGTERM to %s (PID %d): %w", instanceID, pid, err)
 	}
 
+	// Wait for graceful shutdown or timeout
 	termTimer := time.NewTimer(StopTimeout)
 	defer termTimer.Stop()
 	select {
 	case <-termTimer.C:
 		logger.Warn("Graceful shutdown timed out. Sending SIGKILL.", "pid", pid)
+		// Send SIGKILL to the process group
 		if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
 			logger.Error("Failed to send SIGKILL", "pid", pid, "error", killErr)
+			// Process might still be running, but we tried our best. Monitor will handle exit.
 		}
-		appInstance.processCancel()
+		appInstance.processCancel() // Ensure context is cancelled if timeout occurs
 	case <-appInstance.processCtx.Done():
 		logger.Info("Process exited or context canceled during stop wait.")
+		// Process exited, maybe cleanly or due to SIGTERM
 	}
-	return nil
+	return nil // Signal that stop attempt was made
 }
 
-// forwardLogs (Unchanged)
+// forwardLogs reads logs from a pipe and publishes them to NATS.
 func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, streamName string, logger *slog.Logger) {
 	defer appInstance.LogWg.Done()
 	defer pipe.Close()
 	scanner := bufio.NewScanner(pipe)
-	scanner.Buffer(make([]byte, LogBufferSize), bufio.MaxScanTokenSize)
+	// Use a reasonable buffer size, potentially adjustable via config later
+	const initialBufSize = 4 * 1024
+	const maxBufSize = 64 * 1024 // Max line size to handle
+	buf := make([]byte, initialBufSize)
+	scanner.Buffer(buf, maxBufSize)
+
 	logger = logger.With("stream", streamName)
 	logger.Debug("Starting log forwarding")
 	appName := InstanceIDToAppName(appInstance.InstanceID)
+	subject := fmt.Sprintf("%s.%s.%s", LogSubjectPrefix, appName, nr.nodeID)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -295,12 +308,14 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 			logger.Warn("Failed to marshal log entry", "error", err)
 			continue
 		}
-		subject := fmt.Sprintf("logs.%s.%s", appName, nr.nodeID)
+		// Use Publish for fire-and-forget logging
 		if err := nr.nc.Publish(subject, logData); err != nil {
+			// Log warning but continue trying to forward logs
 			logger.Warn("Failed to publish log entry to NATS", "subject", subject, "error", err)
 		}
 	}
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, context.Canceled) {
+		// Check if context was cancelled (process exited) vs. a real read error
 		select {
 		case <-appInstance.processCtx.Done():
 			logger.Debug("Log pipe closed due to process exit")
@@ -312,37 +327,58 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 	}
 }
 
-// monitorAppInstance (Unchanged logic, just passes info to startAppInstance)
+// monitorAppInstance waits for an app instance to exit and handles restarts or cleanup.
 func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.Logger) {
 	instanceID := appInstance.InstanceID
 	appName := InstanceIDToAppName(instanceID)
 
+	// Ensure resources are cleaned up when monitor exits
 	defer func() {
+		// Ensure context is always cancelled on exit
 		appInstance.processCancel()
+		// Wait for log forwarders to finish
 		appInstance.LogWg.Wait()
-		logger.Debug("Monitor finished and resources cleaned up")
+		logger.Debug("Monitor finished and log forwarders completed")
+		// Remove instance state ONLY if it's terminally failed or intentionally stopped AND no restart is pending
 		if appInstance.Status == StatusFailed || appInstance.Status == StatusStopped {
-			nr.removeInstanceState(appName, instanceID, logger)
+			// Check if a restart was suppressed due to external factors
+			select {
+			case <-appInstance.StopSignal: // Intentional stop signal received
+			case <-nr.globalCtx.Done(): // Runner is shutting down
+			default:
+				// If neither stop signal nor global shutdown is active, and status is stopped/failed, remove state.
+				// This condition is a bit complex, maybe simplify? Let's remove if failed or stopped *unintentionally*.
+				if appInstance.Status == StatusFailed || (appInstance.Status == StatusStopped && appInstance.lastExitCode != nil && *appInstance.lastExitCode != 0) {
+					nr.removeInstanceState(appName, instanceID, logger)
+				}
+			}
 		}
 	}()
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
 	waitErr := appInstance.Cmd.Wait()
 
+	// Determine exit details
 	exitCode := -1
 	intentionalStop := false
 	errMsg := ""
+
+	// Check if an intentional stop was signalled BEFORE Wait() returned
 	select {
 	case <-appInstance.StopSignal:
 		intentionalStop = true
 		logger.Info("Process exit detected after intentional stop signal")
 	default:
+		// No intentional stop signal before Wait() returned
 	}
+
+	// If context was cancelled, assume intentional stop unless already signalled otherwise
 	if appInstance.processCtx.Err() == context.Canceled && !intentionalStop {
 		intentionalStop = true
 		logger.Info("Process exit detected after context cancellation")
 	}
 
+	// Determine final status based on Wait() error and signals
 	finalStatus := StatusStopped
 	if waitErr != nil {
 		errMsg = waitErr.Error()
@@ -351,119 +387,146 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 				sig := status.Signal()
 				logger.Warn("Process killed by signal", "pid", appInstance.Pid, "signal", sig)
+				// Treat SIGTERM/SIGINT during intentional stop as clean stop
 				if (sig == syscall.SIGTERM || sig == syscall.SIGINT) && intentionalStop {
 					finalStatus = StatusStopped
 				} else {
-					finalStatus = StatusCrashed
+					finalStatus = StatusCrashed // Killed by other signal or during non-intentional stop
 				}
 			} else {
+				// Exited non-zero, but not signalled
 				logger.Warn("Process exited non-zero", "pid", appInstance.Pid, "exit_code", exitCode)
 				finalStatus = StatusCrashed
 			}
 		} else {
+			// Wait failed for other reason (e.g., I/O error, start failed initially?)
 			logger.Error("Process wait failed", "error", waitErr)
 			finalStatus = StatusFailed
-			intentionalStop = true
+			intentionalStop = true // Treat non-exit errors as fatal, no restart
 		}
 	} else {
+		// Exited cleanly (code 0)
 		exitCode = 0
 		logger.Info("Process exited cleanly", "pid", appInstance.Pid)
 		finalStatus = StatusStopped
 	}
 
+	// Update internal state and publish
 	appInstance.Status = finalStatus
 	appInstance.lastExitCode = &exitCode
 	nr.publishStatusUpdate(instanceID, finalStatus, &appInstance.Pid, &exitCode, errMsg)
 
-	if intentionalStop || finalStatus == StatusFailed {
-		logger.Info("Instance stopped intentionally or failed permanently. No restart.", "status", finalStatus)
-	} else if finalStatus == StatusCrashed || finalStatus == StatusStopped {
-		appInfo := nr.state.GetAppInfo(appName)
-		appInfo.mu.RLock()
-		configHashMatches := appInfo.configHash == appInstance.ConfigHash
-		appInfo.mu.RUnlock()
+	// --- Restart Logic ---
+	// Conditions for NO restart:
+	// 1. Intentional stop (signal or context cancel)
+	// 2. Final status is Failed (unrecoverable error)
+	// 3. Runner is shutting down (global context cancelled)
+	if intentionalStop || finalStatus == StatusFailed || nr.globalCtx.Err() != nil {
+		logger.Info("Instance stopped intentionally or failed permanently or runner shutting down. No restart.", "status", finalStatus, "intentional", intentionalStop, "runner_shutdown", nr.globalCtx.Err() != nil)
+		return // Exit monitor
+	}
 
-		replicaIndex := -1
-		appInfo.mu.RLock()
-		for idx, inst := range appInfo.instances {
-			if inst.InstanceID == instanceID {
-				replicaIndex = idx
-				break
-			}
-		}
-		appInfo.mu.RUnlock()
-		if replicaIndex == -1 {
-			logger.Warn("Instance disappeared from state before restart check. Aborting restart.")
-			return
-		}
+	// Conditions met for potential restart (Crashed or Stopped unexpectedly)
+	appInfo := nr.state.GetAppInfo(appName) // Read-only access needed here
 
-		shouldRestart := false
-		if !configHashMatches {
-			logger.Info("Configuration changed since instance started. No restart.", "old_hash", appInstance.ConfigHash, "new_hash", appInfo.configHash)
-		} else if appInstance.restartCount >= MaxRestarts {
-			logger.Error("Instance crashed too many times. Giving up.", "max_restarts", MaxRestarts)
+	// Check if config changed or instance was removed while process was running
+	appInfo.mu.RLock()
+	configHashMatches := appInfo.configHash == appInstance.ConfigHash
+	instanceStillManaged := false
+	var currentReplicaIndex = -1 // Need index for restart call
+	for idx, inst := range appInfo.instances {
+		if inst.InstanceID == instanceID {
+			instanceStillManaged = true
+			currentReplicaIndex = idx
+			break
+		}
+	}
+	appInfo.mu.RUnlock()
+
+	if !instanceStillManaged {
+		logger.Warn("Instance disappeared from state before restart check. Aborting restart.")
+		return
+	}
+	if !configHashMatches {
+		logger.Info("Configuration changed since instance started. No restart.", "old_hash", appInstance.ConfigHash, "new_hash", appInfo.configHash)
+		return
+	}
+	if currentReplicaIndex == -1 {
+		logger.Error("Could not determine replica index for restarting instance. Aborting restart.", "instance_id", instanceID)
+		return
+	}
+
+	// Check restart count
+	if appInstance.restartCount >= MaxRestarts {
+		logger.Error("Instance crashed too many times. Giving up.", "max_restarts", MaxRestarts)
+		appInstance.Status = StatusFailed // Mark as permanently failed
+		nr.publishStatusUpdate(instanceID, StatusFailed, &appInstance.Pid, &exitCode, "Exceeded max restarts")
+		return // Exit monitor
+	}
+
+	// Proceed with restart
+	appInstance.restartCount++
+	logger.Warn("Instance crashed/stopped unexpectedly. Attempting restart.", "restart_count", appInstance.restartCount, "max_restarts", MaxRestarts, "delay", RestartDelay)
+	appInstance.Status = StatusStarting // Set status before publishing
+	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, fmt.Sprintf("Restarting (%d/%d)", appInstance.restartCount, MaxRestarts))
+
+	// Wait for restart delay, cancellable by global shutdown or specific stop signal
+	restartTimer := time.NewTimer(RestartDelay)
+	select {
+	case <-restartTimer.C:
+		// Delay finished
+	case <-nr.globalCtx.Done():
+		logger.Info("Restart canceled due to runner shutdown.")
+		restartTimer.Stop()
+		return // Exit monitor
+	case <-appInstance.processCtx.Done():
+		// This case should be less likely now but handles if context gets cancelled externally during delay
+		logger.Warn("Instance context cancelled during restart delay?")
+		restartTimer.Stop()
+		return // Exit monitor
+	case <-appInstance.StopSignal:
+		logger.Info("Restart canceled due to explicit stop signal for instance.")
+		restartTimer.Stop()
+		return // Exit monitor
+	}
+
+	// Re-acquire lock to perform the restart safely
+	appInfo.mu.Lock()
+	defer appInfo.mu.Unlock()
+
+	// Double-check conditions after acquiring lock and waiting
+	currentConfigHashAfterDelay := appInfo.configHash
+	instanceStillExistsAfterDelay := false
+	for _, inst := range appInfo.instances {
+		if inst.InstanceID == instanceID {
+			instanceStillExistsAfterDelay = true
+			break
+		}
+	}
+
+	if !instanceStillExistsAfterDelay {
+		logger.Warn("Instance was removed during restart delay. Aborting restart.")
+	} else if currentConfigHashAfterDelay != appInstance.ConfigHash {
+		logger.Info("Config changed during restart delay. Aborting restart.")
+	} else {
+		// Attempt the actual restart
+		err := nr.startAppInstance(context.Background(), appInfo, currentReplicaIndex) // Pass necessary context and index
+		if err != nil {
+			logger.Error("Failed to restart application instance", "error", err)
+			// If restart fails, mark as failed permanently
 			appInstance.Status = StatusFailed
-			nr.publishStatusUpdate(instanceID, StatusFailed, &appInstance.Pid, &exitCode, "Exceeded max restarts")
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, &exitCode, fmt.Sprintf("Restart failed: %v", err))
+			// No return here, let defer handle cleanup
 		} else {
-			shouldRestart = true
-		}
-
-		if shouldRestart {
-			appInstance.restartCount++
-			logger.Warn("Instance crashed. Attempting restart.", "restart_count", appInstance.restartCount, "max_restarts", MaxRestarts, "delay", RestartDelay)
-			appInstance.Status = StatusStarting
-			nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, fmt.Sprintf("Restarting (%d/%d)", appInstance.restartCount, MaxRestarts))
-
-			restartTimer := time.NewTimer(RestartDelay)
-			select {
-			case <-restartTimer.C:
-			case <-nr.globalCtx.Done():
-				logger.Info("Restart canceled due to runner shutdown.")
-				restartTimer.Stop()
-				return
-			case <-appInstance.processCtx.Done():
-				logger.Warn("Instance context cancelled during restart delay?")
-				restartTimer.Stop()
-				return
-			}
-
-			appInfo.mu.Lock() // Lock for the start attempt
-			currentConfigHash := appInfo.configHash
-			instanceStillExists := false
-			for _, inst := range appInfo.instances {
-				if inst.InstanceID == instanceID {
-					instanceStillExists = true
-					break
-				}
-			}
-
-			if !instanceStillExists {
-				logger.Warn("Instance was removed during restart delay. Aborting restart.")
-			} else if currentConfigHash != appInstance.ConfigHash {
-				logger.Info("Config changed during restart delay. Aborting restart.")
-			} else {
-				// ** Pass binaryVersionTag (implicitly via appInfo.spec) to startAppInstance **
-				err := nr.startAppInstance(context.Background(), appInfo, replicaIndex)
-				if err != nil {
-					logger.Error("Failed to restart application instance", "error", err)
-					appInstance.Status = StatusFailed
-					nr.publishStatusUpdate(instanceID, StatusFailed, nil, &exitCode, fmt.Sprintf("Restart failed: %v", err))
-				} else {
-					logger.Info("Instance restarted successfully")
-					appInfo.mu.Unlock()
-					return // Exit *this* monitor goroutine
-				}
-			}
-			appInfo.mu.Unlock()
-		} else {
-			if appInstance.restartCount >= MaxRestarts {
-				appInstance.Status = StatusFailed
-			}
+			logger.Info("Instance restarted successfully")
+			// Restart succeeded, this monitor goroutine's job is done.
+			// The *new* instance started by startAppInstance will have its *own* monitor goroutine.
+			return // Exit *this* monitor goroutine successfully.
 		}
 	}
 }
 
-// publishStatusUpdate (Unchanged)
+// publishStatusUpdate sends the current status of an instance to NATS.
 func (nr *NodeRunner) publishStatusUpdate(instanceID string, status AppStatus, pid *int, exitCode *int, errMsg string) {
 	currentPid := 0
 	if pid != nil && (status == StatusRunning || status == StatusStopping) {
@@ -477,19 +540,21 @@ func (nr *NodeRunner) publishStatusUpdate(instanceID string, status AppStatus, p
 		return
 	}
 	subject := fmt.Sprintf("status.%s.%s", appName, nr.nodeID)
+	// Fire-and-forget publish
 	if err := nr.nc.Publish(subject, updateData); err != nil {
+		// Log error but don't block runner operation
 		nr.logger.Warn("Failed to publish status update to NATS", "instance_id", instanceID, "subject", subject, "error", err)
 	}
 }
 
 // fetchAndStoreBinary downloads the binary from NATS Object Store for the node's platform.
 // It uses the object's digest to version the local storage path.
-func (nr *NodeRunner) fetchAndStoreBinary(ctx context.Context, binaryVersionTag, appName, configHash string) (string, error) {
-	// ** Construct the target object name using local platform **
-	targetObjectName := fmt.Sprintf("%s-%s-%s", binaryVersionTag, nr.localOS, nr.localArch)
-	logger := nr.logger.With("app", appName, "version_tag", binaryVersionTag, "object", targetObjectName)
+func (nr *NodeRunner) fetchAndStoreBinary(ctx context.Context, tag, appName, configHash string) (string, error) {
+	// Construct the target object name using local platform
+	targetObjectName := fmt.Sprintf("%s-%s-%s", tag, nr.localOS, nr.localArch)
+	logger := nr.logger.With("app", appName, "tag", tag, "object", targetObjectName)
 
-	// 1. Get Object Info to determine the version (Digest)
+	// Get Object Info to determine the version (Digest)
 	objInfo, getInfoErr := nr.appBinaries.GetInfo(ctx, targetObjectName) // ** Use target name **
 	if getInfoErr != nil {
 		if errors.Is(getInfoErr, jetstream.ErrObjectNotFound) {
@@ -498,114 +563,133 @@ func (nr *NodeRunner) fetchAndStoreBinary(ctx context.Context, binaryVersionTag,
 		return "", fmt.Errorf("failed to get info for binary object '%s': %w", targetObjectName, getInfoErr)
 	}
 
-	// 2. Determine Version Identifier (Digest) - Unchanged logic
+	// Determine Version Identifier (Digest)
 	versionID := objInfo.Digest
 	if versionID == "" {
 		logger.Error("Object store info is missing digest", "object", targetObjectName)
 		return "", fmt.Errorf("binary object '%s' info is missing digest", targetObjectName)
 	}
-	if parts := strings.SplitN(versionID, "=", 2); len(parts) == 2 {
-		versionID = parts[1]
+	// Ensure digest format is correct (SHA-256=...) before extracting value
+	if !strings.HasPrefix(versionID, "SHA-256=") {
+		return "", fmt.Errorf("unsupported digest format (expected 'SHA-256=' prefix): %s", versionID)
 	}
+	versionID = strings.TrimPrefix(versionID, "SHA-256=") // Extract the Base64 part
 	if versionID == "" {
 		logger.Error("Object store digest value is empty after parsing", "object", targetObjectName, "original_digest", objInfo.Digest)
 		return "", fmt.Errorf("binary object '%s' digest value is empty", targetObjectName)
 	}
 
-	// 3. Construct Local Path (Using digest and target object name)
+	// Construct Local Path (Using digest and target object name)
 	safeAppName := sanitizePathElement(appName)
-	safeVersionID := sanitizePathElement(versionID)         // Digest hash
+	safeVersionID := sanitizePathElement(versionID)         // Digest hash (Base64 value)
 	safeObjectName := sanitizePathElement(targetObjectName) // Includes OS/Arch
-	// Store the OS/Arch specific binary under its digest, using its full name
 	versionedDir := filepath.Join(nr.dataDir, "binaries", safeAppName, safeVersionID)
 	localPath := filepath.Join(versionedDir, safeObjectName)
 
-	// 4. Check if this specific version exists locally (Unchanged logic)
+	// Check if this specific version exists locally
 	_, statErr := os.Stat(localPath)
 	if statErr == nil {
-		hashMatches, err := verifyLocalFileHash(localPath, objInfo.Digest)
+		// File exists, verify hash
+		hashMatches, err := verifyLocalFileHash(localPath, objInfo.Digest) // Pass original digest with prefix
 		if err == nil && hashMatches {
 			logger.Info("Local binary version exists and hash verified.", "path", localPath)
-			return localPath, nil
+			return localPath, nil // Success, use local copy
 		}
+		// Hash mismatch or error reading local file, proceed to re-download
 		logger.Warn("Local binary version exists but hash verification failed or errored. Re-downloading.", "path", localPath, "verify_err", err)
 	} else if !os.IsNotExist(statErr) {
+		// Error stating the file other than "not found"
 		return "", fmt.Errorf("failed to stat local binary path %s: %w", localPath, statErr)
 	} else {
+		// File does not exist locally
 		logger.Info("Local binary version not found.", "path", localPath)
 	}
 
-	// 5. Download (Unchanged logic, uses targetObjectName implicitly via objResult)
+	//  Download
 	logger.Info("Downloading specific binary version", "version_id", versionID, "local_path", localPath)
 	if err := os.MkdirAll(versionedDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create versioned binary directory %s: %w", versionedDir, err)
 	}
-	tempLocalPath := localPath + ".tmp" + fmt.Sprintf(".%d", time.Now().UnixNano())
+	// Use unique temp file name
+	tempLocalPath := localPath + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
 	outFile, err := os.Create(tempLocalPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary file %s: %w", tempLocalPath, err)
 	}
+	var finalErr error // To capture error for defer cleanup
 	defer func() {
 		if outFile != nil {
-			outFile.Close()
-			if err != nil {
-				logger.Warn("Removing temporary file", "path", tempLocalPath, "error", err)
-				os.Remove(tempLocalPath)
+			outFile.Close() // Ensure closed before potential remove
+		}
+		// Remove temp file if an error occurred during download/verify/rename
+		if finalErr != nil {
+			logger.Warn("Removing temporary file due to error", "path", tempLocalPath, "error", finalErr)
+			if remErr := os.Remove(tempLocalPath); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
+				logger.Error("Failed to remove temporary download file", "path", tempLocalPath, "error", remErr)
 			}
 		}
 	}()
 
+	// Get object reader
 	objResult, err := nr.appBinaries.Get(ctx, targetObjectName) // ** Use target name **
 	if err != nil {
-		outFile.Close()
-		outFile = nil
-		os.Remove(tempLocalPath)
-		return "", fmt.Errorf("failed to get object reader for %s: %w", targetObjectName, err)
+		finalErr = fmt.Errorf("failed to get object reader for %s: %w", targetObjectName, err)
+		return "", finalErr
 	}
-	defer objResult.Close()
+	defer objResult.Close() // Close object reader when done
 
+	// Copy data
 	bytesCopied, err := io.Copy(outFile, objResult)
 	if err != nil {
-		return "", fmt.Errorf("failed to copy object data to %s: %w", tempLocalPath, err)
+		finalErr = fmt.Errorf("failed to copy object data to %s: %w", tempLocalPath, err)
+		return "", finalErr
 	}
 	logger.Debug("Binary data copied", "temp_path", tempLocalPath, "bytes_copied", bytesCopied)
+
+	// Sync and close file before verification/rename
 	if syncErr := outFile.Sync(); syncErr != nil {
 		logger.Error("Failed to sync temporary file", "path", tempLocalPath, "error", syncErr)
+		// Potentially continue, but log the error
 	}
-	if err = outFile.Close(); err != nil {
-		outFile = nil
-		os.Remove(tempLocalPath)
-		return "", fmt.Errorf("failed to close temporary file %s: %w", tempLocalPath, err)
+	if closeErr := outFile.Close(); closeErr != nil {
+		outFile = nil // Prevent double close in defer
+		finalErr = fmt.Errorf("failed to close temporary file %s: %w", tempLocalPath, closeErr)
+		return "", finalErr
 	}
-	outFile = nil
+	outFile = nil // Mark as closed for defer
 
-	// Verify checksum (Unchanged logic)
-	hashMatches, verifyErr := verifyLocalFileHash(tempLocalPath, objInfo.Digest)
+	// Verify checksum of downloaded file
+	hashMatches, verifyErr := verifyLocalFileHash(tempLocalPath, objInfo.Digest) // Pass original digest
 	if verifyErr != nil || !hashMatches {
 		errMsg := fmt.Sprintf("hash verification failed (err: %v, match: %v)", verifyErr, hashMatches)
 		logger.Error(errMsg, "path", tempLocalPath, "expected_digest", objInfo.Digest)
-		err = fmt.Errorf("hash verification failed for %s: %s", tempLocalPath, errMsg) // Set error for defer cleanup
-		return "", err
+		finalErr = fmt.Errorf("hash verification failed for %s: %s", tempLocalPath, errMsg)
+		return "", finalErr
 	}
 
-	// Atomic Rename (Unchanged logic)
+	// Atomic Rename
 	logger.Debug("Verification successful, renaming", "from", tempLocalPath, "to", localPath)
 	if err = os.Rename(tempLocalPath, localPath); err != nil {
 		logger.Error("Failed to rename temporary binary file", "temp", tempLocalPath, "final", localPath, "error", err)
-		_ = os.Remove(tempLocalPath) // Attempt cleanup
-		return "", fmt.Errorf("failed to finalize binary download for %s: %w", localPath, err)
+		// Set finalErr so defer removes the temp file if rename fails
+		finalErr = fmt.Errorf("failed to finalize binary download for %s: %w", localPath, err)
+		// Try removing temp file here too, just in case defer has issues
+		_ = os.Remove(tempLocalPath)
+		return "", finalErr
 	}
 
 	logger.Info("Binary version downloaded and verified successfully", "path", localPath)
 	return localPath, nil // Success
 }
 
-// verifyLocalFileHash (Unchanged - already handles padding correctly)
+// verifyLocalFileHash calculates the SHA256 hash of a file and compares it
+// to the expected NATS Object Store digest string (e.g., "SHA-256=Base64Hash").
 func verifyLocalFileHash(filePath, expectedDigest string) (bool, error) {
 	if !strings.HasPrefix(expectedDigest, "SHA-256=") {
 		return false, fmt.Errorf("unsupported digest format (expected 'SHA-256=' prefix): %s", expectedDigest)
 	}
 	expectedBase64Hash := strings.TrimPrefix(expectedDigest, "SHA-256=")
+	expectedBase64Hash = strings.TrimRight(expectedBase64Hash, "=") // trailing b64
 	if expectedBase64Hash == "" {
 		return false, fmt.Errorf("expected digest value is empty after removing prefix: %s", expectedDigest)
 	}
@@ -622,48 +706,81 @@ func verifyLocalFileHash(filePath, expectedDigest string) (bool, error) {
 	}
 	hashBytes := hasher.Sum(nil)
 
+	// NATS uses URL encoding without padding for the digest value
 	actualBase64Hash := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(hashBytes)
-	actualHexHash := fmt.Sprintf("%x", hashBytes)
+	actualHexHash := fmt.Sprintf("%x", hashBytes) // For logging/debugging
 
-	trimmedExpected := strings.TrimRight(expectedBase64Hash, "=")
-	trimmedActual := strings.TrimRight(actualBase64Hash, "=")
+	// Compare the Base64 encoded values (padding doesn't matter for comparison here)
+	match := actualBase64Hash == expectedBase64Hash
 
-	slog.Debug("Verifying file hash", "file", filePath, "expected_base64_raw", expectedBase64Hash, "calculated_base64_raw", actualBase64Hash, "expected_base64_trimmed", trimmedExpected, "calculated_base64_trimmed", trimmedActual, "calculated_hex", actualHexHash)
-
-	match := trimmedActual == trimmedExpected
 	if !match {
-		slog.Warn("Hash verification failed", "file", filePath, "expected_digest", expectedDigest, "expected_base64_trimmed", trimmedExpected, "calculated_base64_trimmed", trimmedActual, "calculated_hex", actualHexHash)
+		slog.Warn("Hash verification failed", "file", filePath,
+			"expected_digest", expectedDigest,
+			"expected_base64", expectedBase64Hash,
+			"calculated_base64", actualBase64Hash,
+			"calculated_hex", actualHexHash)
+	} else {
+		slog.Debug("Hash verification successful", "file", filePath,
+			"expected_digest", expectedDigest,
+			"calculated_hex", actualHexHash)
 	}
 	return match, nil
 }
 
-// sanitizePathElement (Unchanged)
+// sanitizePathElement removes potentially problematic characters for filesystem paths.
 func sanitizePathElement(element string) string {
-	r := strings.NewReplacer(":", "_", "/", "_", "\\", "_", "*", "_", "?", "_", "<", "_", ">", "_", "|", "_")
-	sanitized := r.Replace(element)
-	if len(sanitized) > 100 {
-		sanitized = sanitized[:100]
+	// Allow alphanumeric, hyphen, underscore, dot. Replace others.
+	// Using strings.Builder for potentially better performance
+	var sb strings.Builder
+	sb.Grow(len(element)) // Preallocate approximate size
+
+	for _, r := range element {
+		if ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9') || r == '-' || r == '_' || r == '.' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_') // Replace disallowed characters with underscore
+		}
+	}
+
+	sanitized := sb.String()
+	// Limit length to prevent excessively long paths
+	const maxLen = 100
+	if len(sanitized) > maxLen {
+		sanitized = sanitized[:maxLen]
+	}
+	// Avoid names that are just "." or ".."
+	if sanitized == "." || sanitized == ".." {
+		return "_" + sanitized + "_"
 	}
 	return sanitized
 }
 
-// removeInstanceState (Unchanged)
+// removeInstanceState removes the state for a specific instance from the manager.
 func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *slog.Logger) {
-	appInfo := nr.state.GetAppInfo(appName)
+	appInfo := nr.state.GetAppInfo(appName) // Gets or creates (though should exist)
 	appInfo.mu.Lock()
 	defer appInfo.mu.Unlock()
+
 	newInstances := make([]*ManagedApp, 0, len(appInfo.instances))
 	found := false
 	for _, instance := range appInfo.instances {
 		if instance.InstanceID == instanceID {
 			found = true
+			// Optionally, explicitly cancel context if not already done
+			if instance.processCancel != nil {
+				instance.processCancel()
+			}
 		} else {
 			newInstances = append(newInstances, instance)
 		}
 	}
+
 	if found {
 		appInfo.instances = newInstances
-		logger.Info("Removed instance state.", "count_after_remove", len(newInstances))
+		logger.Info("Removed instance state.", "remaining_instances", len(newInstances))
+		// If this was the last instance, maybe remove the appInfo entirely?
+		// Need careful consideration of locking if we do that here.
+		// For now, leave the appInfo entry even if instances list is empty.
 	} else {
 		logger.Warn("Attempted to remove instance state, but it was not found.")
 	}

@@ -75,7 +75,7 @@ func main() {
 		deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional). If provided, overrides -name, -tag, -node, -replicas.")
 		deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 		deployFlags.String("name", "", "Application name (required if -config is not used)")
-		deployFlags.String("tag", "", "Binary version tag (required if -config is not used)")
+		deployFlags.String("tag", "", "Binary tag (required if -config is not used)")
 		deployFlags.String("node", "local", "Target node name (used if -config is not used)")
 		deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
 		deployFlags.Usage = func() { // Define the specific Usage text again
@@ -188,7 +188,7 @@ func handleDeployCmd(args []string) {
 	timeout := deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	// Flags used when -config is NOT provided
 	appNameFlag := deployFlags.String("name", "", "Application name (required if -config is not used)")
-	tagFlag := deployFlags.String("tag", "", "Binary version tag (required if -config is not used)")
+	tagFlag := deployFlags.String("tag", "", "Binary tag tag (required if -config is not used)")
 	nodeFlag := deployFlags.String("node", "local", "Target node name (used if -config is not used)")
 	replicasFlag := deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
 
@@ -239,7 +239,7 @@ Options:
 		if spec.Name == "" {
 			log.Fatalf("Deploy Error: 'name' field is missing or empty in %s", *configFile)
 		}
-		if spec.BinaryVersionTag == "" {
+		if spec.Tag == "" {
 			log.Fatalf("Deploy Error: 'binary_version_tag' field is missing or empty in %s", *configFile)
 		}
 		// Node validation (keep it simple)
@@ -254,7 +254,7 @@ Options:
 			// (omitted for brevity, assume initial validation is sufficient here)
 		}
 		log.Printf("Deploying ServiceSpec from %s: AppName='%s', BinaryVersionTag='%s', TargetNodes=%+v",
-			*configFile, spec.Name, spec.BinaryVersionTag, spec.Nodes)
+			*configFile, spec.Name, spec.Tag, spec.Nodes)
 
 	} else {
 		// Mode 2: Using flags
@@ -283,8 +283,8 @@ Options:
 
 		// Generate the ServiceSpec in memory
 		spec = noderunner.ServiceSpec{
-			Name:             *appNameFlag,
-			BinaryVersionTag: *tagFlag,
+			Name: *appNameFlag,
+			Tag:  *tagFlag,
 			Nodes: []noderunner.NodeSelectorSpec{
 				{
 					Name:     *nodeFlag,
@@ -295,7 +295,7 @@ Options:
 		}
 
 		log.Printf("Deploying Generated ServiceSpec: AppName='%s', BinaryVersionTag='%s', TargetNode='%s', Replicas=%d",
-			spec.Name, spec.BinaryVersionTag, spec.Nodes[0].Name, spec.Nodes[0].Replicas)
+			spec.Name, spec.Tag, spec.Nodes[0].Name, spec.Nodes[0].Replicas)
 
 		// Marshal the generated spec to YAML for upload
 		configData, err = yaml.Marshal(spec)
@@ -305,8 +305,8 @@ Options:
 	}
 
 	// Common Deployment Logic
-	appName := spec.Name                      // Use name from loaded or generated spec
-	binaryVersionTag := spec.BinaryVersionTag // Use tag from loaded or generated spec
+	appName := spec.Name // Use name from loaded or generated spec
+	tag := spec.Tag      // Use tag from loaded or generated spec
 
 	// NATS Connection and JetStream Setup (remains the same)
 	ctxAll, cancelAll := context.WithCancel(context.Background())
@@ -342,16 +342,16 @@ Options:
 			continue
 		}
 
-		goos, goarch, err := detectBinaryPlatform(binaryPath)
+		operSys, goarch, err := detectBinaryPlatform(binaryPath)
 		if err != nil {
 			log.Printf("Error: Could not detect platform for %s: %v. Skipping.", binaryPath, err)
 			uploadErrors = true
 			continue
 		}
-		log.Printf("Detected Platform: %s / %s", goos, goarch)
+		log.Printf("Detected Platform: %s / %s", operSys, goarch)
 
-		// Construct object name using the version tag from the spec (loaded or generated)
-		objectName := fmt.Sprintf("%s-%s-%s", binaryVersionTag, goos, goarch)
+		// Construct object name using the tag from the spec (loaded or generated)
+		objectName := fmt.Sprintf("%s-%s-%s", tag, operSys, goarch)
 		log.Printf("--> NATS Object Store Name: %s", objectName)
 
 		binaryBaseName := filepath.Base(binaryPath)
@@ -367,11 +367,11 @@ Options:
 		putCtx, putCancel := context.WithTimeout(ctxAll, *timeout*2) // Increased timeout for potentially large binaries
 		meta := jetstream.ObjectMeta{
 			Name:        objectName,
-			Description: fmt.Sprintf("Binary for %s (%s/%s) tag %s", appName, goos, goarch, binaryVersionTag),
+			Description: fmt.Sprintf("Binary for %s (%s/%s) tag %s", appName, operSys, goarch, tag),
 			Metadata: map[string]string{
-				"narun-goos":          goos,
+				"narun-goos":          operSys,
 				"narun-goarch":        goarch,
-				"narun-version-tag":   binaryVersionTag,
+				"narun-version-tag":   tag,
 				"narun-original-file": binaryBaseName,
 			},
 		}
@@ -413,7 +413,7 @@ Options:
 		log.Fatalf("Deploy Error: updating configuration key '%s': %v", appName, err)
 	}
 	log.Printf("Configuration updated: Key=%s, Revision=%d", appName, revision)
-	log.Printf("Deployment of application '%s' (version tag '%s') completed successfully.", appName, binaryVersionTag)
+	log.Printf("Deployment of application '%s' (tag '%s') completed successfully.", appName, tag)
 }
 
 func handleLogsCmd(args []string) {
@@ -511,7 +511,7 @@ func handleListImagesCmd(args []string) {
 		log.Fatalf("Error parsing list-images flags: %v", err)
 	}
 
-	log.Printf("Listing images from NATS Object Store '%s'...", noderunner.AppBinariesOSBucket)
+	slog.Debug(fmt.Sprintf("Listing images from NATS Object Store '%s'...", noderunner.AppBinariesOSBucket))
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -547,8 +547,8 @@ func handleListImagesCmd(args []string) {
 
 	// Prepare Tabular Output
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "OBJECT NAME\tSIZE\tMODIFIED\tVERSION TAG\tOS\tARCH\tDIGEST")
-	fmt.Fprintln(tw, "-----------\t----\t--------\t-----------\t--\t----\t------")
+	fmt.Fprintln(tw, "OBJECT NAME\tSIZE\tMODIFIED\tTAG\tOS\tARCH\tDIGEST")
+	fmt.Fprintln(tw, "-----------\t----\t--------\t---\t--\t----\t------")
 
 	count := 0
 	for _, objInfo := range objects {
@@ -585,7 +585,7 @@ func handleListImagesCmd(args []string) {
 	}
 
 	tw.Flush()
-	log.Printf("Found %d image(s).", count)
+	slog.Debug(fmt.Sprintf("Found %d image(s).", count))
 }
 
 // List Apps Command Logic
@@ -711,8 +711,8 @@ func handleListAppsCmd(args []string) {
 
 	// Display Results
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "APPLICATION\tVERSION TAG\tNODE\tNODE STATUS\tNODE PLATFORM\tRUNNING INSTANCES")
-	fmt.Fprintln(tw, "-----------\t-----------\t----\t-----------\t-------------\t-----------------")
+	fmt.Fprintln(tw, "APPLICATION\tTAG\tNODE\tNODE STATUS\tNODE PLATFORM\tRUNNING INSTANCES")
+	fmt.Fprintln(tw, "-----------\t---\t----\t-----------\t-------------\t-----------------")
 
 	// Sort app names for consistent output
 	appNames := make([]string, 0, len(appConfigs))
@@ -732,7 +732,7 @@ func handleListAppsCmd(args []string) {
 				// App is configured but not running anywhere currently
 				fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t0\n",
 					appName,
-					spec.BinaryVersionTag,
+					spec.Tag,
 				)
 			} else {
 				// Sort node IDs for consistent output within an app
@@ -749,11 +749,11 @@ func handleListAppsCmd(args []string) {
 					nodePlatform := "-/-"
 					if nodeFound {
 						nodeStatus = nodeInfo.Status
-						nodePlatform = fmt.Sprintf("%s/%s", nodeInfo.GOOS, nodeInfo.GOARCH)
+						nodePlatform = fmt.Sprintf("%s/%s", nodeInfo.OS, nodeInfo.Arch)
 					}
 					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\n",
 						appName,
-						spec.BinaryVersionTag,
+						spec.Tag,
 						nodeID,
 						nodeStatus,
 						nodePlatform,
@@ -813,7 +813,7 @@ Options:
 		}
 	}
 
-	log.Printf("Deleting application configuration '%s'...", appName)
+	slog.Debug(fmt.Sprintf("Deleting application configuration '%s'...", appName))
 
 	// NATS Connection and JetStream Setup
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -838,14 +838,14 @@ Options:
 	getCancel()
 	if getErr != nil {
 		if errors.Is(getErr, jetstream.ErrKeyNotFound) {
-			log.Printf("Application configuration '%s' not found. Nothing to delete.", appName)
+			fmt.Printf("Application configuration '%s' not found. Nothing to delete.", appName)
 			os.Exit(0)
 		}
 		log.Fatalf("Delete Error: failed to check if key '%s' exists: %v", appName, getErr)
 	}
 
 	// Delete the key
-	log.Printf("Deleting key '%s' from KV store '%s'...", appName, noderunner.AppConfigKVBucket)
+	slog.Debug(fmt.Sprintf("Deleting key '%s' from KV store '%s'...", appName, noderunner.AppConfigKVBucket))
 	delCtx, delCancel := context.WithTimeout(ctx, 10*time.Second)
 	err = kvStore.Delete(delCtx, appName)
 	delCancel()
@@ -853,8 +853,8 @@ Options:
 		log.Fatalf("Delete Error: failed to delete key '%s': %v", appName, err)
 	}
 
-	log.Printf("Successfully deleted application configuration '%s'.", appName)
-	log.Println("Node runners will now stop instances for this application.")
+	fmt.Printf("Successfully deleted application configuration '%s'.", appName)
+	slog.Debug(fmt.Sprintf("Node runners will now stop instances for this application."))
 }
 
 func connectNATS(ctx context.Context, url string, clientName string) (*nats.Conn, jetstream.JetStream, error) {

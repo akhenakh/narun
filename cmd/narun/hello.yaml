@@ -1,5 +1,5 @@
 name: hello # This will be the KV key
-binary_version_tag: hello-app-v1.2
+tag: aaf56fe96c953198aec60280a99c3b227c9c3215
 nodes:
   - name: clot # Target node runner with ID 'node1'
     replicas: 2 # Run 2 instances on node1

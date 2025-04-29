@@ -33,14 +33,15 @@ type NodeSelectorSpec struct {
 // ServiceSpec defines the desired configuration for an application managed by the node runner.
 // This structure is stored as YAML in the NATS KV store.
 type ServiceSpec struct {
-	Name             string             `yaml:"name"`               // Name of the service/app, used as KV key
-	Command          string             `yaml:"command,omitempty"`  // Optional: command to run (defaults to binary name)
-	Args             []string           `yaml:"args,omitempty"`     // Arguments to pass to the command
-	Env              []EnvVar           `yaml:"env,omitempty"`      // Environment variables to set
-	BinaryVersionTag string             `yaml:"binary_version_tag"` // **RENAMED**: Base name/version (e.g., "hello-v1.2") used to construct the OS/arch specific object name
-	Nodes            []NodeSelectorSpec `yaml:"nodes,omitempty"`    // List of nodes to deploy on and replica counts
+	Name    string             `yaml:"name"`              // Name of the service/app, used as KV key
+	Command string             `yaml:"command,omitempty"` // Optional: command to run (defaults to binary name)
+	Args    []string           `yaml:"args,omitempty"`    // Arguments to pass to the command
+	Env     []EnvVar           `yaml:"env,omitempty"`     // Environment variables to set
+	Tag     string             `yaml:"tag"`               // Tag for the binary
+	Nodes   []NodeSelectorSpec `yaml:"nodes,omitempty"`   // List of nodes to deploy on and replica counts
 }
 
+// NodeState represents the information stored about a node runner in the KV store.
 // NodeState represents the information stored about a node runner in the KV store.
 type NodeState struct {
 	NodeID           string    `json:"node_id"`
@@ -49,8 +50,8 @@ type NodeState struct {
 	StartTime        time.Time `json:"start_time"`        // When this runner instance started
 	ManagedInstances []string  `json:"managed_instances"` // List of instance IDs currently managed (e.g., "hello-0", "hello-1")
 	Status           string    `json:"status"`            // e.g., "running", "shutting_down"
-	GOOS             string    `json:"goos"`              // OS the runner is on
-	GOARCH           string    `json:"goarch"`            // Architecture the runner is on
+	OS               string    `json:"os"`                // OS the runner is on
+	Arch             string    `json:"arch"`              // Architecture the runner is on
 }
 
 // ParseServiceSpec parses the YAML byte slice into a ServiceSpec struct.
@@ -63,8 +64,8 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 	if spec.Name == "" {
 		return nil, fmt.Errorf("service 'name' is required")
 	}
-	if spec.BinaryVersionTag == "" {
-		return nil, fmt.Errorf("service 'binary_version_tag' is required (e.g., myapp-v1.0)")
+	if spec.Tag == "" {
+		return nil, fmt.Errorf("service 'tag' is required (e.g., myapp-v1.0)")
 	}
 	if spec.Command == "" {
 		// Default command to the binary name if not specified

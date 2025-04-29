@@ -21,7 +21,7 @@ narun <command> [options] [arguments...]
 *   `logs`: Stream logs from node runners.
 *   `list-images`: List application binaries stored in NATS Object Store.
 *   `list-apps`: List deployed applications and their status on nodes.
-*   `help`: Show detailed help.
+*   `delete-app`:  Delete an application configuration from NATS KV.
 
 ---
 
@@ -37,7 +37,7 @@ You can either provide a full `ServiceSpec` configuration file (`-config`) or sp
 *   `-timeout <duration>`: Timeout for NATS operations (default: 15s).
 *   `-config <path>`: Path to the application `ServiceSpec` YAML configuration file (optional). If provided, this defines the full deployment spec.
 *   `-name <app_name>`: Application name (required if `-config` is not used).
-*   `-tag <version_tag>`: Binary version tag (required if `-config` is not used).
+*   `-tag <tag>`: Binary tag (required if `-config` is not used).
 *   `-node <node_id>`: Target node name (default: "local"; used if `-config` is not used).
 *   `-replicas <count>`: Number of replicas on the target node (default: 1; used if `-config` is not used).
 
@@ -46,7 +46,7 @@ You can either provide a full `ServiceSpec` configuration file (`-config`) or sp
 1.  **Prepare `hello-spec.yaml`:**
     ```yaml
     name: hello-app
-    binary_version_tag: hello-app-v1.3 # Base version tag
+    tag: hello-app-v1.3 # Base tag
     args: [ "--listen", ":9001" ]
     env:
       - name: GREETING
@@ -165,7 +165,7 @@ Lists application binaries stored in the NATS Object Store (`app-binaries`).
 ```
 $ ./narun list-images
 Listing images from NATS Object Store 'app-binaries'...
-OBJECT NAME                  SIZE  MODIFIED             APP NAME   VERSION TAG    OS     ARCH   DIGEST
+OBJECT NAME                  SIZE  MODIFIED             APP NAME   TAG            OS     ARCH   DIGEST
 -----------                  ----  --------             --------   -----------    --     ----   ------
 hello-app-v1.3-linux-amd64   12345 2023-10-27T10:30:00Z hello-app  hello-app-v1.3 linux  amd64  SHA-256=...
 hello-app-v1.3-linux-arm64   12300 2023-10-27T10:30:05Z hello-app  hello-app-v1.3 linux  arm64  SHA-256=...
