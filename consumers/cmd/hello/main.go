@@ -125,6 +125,14 @@ func main() {
 	// to validate secret system is working, let's read the ENV named secret
 	logger.Debug("reading env SECRET value", "secret", os.Getenv("SECRET"))
 
+	// to validate filesystem restriction using landlock try to read /etc/lsb-release
+	b, err := os.ReadFile("/etc/lsb-release")
+	if err != nil {
+		logger.Error("failed to read /etc/lsb-release", "error", err)
+	} else {
+		logger.Debug("read /etc/lsb-release", "content", string(b))
+	}
+
 	// Create handler
 	handler := &helloHandler{}
 
@@ -143,7 +151,7 @@ func main() {
 		"service_name", opts.ServiceName, // Log service name
 		"nats_url", opts.NATSURL)
 
-	err := nconsumer.ListenAndServe(opts, handler)
+	err = nconsumer.ListenAndServe(opts, handler)
 	if err != nil {
 		logger.Error("NATS Micro service failed", "error", err)
 		os.Exit(1)

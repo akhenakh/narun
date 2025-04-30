@@ -1,8 +1,16 @@
 name: hello # This will be the KV key
-tag: aaf56fe96c953198aec60280a99c3b227c9c3215
+tag: v4
 nodes:
   - name: clot # Target node runner with ID 'node1'
     replicas: 2 # Run 2 instances on node1
+mode: landlock # exec or landlock
+landlock:
+  shared: true # common shared object files
+  dns: true # DNS resolution
+  tmp: true # temporary files
+  paths:
+    - path: /etc/issue
+      modes: "r"
 
 # Original args/env
 args:

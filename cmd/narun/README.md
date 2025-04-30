@@ -245,18 +245,41 @@ Found 3 configured application(s).
     ./narun secret delete -nats nats://localhost:4222 A_SECURE_KEY
     ```
 
-### `narun secret set -master`
-```
-SECRET NAME
------------
-SECRET
-```
+## Execution Mode
 
+Narun is supporting several mode of execution for the workloads.
 
+- `exec`: Execute the workload directly on the node runner.
+- `landlock`: Execute the workload in a landlocked environment on the node runner.
 
-### `narun secret list`
-```
-SECRET NAME
------------
-SECRET
+```yaml
+# narun/cmd/narun/hello.yaml example with landlock
+name: hello
+tag: aaf56fe96c953198aec60280a99c3b227c9c3215
+nodes:
+  - name: node-linux-1 # Target Linux node runner
+    replicas: 1
+
+  - name: node-other # Target node runner without landlock
+    replicas: 1
+
+mode: landlock # Enable landlock mode
+landlock:
+  shared: true  # Allow shared libraries (often needed for non static Go binaries)
+  dns: true     # Allow DNS resolution files
+  certs: true   # Allow system certificates
+  tmp: true     # Allow /tmp access
+  paths:        # Custom paths
+    - path: /data/config.json # Example: allow reading a config file
+      modes: "r"
+    - path: /app/logs # Example: allow writing logs to a specific directory
+      modes: "wc" # Allow write and create
+
+args:
+  - -concurrency=1
+env:
+  - name: GREETING
+    value: "Hello from restricted NATS!"
+  - name: SECRET
+    valueFromSecret: SECRET # Example secret usage
 ```

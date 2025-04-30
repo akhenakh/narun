@@ -2,6 +2,8 @@ package noderunner
 
 import (
 	"fmt"
+	"log"
+	"runtime"
 	"strings"
 	"time"
 
@@ -25,7 +27,24 @@ type EnvVar struct {
 	Name            string `yaml:"name"`
 	Value           string `yaml:"value"`
 	ValueFromSecret string `yaml:"valueFromSecret,omitempty"` // Name of the secret in the SecretKVBucket
+}
 
+// LandlockPathSpec defines a specific path and its allowed access modes for Landlock.
+type LandlockPathSpec struct {
+	Path  string `yaml:"path"`  // Filesystem path (absolute or relative to work dir?) - Assume absolute for now, user needs to know.
+	Modes string `yaml:"modes"` // Permissions string (e.g., "r", "rw", "rwc", "rx")
+}
+
+// LandlockSpec defines the Landlock configuration for a service.
+type LandlockSpec struct {
+	Shared bool               `yaml:"shared,omitempty"` // Allow access to common shared libraries
+	Stdio  bool               `yaml:"stdio,omitempty"`  // Allow standard I/O operations
+	TTY    bool               `yaml:"tty,omitempty"`    // Allow terminal operations
+	Tmp    bool               `yaml:"tmp,omitempty"`    // Allow access to /tmp
+	VMInfo bool               `yaml:"vminfo,omitempty"` // Allow reading system VM info
+	DNS    bool               `yaml:"dns,omitempty"`    // Allow necessary files for DNS resolution
+	Certs  bool               `yaml:"certs,omitempty"`  // Allow reading system SSL/TLS certificates
+	Paths  []LandlockPathSpec `yaml:"paths,omitempty"`  // Custom paths to allow access to
 }
 
 // NodeSelectorSpec defines which node should run the service and how many replicas.
@@ -37,12 +56,14 @@ type NodeSelectorSpec struct {
 // ServiceSpec defines the desired configuration for an application managed by the node runner.
 // This structure is stored as YAML in the NATS KV store.
 type ServiceSpec struct {
-	Name    string             `yaml:"name"`              // Name of the service/app, used as KV key
-	Command string             `yaml:"command,omitempty"` // Optional: command to run (defaults to binary name)
-	Args    []string           `yaml:"args,omitempty"`    // Arguments to pass to the command
-	Env     []EnvVar           `yaml:"env,omitempty"`     // Environment variables to set
-	Tag     string             `yaml:"tag"`               // Tag for the binary
-	Nodes   []NodeSelectorSpec `yaml:"nodes,omitempty"`   // List of nodes to deploy on and replica counts
+	Name     string             `yaml:"name"`               // Name of the service/app, used as KV key
+	Command  string             `yaml:"command,omitempty"`  // Optional: command to run (defaults to binary name)
+	Args     []string           `yaml:"args,omitempty"`     // Arguments to pass to the command
+	Env      []EnvVar           `yaml:"env,omitempty"`      // Environment variables to set
+	Tag      string             `yaml:"tag"`                // Tag for the binary
+	Nodes    []NodeSelectorSpec `yaml:"nodes,omitempty"`    // List of nodes to deploy on and replica counts
+	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
+	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 }
 
 // StoredSecret is the structure stored as JSON in the SecretKVBucket.
@@ -55,7 +76,6 @@ type StoredSecret struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-// NodeState represents the information stored about a node runner in the KV store.
 // NodeState represents the information stored about a node runner in the KV store.
 type NodeState struct {
 	NodeID           string    `json:"node_id"`
@@ -75,6 +95,8 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		return nil, fmt.Errorf("failed to unmarshal ServiceSpec YAML: %w", err)
 	}
 
+	log.Println("DEBUG---------------------------------------------------------------------------", spec.Mode, spec)
+
 	if spec.Name == "" {
 		return nil, fmt.Errorf("service 'name' is required")
 	}
@@ -85,7 +107,38 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		// Default command to the binary name if not specified
 		// Note: This default might be less useful now, as the actual binary filename
 		// will include OS/Arch. The path retrieved from fetchAndStoreBinary is more reliable.
-		spec.Command = spec.Name // We'll use the local path later
+		spec.Command = spec.Name // Default command (will use local binary path later)
+	}
+
+	// Default and Validate Mode
+	if spec.Mode == "" {
+		spec.Mode = "exec" // Default mode
+	}
+	if spec.Mode != "exec" && spec.Mode != "landlock" {
+		return nil, fmt.Errorf("invalid mode '%s': must be 'exec' or 'landlock'", spec.Mode)
+	}
+
+	// Validate Landlock spec only if mode is landlock
+	if spec.Mode == "landlock" {
+		if runtime.GOOS != "linux" {
+			// Log warning during parse, but runtime check in runner is definitive
+			fmt.Printf("Warning: Landlock mode specified for app '%s' during parse, but current OS is not Linux (%s).\n", spec.Name, runtime.GOOS)
+		}
+		// Validate custom paths
+		for i, p := range spec.Landlock.Paths {
+			if strings.TrimSpace(p.Path) == "" {
+				return nil, fmt.Errorf("landlock path at index %d: 'path' cannot be empty", i)
+			}
+			if strings.TrimSpace(p.Modes) == "" {
+				return nil, fmt.Errorf("landlock path '%s': 'modes' cannot be empty", p.Path)
+			}
+			validModes := "rwxc"
+			for _, char := range p.Modes {
+				if !strings.ContainsRune(validModes, char) {
+					return nil, fmt.Errorf("landlock path '%s': invalid character '%c' in modes '%s'. Only 'r', 'w', 'x', 'c' allowed.", p.Path, char, p.Modes)
+				}
+			}
+		}
 	}
 
 	// Validate Env Vars: only one of value or valueFromSecret should be set

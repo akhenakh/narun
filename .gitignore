@@ -22,3 +22,4 @@ cmd/narun-gw/narun-gw
 cmd/narun-deploy/narun-deploy
 narun-data
 master.key
+chat/

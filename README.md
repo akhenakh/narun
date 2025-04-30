@@ -255,13 +255,13 @@ This project is under active development. Components and APIs may change.
 - [X] caddy plugin
 - metrics for inflights
 - direct response NAT
-- send consumer logs to NATS
+- [X] send consumer logs to NATS
 - [X] move to protocol buffers, done them removed for nats micro
 - x request id
 - enable tracing
 - self registering path consumers
 - node runner
-  - landlock https://github.com/shoenig/go-landlock
+  - [X] landlock https://github.com/shoenig/go-landlock
   - gvisor
   - firecracker
   - exec
@@ -288,7 +288,7 @@ This project is under active development. Components and APIs may change.
 - Narun auto gitops (argocd like)
 - Logs to vector (easy nothing to do)
 - embed a nats server into the node runner
-
+- no need for health probe after the app is deployed, node runner should validate the app is listening.
 
 ### Won't
 Because of caddy providing the feature:

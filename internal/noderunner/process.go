@@ -14,13 +14,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/nats-io/nats.go/jetstream"
-	"gopkg.in/yaml.v3" // Use v3 consistently if config uses it
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -29,6 +30,18 @@ const (
 	StopTimeout     = 10 * time.Second // Time to wait for graceful shutdown before SIGKILL
 	LogBufferSize   = 1024             // Buffer size for log lines
 	StatusQueueSize = 10               // Buffer size for status update channel
+)
+
+// Constants for landlock
+const (
+	internalLaunchFlag           = "--internal-landlock-launch"
+	envLandlockConfigJSON        = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
+	envLandlockTargetCmd         = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
+	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
+	landlockLauncherErrCode      = 120 // Generic launcher setup error
+	landlockUnsupportedErrCode   = 121 // Landlock not supported on OS/Kernel
+	landlockLockFailedErrCode    = 122 // l.Lock() failed
+	landlockTargetExecFailedCode = 123 // syscall.Exec() failed
 )
 
 type statusUpdate struct {
@@ -69,17 +82,32 @@ func calculateSpecHash(spec *ServiceSpec) (string, error) {
 // startAppInstance attempts to download the binary, configure, and start a single instance.
 // It assumes the calling code (handleAppConfigUpdate) holds the lock on appInfo.
 func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, replicaIndex int) error {
-	spec := appInfo.spec // Use the spec from appInfo
+	spec := appInfo.spec
 	if spec == nil {
-		return fmt.Errorf("cannot start instance, app spec is nil for %s", appInfo.configHash /* Use hash or appName */)
+		return fmt.Errorf("cannot start instance, app spec is nil for %s", appInfo.configHash)
 	}
 	appName := spec.Name
-	tag := spec.Tag // Get the tag
+	tag := spec.Tag
 	instanceID := GenerateInstanceID(appName, replicaIndex)
-	logger := nr.logger.With("app", appName, "instance_id", instanceID, "tag", tag)
+	logger := nr.logger.With("app", appName, "instance_id", instanceID, "tag", tag, "mode", spec.Mode)
 	logger.Info("Attempting to start application instance")
 
-	// Prepare Environment Variables (with secret resolution) ***
+	// Fetch Binary First
+	binaryPath, fetchErr := nr.fetchAndStoreBinary(ctx, spec.Tag, appName, appInfo.configHash)
+	if fetchErr != nil {
+		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
+		logger.Error(errMsg, "error", fetchErr)
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+		return fmt.Errorf("failed to fetch binary for %s: %w", instanceID, fetchErr)
+	}
+	logger.Info("Binary downloaded/verified", "path", binaryPath)
+	if err := os.Chmod(binaryPath, 0755); err != nil {
+		logger.Error("Failed to make binary executable", "path", binaryPath, "error", err)
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
+		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
+	}
+
+	// Prepare Common Env Vars (including secrets)
 	processEnv := os.Environ()
 	// Add Base env vars from spec, resolving secrets
 	for _, envVar := range spec.Env {
@@ -87,25 +115,18 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		var resErr error
 
 		if envVar.ValueFromSecret != "" {
-			// Resolve secret
 			secretName := envVar.ValueFromSecret
 			resolvedValue, resErr = nr.resolveSecret(ctx, secretName, logger)
 			if resErr != nil {
-				// Fail the instance start if a required secret cannot be resolved
 				logger.Error("Failed to resolve secret for env var", "secret_name", secretName, "env_var", envVar.Name, "error", resErr)
 				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", secretName, resErr)
-				// Cancel context before returning error? Yes.
-				// Note: We haven't created the process context yet. Use the passed ctx? Or just return.
-				// Let's just return the error. The caller (handleAppConfigUpdate) might handle cleanup.
-				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg) // Publish failure status
+				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 				return fmt.Errorf("failed to resolve secret '%s' for env var '%s': %w", secretName, envVar.Name, resErr)
 			}
 			logger.Debug("Successfully resolved secret", "secret_name", secretName, "env_var", envVar.Name)
 		} else {
-			// Use direct value
 			resolvedValue = envVar.Value
 		}
-		// Append the resolved env var
 		processEnv = append(processEnv, fmt.Sprintf("%s=%s", envVar.Name, resolvedValue))
 	}
 	// Add instance-specific env vars
@@ -115,34 +136,75 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
-	// Create context for this specific instance (moved after env resolution)
+
+	// Create context for the child process (launcher or direct exec)
 	processCtx, processCancel := context.WithCancel(nr.globalCtx)
 
-	// Create command (using resolved binary path)
-	binaryPath := "" // Get this from fetchAndStoreBinary call earlier
-	var fetchErr error
-	binaryPath, fetchErr = nr.fetchAndStoreBinary(ctx, spec.Tag, appName, appInfo.configHash)
-	if fetchErr != nil {
-		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
-		logger.Error(errMsg, "error", fetchErr)
-		processCancel() // Cancel context
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-		return fmt.Errorf("failed to fetch binary for %s: %w", instanceID, fetchErr)
-	}
-	logger.Info("Binary downloaded/verified", "path", binaryPath)
-	// Chmod after fetch, before Command creation
-	if err := os.Chmod(binaryPath, 0755); err != nil {
-		logger.Error("Failed to make binary executable", "path", binaryPath, "error", err)
-		processCancel() // Cancel context
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
-		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
+	// Prepare Command based on Mode
+	var cmd *exec.Cmd
+	var cmdPath string
+	var cmdArgs []string
+
+	if spec.Mode == "landlock" {
+		logger.Info("Preparing Landlock execution mode")
+		if runtime.GOOS != "linux" {
+			processCancel()
+			errMsg := "landlock mode is only supported on Linux"
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+
+		selfPath, err := os.Executable() // Path to the node-runner binary itself
+		if err != nil {
+			processCancel()
+			errMsg := fmt.Sprintf("Failed to get node-runner executable path: %v", err)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+
+		// Serialize config needed by the launcher child process
+		landlockConfigJSON, err := json.Marshal(spec.Landlock)
+		if err != nil {
+			processCancel()
+			errMsg := fmt.Sprintf("Failed to marshal landlock config to JSON: %v", err)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+		targetArgsJSON, err := json.Marshal(spec.Args)
+		if err != nil {
+			processCancel()
+			errMsg := fmt.Sprintf("Failed to marshal target args to JSON: %v", err)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+
+		// Prepare the environment specifically for the LAUNCHER process
+		launcherEnv := append([]string{}, processEnv...) // Start with app's resolved env
+		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)))
+		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath)) // Pass the fetched application binary path
+		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)))
+
+		// Command to run the launcher (node-runner binary with the internal flag)
+		cmdPath = selfPath
+		cmdArgs = []string{internalLaunchFlag} // Launcher only needs the flag
+		cmd = exec.CommandContext(processCtx, cmdPath, cmdArgs...)
+		cmd.Env = launcherEnv // Use the extended environment for the launcher
+
+		logger.Debug("Launcher command prepared", "cmd", cmdPath, "args", cmdArgs)
+
+	} else { // Default "exec" mode
+		logger.Info("Preparing standard execution mode")
+		cmdPath = binaryPath // Execute the application binary directly
+		cmdArgs = spec.Args
+		cmd = exec.CommandContext(processCtx, cmdPath, cmdArgs...)
+		cmd.Env = processEnv // Use the standard application environment
 	}
 
-	cmdPath := binaryPath
-	cmd := exec.CommandContext(processCtx, cmdPath, spec.Args...)
-	cmd.Env = processEnv // Assign the fully prepared environment
-
-	// Directory Setup
+	// Common Setup (Directory, Pipes, State)
 	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
 	workDir := filepath.Join(instanceDir, "work")
 	if err := os.MkdirAll(workDir, 0755); err != nil {
@@ -152,9 +214,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
 	}
 	cmd.Dir = workDir
+	// Ensure child process can be killed cleanly via process group
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Pipes
+	// Pipes for log forwarding
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		processCancel()
@@ -165,25 +228,35 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		processCancel()
-		stdoutPipe.Close()
+		stdoutPipe.Close() // Close previous pipe on error
 		logger.Error("Failed to get stderr pipe", "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stderr pipe failed: %v", err))
 		return fmt.Errorf("stderr pipe failed for %s: %w", instanceID, err)
 	}
 
-	// Create/Update ManagedApp State
+	// Create/Update ManagedApp State in the manager
 	appInstance := &ManagedApp{
-		InstanceID: instanceID, Spec: spec, Cmd: cmd, Status: StatusStarting, ConfigHash: appInfo.configHash,
-		BinaryPath: binaryPath, StdoutPipe: stdoutPipe, StderrPipe: stderrPipe,
-		StopSignal: make(chan struct{}), processCtx: processCtx, processCancel: processCancel, restartCount: 0,
+		InstanceID:    instanceID,
+		Spec:          spec, // Store reference to the spec
+		Cmd:           cmd,  // Store the prepared command (launcher or direct exec)
+		Status:        StatusStarting,
+		ConfigHash:    appInfo.configHash,
+		BinaryPath:    binaryPath, // Store path to the actual app binary
+		StdoutPipe:    stdoutPipe,
+		StderrPipe:    stderrPipe,
+		StopSignal:    make(chan struct{}),
+		processCtx:    processCtx,
+		processCancel: processCancel,
+		restartCount:  0, // Initial start
 	}
+	// Find and replace or append logic (remains the same)
 	foundAndReplaced := false
 	for i, existing := range appInfo.instances {
 		if existing.InstanceID == instanceID {
-			appInstance.restartCount = existing.restartCount
+			appInstance.restartCount = existing.restartCount // Inherit restart count on update
 			logger.Debug("Replacing existing state for instance in appInfo", "index", i, "inheriting_restart_count", appInstance.restartCount)
 			if existing.processCancel != nil {
-				existing.processCancel()
+				existing.processCancel() // Cancel old context if replacing
 			}
 			appInfo.instances[i] = appInstance
 			foundAndReplaced = true
@@ -198,27 +271,30 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	// Publish starting status
 	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, "Starting process")
 
-	// Start Process
-	logger.Info("Starting process", "command", cmdPath, "args", spec.Args, "env_count", len(cmd.Env))
+	// Start the Process (either the launcher or the direct application)
+	logger.Info("Starting process execution", "command", cmdPath, "args", cmdArgs, "env_count", len(cmd.Env))
 	if startErr := cmd.Start(); startErr != nil {
 		errMsg := fmt.Sprintf("Failed to start process: %v", startErr)
 		logger.Error(errMsg, "error", startErr)
 		appInstance.Status = StatusFailed
-		appInstance.processCancel()
+		appInstance.processCancel() // Ensure context is cancelled
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+		nr.removeInstanceState(appName, instanceID, logger) // Clean up state if start fails
 		return fmt.Errorf("failed to start %s: %w", instanceID, startErr)
 	}
 
 	// Success Path
-	appInstance.Pid = cmd.Process.Pid
+	appInstance.Pid = cmd.Process.Pid // Get the PID of the started process
 	appInstance.StartTime = time.Now()
 	appInstance.Status = StatusRunning
 	logger.Info("Process started successfully", "pid", appInstance.Pid)
 	nr.publishStatusUpdate(instanceID, StatusRunning, &appInstance.Pid, nil, "")
+
+	// Start log forwarding and monitoring goroutines
 	appInstance.LogWg.Add(2)
 	go nr.forwardLogs(appInstance, appInstance.StdoutPipe, "stdout", logger)
 	go nr.forwardLogs(appInstance, appInstance.StderrPipe, "stderr", logger)
-	go nr.monitorAppInstance(appInstance, logger)
+	go nr.monitorAppInstance(appInstance, logger) // Monitor handles cmd.Wait()
 
 	return nil
 }
@@ -370,109 +446,111 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.Logger) {
 	instanceID := appInstance.InstanceID
 	appName := InstanceIDToAppName(instanceID)
+	spec := appInstance.Spec // Get spec reference
 
-	// Ensure resources are cleaned up when monitor exits
+	// Defer cleanup and state removal
 	defer func() {
-		// Ensure context is always cancelled on exit
 		appInstance.processCancel()
-		// Wait for log forwarders to finish
 		appInstance.LogWg.Wait()
 		logger.Debug("Monitor finished and log forwarders completed")
-		// Remove instance state ONLY if it's terminally failed or intentionally stopped AND no restart is pending
-		if appInstance.Status == StatusFailed || appInstance.Status == StatusStopped {
-			// Check if a restart was suppressed due to external factors
-			select {
-			case <-appInstance.StopSignal: // Intentional stop signal received
-			case <-nr.globalCtx.Done(): // Runner is shutting down
-			default:
-				// If neither stop signal nor global shutdown is active, and status is stopped/failed, remove state.
-				// This condition is a bit complex, maybe simplify? Let's remove if failed or stopped *unintentionally*.
-				if appInstance.Status == StatusFailed || (appInstance.Status == StatusStopped && appInstance.lastExitCode != nil && *appInstance.lastExitCode != 0) {
-					nr.removeInstanceState(appName, instanceID, logger)
-				}
-			}
+		// Conditionally remove instance state (no restart pending and failed/stopped)
+		shouldRemove := false
+		select {
+		case <-appInstance.StopSignal: // Intentionally stopped
+			shouldRemove = (appInstance.Status == StatusStopped || appInstance.Status == StatusFailed)
+		case <-nr.globalCtx.Done(): // Runner shutting down
+			shouldRemove = true // Clean up on runner shutdown
+		default: // Process exited on its own
+			shouldRemove = (appInstance.Status == StatusFailed) || (appInstance.Status == StatusStopped) // Crashed gets handled by restart logic first
+		}
+		if shouldRemove {
+			nr.removeInstanceState(appName, instanceID, logger)
 		}
 	}()
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
-	waitErr := appInstance.Cmd.Wait()
+	waitErr := appInstance.Cmd.Wait() // Wait for the process (launcher or direct exec)
 
 	// Determine exit details
 	exitCode := -1
 	intentionalStop := false
 	errMsg := ""
+	finalStatus := StatusStopped // Default to stopped
 
-	// Check if an intentional stop was signalled BEFORE Wait() returned
 	select {
 	case <-appInstance.StopSignal:
 		intentionalStop = true
 		logger.Info("Process exit detected after intentional stop signal")
 	default:
-		// No intentional stop signal before Wait() returned
 	}
-
-	// If context was cancelled, assume intentional stop unless already signalled otherwise
 	if appInstance.processCtx.Err() == context.Canceled && !intentionalStop {
 		intentionalStop = true
 		logger.Info("Process exit detected after context cancellation")
 	}
 
-	// Determine final status based on Wait() error and signals
-	finalStatus := StatusStopped
 	if waitErr != nil {
 		errMsg = waitErr.Error()
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				sig := status.Signal()
-				logger.Warn("Process killed by signal", "pid", appInstance.Pid, "signal", sig)
-				// Treat SIGTERM/SIGINT during intentional stop as clean stop
-				if (sig == syscall.SIGTERM || sig == syscall.SIGINT) && intentionalStop {
-					finalStatus = StatusStopped
-				} else {
-					finalStatus = StatusCrashed // Killed by other signal or during non-intentional stop
+			// Check if it was the launcher that failed
+			isLauncherFailure := false
+			if spec.Mode == "landlock" && strings.HasSuffix(appInstance.Cmd.Path, "node-runner") { // Check if we ran the launcher
+				switch exitCode {
+				case landlockLauncherErrCode, landlockUnsupportedErrCode,
+					landlockLockFailedErrCode, landlockTargetExecFailedCode:
+					isLauncherFailure = true
+					finalStatus = StatusFailed // Launcher errors are fatal for the instance
+					logger.Error("Landlock launcher failed", "exit_code", exitCode, "error", errMsg)
+					// Make sure intentionalStop is true so we don't try to restart
+					intentionalStop = true
 				}
-			} else {
-				// Exited non-zero, but not signalled
-				logger.Warn("Process exited non-zero", "pid", appInstance.Pid, "exit_code", exitCode)
-				finalStatus = StatusCrashed
 			}
-		} else {
-			// Wait failed for other reason (e.g., I/O error, start failed initially?)
+
+			if !isLauncherFailure { // Handle non-launcher exit errors
+				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+					sig := status.Signal()
+					logger.Warn("Process killed by signal", "pid", appInstance.Pid, "signal", sig)
+					if (sig == syscall.SIGTERM || sig == syscall.SIGINT) && intentionalStop {
+						finalStatus = StatusStopped
+					} else {
+						finalStatus = StatusCrashed
+					}
+				} else {
+					logger.Warn("Process exited non-zero", "pid", appInstance.Pid, "exit_code", exitCode)
+					finalStatus = StatusCrashed // Crashed if exited non-zero unexpectedly
+				}
+			}
+		} else { // Wait failed for other reasons (e.g., start failed, IO error)
 			logger.Error("Process wait failed", "error", waitErr)
 			finalStatus = StatusFailed
-			intentionalStop = true // Treat non-exit errors as fatal, no restart
+			intentionalStop = true // Treat non-exit errors as fatal
 		}
-	} else {
-		// Exited cleanly (code 0)
+	} else { // Exited cleanly (code 0)
 		exitCode = 0
 		logger.Info("Process exited cleanly", "pid", appInstance.Pid)
 		finalStatus = StatusStopped
 	}
 
-	// Update internal state and publish
+	// Update internal state and publish status
 	appInstance.Status = finalStatus
 	appInstance.lastExitCode = &exitCode
 	nr.publishStatusUpdate(instanceID, finalStatus, &appInstance.Pid, &exitCode, errMsg)
 
 	// --- Restart Logic ---
-	// Conditions for NO restart:
-	// 1. Intentional stop (signal or context cancel)
-	// 2. Final status is Failed (unrecoverable error)
-	// 3. Runner is shutting down (global context cancelled)
+	// No restart if: intentional stop, Failed status (unrecoverable), runner shutting down
 	if intentionalStop || finalStatus == StatusFailed || nr.globalCtx.Err() != nil {
-		logger.Info("Instance stopped intentionally or failed permanently or runner shutting down. No restart.", "status", finalStatus, "intentional", intentionalStop, "runner_shutdown", nr.globalCtx.Err() != nil)
+		logger.Info("Instance stopped/failed or runner shutting down. No restart.",
+			"status", finalStatus, "intentional", intentionalStop, "runner_shutdown", nr.globalCtx.Err() != nil)
 		return // Exit monitor
 	}
 
-	// Conditions met for potential restart (Crashed or Stopped unexpectedly)
-	appInfo := nr.state.GetAppInfo(appName) // Read-only access needed here
+	// Potential restart needed (Crashed or Stopped unexpectedly)
+	appInfo := nr.state.GetAppInfo(appName)
 
-	// Check if config changed or instance was removed while process was running
 	appInfo.mu.RLock()
 	configHashMatches := appInfo.configHash == appInstance.ConfigHash
 	instanceStillManaged := false
-	var currentReplicaIndex = -1 // Need index for restart call
+	var currentReplicaIndex = -1
 	for idx, inst := range appInfo.instances {
 		if inst.InstanceID == instanceID {
 			instanceStillManaged = true
@@ -513,27 +591,25 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	restartTimer := time.NewTimer(RestartDelay)
 	select {
 	case <-restartTimer.C:
-		// Delay finished
 	case <-nr.globalCtx.Done():
 		logger.Info("Restart canceled due to runner shutdown.")
 		restartTimer.Stop()
-		return // Exit monitor
+		return
 	case <-appInstance.processCtx.Done():
-		// This case should be less likely now but handles if context gets cancelled externally during delay
 		logger.Warn("Instance context cancelled during restart delay?")
 		restartTimer.Stop()
-		return // Exit monitor
+		return
 	case <-appInstance.StopSignal:
 		logger.Info("Restart canceled due to explicit stop signal for instance.")
 		restartTimer.Stop()
-		return // Exit monitor
+		return
 	}
 
 	// Re-acquire lock to perform the restart safely
 	appInfo.mu.Lock()
 	defer appInfo.mu.Unlock()
 
-	// Double-check conditions after acquiring lock and waiting
+	// Double-check conditions after lock and delay
 	currentConfigHashAfterDelay := appInfo.configHash
 	instanceStillExistsAfterDelay := false
 	for _, inst := range appInfo.instances {
@@ -549,18 +625,17 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		logger.Info("Config changed during restart delay. Aborting restart.")
 	} else {
 		// Attempt the actual restart
-		err := nr.startAppInstance(context.Background(), appInfo, currentReplicaIndex) // Pass necessary context and index
+		err := nr.startAppInstance(context.Background(), appInfo, currentReplicaIndex)
 		if err != nil {
 			logger.Error("Failed to restart application instance", "error", err)
-			// If restart fails, mark as failed permanently
 			appInstance.Status = StatusFailed
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, &exitCode, fmt.Sprintf("Restart failed: %v", err))
-			// No return here, let defer handle cleanup
+			// Let defer handle final cleanup
 		} else {
 			logger.Info("Instance restarted successfully")
-			// Restart succeeded, this monitor goroutine's job is done.
-			// The *new* instance started by startAppInstance will have its *own* monitor goroutine.
-			return // Exit *this* monitor goroutine successfully.
+			// Restart succeeded, THIS monitor goroutine's job is done.
+			// The NEW instance has its own monitor.
+			return
 		}
 	}
 }
@@ -796,7 +871,7 @@ func sanitizePathElement(element string) string {
 
 // removeInstanceState removes the state for a specific instance from the manager.
 func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *slog.Logger) {
-	appInfo := nr.state.GetAppInfo(appName) // Gets or creates (though should exist)
+	appInfo := nr.state.GetAppInfo(appName)
 	appInfo.mu.Lock()
 	defer appInfo.mu.Unlock()
 
@@ -805,9 +880,8 @@ func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *sl
 	for _, instance := range appInfo.instances {
 		if instance.InstanceID == instanceID {
 			found = true
-			// Optionally, explicitly cancel context if not already done
 			if instance.processCancel != nil {
-				instance.processCancel()
+				instance.processCancel() // Ensure context is cancelled
 			}
 		} else {
 			newInstances = append(newInstances, instance)
@@ -817,9 +891,6 @@ func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *sl
 	if found {
 		appInfo.instances = newInstances
 		logger.Info("Removed instance state.", "remaining_instances", len(newInstances))
-		// If this was the last instance, maybe remove the appInfo entirely?
-		// Need careful consideration of locking if we do that here.
-		// For now, leave the appInfo entry even if instances list is empty.
 	} else {
 		logger.Warn("Attempted to remove instance state, but it was not found.")
 	}

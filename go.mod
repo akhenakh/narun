@@ -49,6 +49,7 @@ require (
 	github.com/google/cel-go v0.24.1 // indirect
 	github.com/google/pprof v0.0.0-20231212022811-ec68065c825e // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/hashicorp/go-set/v2 v2.1.0 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
@@ -84,6 +85,7 @@ require (
 	github.com/quic-go/quic-go v0.50.1 // indirect
 	github.com/rs/xid v1.5.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/shoenig/go-landlock v1.2.2 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/shurcooL/sanitized_anchor_name v1.0.0 // indirect
 	github.com/slackhq/nebula v1.6.1 // indirect
@@ -121,4 +123,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20241007155032-5fefd90f89a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241007155032-5fefd90f89a9 // indirect
 	howett.net/plist v1.0.0 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.70 // indirect
 )
