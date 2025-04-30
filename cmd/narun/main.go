@@ -110,6 +110,8 @@ Options:
 		handleListAppsCmd(args)
 	case "delete-app":
 		handleAppDeleteCmd(args)
+	case "secret":
+		handleSecretCmd(args)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -119,6 +121,7 @@ Options:
 	}
 }
 
+// Update main printUsage to mention the secret command
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Narun Management CLI
 
@@ -126,58 +129,42 @@ Usage: %s <command> [options] [arguments...]
 
 Commands:
   deploy        Upload application binaries and configuration.
-                Run '%s deploy -h' for specific deploy options.
   logs          Stream logs from node runners.
   list-images   List application binaries stored in NATS Object Store.
   list-apps     List deployed applications and their status on nodes.
   delete-app    Delete an application configuration from NATS KV.
+  secret        Manage encrypted secrets (set, list, delete). Run '%s secret help' for details.
   help          Show this help message.
 
 Common Options (apply to multiple commands where relevant):
   -nats <url>     NATS server URL (default: %s)
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
-Options for deploy:
+Use "<command> -h" for command-specific help.
 `, os.Args[0], os.Args[0], DefaultNatsURL, DefaultTimeout)
-	// Print deploy flags specifically
+}
+
+// Add specific usage functions for other commands if needed (for -h)
+func printDeployUsage() {
 	deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
 	deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (required)")
+	deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional).")
 	deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+	deployFlags.String("name", "", "Application name (required if -config is not used)")
+	deployFlags.String("tag", "", "Binary tag (required if -config is not used)")
+	deployFlags.String("node", "local", "Target node name (used if -config is not used)")
+	deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
+	fmt.Fprintf(os.Stderr, `Usage: %s deploy [options] <binary_path> [<binary_path>...]
+
+Uploads application binaries and configuration.
+
+Arguments:
+  <binary_path>   Path to the application binary file (at least one required).
+
+Options:
+`, os.Args[0])
 	deployFlags.PrintDefaults()
-
-	fmt.Fprintln(os.Stderr, "\nOptions for logs:")
-	logsFlags := flag.NewFlagSet("logs", flag.ExitOnError)
-	logsFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	logsFlags.String("app", "", "Filter logs by application name")
-	logsFlags.String("node", "", "Filter logs by node ID")
-	logsFlags.String("instance", "", "Filter logs by specific instance ID (requires -app)")
-	logsFlags.Bool("f", false, "Follow the log stream continuously (alias -follow)")
-	logsFlags.Bool("follow", false, "Follow the log stream continuously")
-	logsFlags.Bool("raw", false, "Output raw JSON log messages")
-	logsFlags.Duration("timeout", 1*time.Minute, "Timeout for NATS connection/initial setup")
-	logsFlags.PrintDefaults()
-
-	fmt.Fprintln(os.Stderr, "\nOptions for list-images:")
-	listImagesFlags := flag.NewFlagSet("list-images", flag.ExitOnError)
-	listImagesFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	listImagesFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
-	// Add filtering options later if needed
-	listImagesFlags.PrintDefaults()
-
-	fmt.Fprintln(os.Stderr, "\nOptions for list-apps:")
-	listAppsFlags := flag.NewFlagSet("list-apps", flag.ExitOnError)
-	listAppsFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	listAppsFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
-	// Add filtering options later if needed
-	listAppsFlags.PrintDefaults()
-
-	fmt.Fprintln(os.Stderr, "\nOptions for delete:")
-	deleteFlags := flag.NewFlagSet("delete", flag.ExitOnError)
-	deleteFlags.String("nats", DefaultNatsURL, "NATS server URL")
-	deleteFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
-	deleteFlags.Bool("y", false, "Skip confirmation prompt")
-	deleteFlags.PrintDefaults()
+	fmt.Fprintln(os.Stderr, "\nNote: If -config is provided, the -name, -tag, -node, and -replicas flags are ignored.")
 }
 
 // Deploy Command Logic

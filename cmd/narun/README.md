@@ -21,6 +21,7 @@ narun <command> [options] [arguments...]
 *   `logs`: Stream logs from node runners.
 *   `list-images`: List application binaries stored in NATS Object Store.
 *   `list-apps`: List deployed applications and their status on nodes.
+*   `secret`: Manage secrets for applications.
 *   `delete-app`:  Delete an application configuration from NATS KV.
 
 ---
@@ -198,4 +199,64 @@ simple-app   simple-v0.1    local              running          linux/amd64    1
 simple-app   simple-v0.1    specific-worker    offline/unknown  -/-            0                  2
 other-svc    other-svc-v2.0 node-arm64         running          linux/arm64    1                  1
 Found 3 configured application(s).
+```
+
+### `narun secret`
+
+1.  **Generate a Master Key:** Create a strong 32-byte key and base64 encode it.
+    ```bash
+    # Example using openssl
+    openssl rand -base64 32
+    # Copy the output
+    export NARUN_MASTER_KEY="YOUR_BASE64_ENCODED_KEY_HERE"
+
+    # Or store it in a File and set the environment variable
+    export NARUN_MASTER_KEY_PATH="/path/to/master_key.txt"
+    ```
+1.  **Set a Secret:**
+    ```bash
+    ./narun secret set -nats nats://localhost:4222 -master-key $NARUN_MASTER_KEY A_SECURE_KEY "this-is-my-super-secret-value" -desc "API key for external service"
+    ```
+1.  **List Secrets:**
+    ```bash
+    ./narun secret list -nats nats://localhost:4222
+    ```
+1.  **Example deployment**
+    ```yaml
+    name: hello-app
+    tag: v2
+    args: [ "--listen", ":9001" ]
+    env:
+      - name: GREETING
+        value: "Hello from NATS!"
+      - name: MY_SECRET_ENV # App expects this env var
+        valueFromSecret: A_SECURE_KEY # Reference the secret name
+    nodes:
+      - name: node-amd64
+        replicas: 1
+    ```
+1.  **Run Node Runner with Master Key:**
+    ```bash
+    ./node-runner -nats-url nats://localhost:4222 -data-dir /data/narun -node-id node-amd64 -master-key $NARUN_MASTER_KEY
+    ```
+1.  **Verification:** The `hello-app` running on `node-amd64` should now have the environment variable `MY_SECRET_ENV` set to `"this-is-my-super-secret-value"`.
+1.  **Delete a Secret:**
+    ```bash
+    ./narun secret delete -nats nats://localhost:4222 A_SECURE_KEY
+    ```
+
+### `narun secret set -master`
+```
+SECRET NAME
+-----------
+SECRET
+```
+
+
+
+### `narun secret list`
+```
+SECRET NAME
+-----------
+SECRET
 ```

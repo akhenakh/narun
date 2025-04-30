@@ -239,9 +239,9 @@ This project is under active development. Components and APIs may change.
 - route grpc from Caddy
 - caddy config does not need the path
 - global nats url in caddy rather than per path?
-- SIGTERM on an app , node runner does not restart
+- [X] SIGTERM on an app , node runner does not restart
 - [X] known bug the node-runner is not downloading and hashing the binary back properly.
-- Log history not just live follow
+- Log history not just live follow or use external solution like vector
 - [X] check arch before downloading binary
 - [X] fix the version/tag system to long
 - [X] dont store arch as GOARCH since it may be a binary coming from another language.
@@ -267,7 +267,7 @@ This project is under active development. Components and APIs may change.
   - exec
   - systemd-nspawn
 - do not develop a node runner but interact with systemd only?
-- no registry needed for "images", binary can be compiled using ko and uploaded to objectstore
+- no registry needed for "images", binary can be compiled using ko like solution and uploaded to objectstore
 - zig musl + static go build
 - config stored in ELF .config
 - each gateway has a name, developer can target a specific gateway in its config
@@ -279,7 +279,7 @@ This project is under active development. Components and APIs may change.
 - Store disk Zstd  transferable pvc, big file
 - Incoming webhook handler (bento?)
 - Proxy to existing http app via nats (using gw as a sidecar pseudo mesh)
-- Secure Enclave server store + add encrypted  secret
+- [X] Secure Enclave server store + add encrypted  secret
   - Export secret to pgp
 - Add auth gw to nats
 - Regroup into one command
@@ -287,6 +287,7 @@ This project is under active development. Components and APIs may change.
 - Outgoing wiry translation
 - Narun auto gitops (argocd like)
 - Logs to vector (easy nothing to do)
+- embed a nats server into the node runner
 
 
 ### Won't

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -31,6 +32,8 @@ type NodeRunner struct {
 	appBinaries  jetstream.ObjectStore
 	state        *AppStateManager // Updated state manager
 	logger       *slog.Logger
+	kvSecrets    jetstream.KeyValue // KV store for encrypted secrets
+	masterKey    []byte             // Decoded master key
 	dataDir      string
 	version      string
 	startTime    time.Time
@@ -42,7 +45,7 @@ type NodeRunner struct {
 }
 
 // NewNodeRunner creates and initializes a new NodeRunner.
-func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeRunner, error) {
+func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64 string, logger *slog.Logger) (*NodeRunner, error) {
 	// ... (hostname, dataDir, logger setup identical) ...
 	if nodeID == "" {
 		hostname, err := os.Hostname()
@@ -67,12 +70,24 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	}
 	logger = logger.With("node_id", nodeID, "component", "node-runner")
 
-	// ** Detect Local Platform **
+	// Detect Local Platform
 	localOS := runtime.GOOS
 	localArch := runtime.GOARCH
-	logger.Info("Detected local platform", "os", localOS, "arch", localArch)
+	logger.Debug("Detected local platform", "os", localOS, "arch", localArch)
 
-	// ... (NATS connection setup identical) ...
+	var masterKey []byte
+	if masterKeyBase64 != "" {
+		masterKey, err = crypto.DeriveKeyFromBase64(masterKeyBase64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid master key provided: %w", err)
+		}
+		logger.Info("Master key loaded successfully.")
+	} else {
+		logger.Warn("No master key provided (-master-key flag or NARUN_MASTER_KEY env). Secret decryption will not be possible.")
+		// Allow running without a key, but secret resolution will fail
+	}
+
+	// NATS connection
 	nc, err := nats.Connect(natsURL,
 		nats.Name(fmt.Sprintf("node-runner-%s", nodeID)),
 		nats.ReconnectWait(2*time.Second),
@@ -94,14 +109,14 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsURL, err)
 	}
-	logger.Info("Connected to NATS", "url", natsURL)
+	logger.Debug("Connected to NATS", "url", natsURL)
 
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("failed to create JetStream context: %w", err)
 	}
-	logger.Info("JetStream context created")
+	logger.Debug("JetStream context created")
 
 	// Bind to KV Stores
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -114,7 +129,8 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		nc.Close()
 		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", AppConfigKVBucket, err)
 	}
-	logger.Info("Bound to App Config KV store", "bucket", AppConfigKVBucket)
+	logger.Debug("Bound to App Config KV store", "bucket", AppConfigKVBucket)
+
 	kvNodeStates, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
 		Bucket: NodeStateKVBucket, Description: "Stores node runner states and heartbeats.", TTL: NodeStateKVTTL, History: 1,
 	})
@@ -122,7 +138,19 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		nc.Close()
 		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", NodeStateKVBucket, err)
 	}
-	logger.Info("Bound to Node State KV store", "bucket", NodeStateKVBucket, "ttl", NodeStateKVTTL)
+	logger.Debug("Bound to Node State KV store", "bucket", NodeStateKVBucket, "ttl", NodeStateKVTTL)
+
+	// Bind to Secret KV Store
+	kvSecrets, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
+		Bucket:      SecretKVBucket,
+		Description: "Stores encrypted application secrets.",
+		History:     1, // Only keep latest version of secret
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", SecretKVBucket, err)
+	}
+	logger.Debug("Bound to Secret KV store", "bucket", SecretKVBucket)
 
 	// Bind to Object Store
 	osBucket, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
@@ -143,14 +171,16 @@ func NewNodeRunner(nodeID, natsURL, dataDir string, logger *slog.Logger) (*NodeR
 		js:           js,
 		kvAppConfigs: kvAppConfigs,
 		kvNodeStates: kvNodeStates,
+		kvSecrets:    kvSecrets, // Store handle
+		masterKey:    masterKey, // Store decoded key
 		appBinaries:  osBucket,
 		state:        NewAppStateManager(),
 		logger:       logger,
 		dataDir:      dataDirAbs,
 		version:      runnerVersion,
 		startTime:    runnerStartTime,
-		localOS:      localOS,   // ** Store detected OS **
-		localArch:    localArch, // ** Store detected Arch **
+		localOS:      localOS,   // Store detected OS
+		localArch:    localArch, //  Store detected Arch
 		globalCtx:    gCtx,
 		globalCancel: gCancel,
 	}

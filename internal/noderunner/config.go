@@ -16,12 +16,16 @@ const (
 	NodeStateKVTTL        = 45 * time.Second   // Key expires if not updated within this duration
 	NodeHeartbeatInterval = NodeStateKVTTL / 3 // Update frequency (e.g., every 15s)
 	LogSubjectPrefix      = "logs"             // prefix for the logs
+	SecretKVBucket        = "narun-secrets"    // KV store for encrypted secrets
 )
 
 // EnvVar defines an environment variable for the service.
+// Now includes ValueFromSecret. Only one of Value or ValueFromSecret should be set.
 type EnvVar struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
+	Name            string `yaml:"name"`
+	Value           string `yaml:"value"`
+	ValueFromSecret string `yaml:"valueFromSecret,omitempty"` // Name of the secret in the SecretKVBucket
+
 }
 
 // NodeSelectorSpec defines which node should run the service and how many replicas.
@@ -39,6 +43,16 @@ type ServiceSpec struct {
 	Env     []EnvVar           `yaml:"env,omitempty"`     // Environment variables to set
 	Tag     string             `yaml:"tag"`               // Tag for the binary
 	Nodes   []NodeSelectorSpec `yaml:"nodes,omitempty"`   // List of nodes to deploy on and replica counts
+}
+
+// StoredSecret is the structure stored as JSON in the SecretKVBucket.
+type StoredSecret struct {
+	Name        string    `json:"name"`       // Name of the secret (for verification, used as AAD)
+	Ciphertext  []byte    `json:"ciphertext"` // AES-GCM encrypted value
+	Nonce       []byte    `json:"nonce"`      // Nonce used for encryption (must be unique per key+encryption)
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // NodeState represents the information stored about a node runner in the KV store.
@@ -72,6 +86,24 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		// Note: This default might be less useful now, as the actual binary filename
 		// will include OS/Arch. The path retrieved from fetchAndStoreBinary is more reliable.
 		spec.Command = spec.Name // We'll use the local path later
+	}
+
+	// Validate Env Vars: only one of value or valueFromSecret should be set
+	for i, env := range spec.Env {
+		if env.Name == "" {
+			return nil, fmt.Errorf("env var at index %d: 'name' cannot be empty", i)
+		}
+		if env.Value != "" && env.ValueFromSecret != "" {
+			return nil, fmt.Errorf("env var '%s': cannot specify both 'value' and 'valueFromSecret'", env.Name)
+		}
+		// Allow both to be empty? Maybe for system-provided vars later. For now, require one or the other if Env is defined.
+		// Let's relax this: allow neither to be set if desired (e.g. just inheriting).
+		// if env.Value == "" && env.ValueFromSecret == "" {
+		// 	return nil, fmt.Errorf("env var '%s': must specify either 'value' or 'valueFromSecret'", env.Name)
+		// }
+		if strings.ContainsAny(env.Name, " =") {
+			return nil, fmt.Errorf("env var name '%s' contains invalid characters", env.Name)
+		}
 	}
 
 	nodeNames := make(map[string]bool)

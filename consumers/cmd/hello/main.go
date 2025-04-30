@@ -122,6 +122,9 @@ func main() {
 	maxConcurrent := flag.Int("concurrency", runtime.NumCPU(), "Maximum number of concurrent requests")
 	flag.Parse()
 
+	// to validate secret system is working, let's read the ENV named secret
+	logger.Debug("reading env SECRET value", "secret", os.Getenv("SECRET"))
+
 	// Create handler
 	handler := &helloHandler{}
 

@@ -10,3 +10,5 @@ args:
 env:
   - name: GREETING
     value: "Hello from NATS!"
+  - name: SECRET
+    valueFromSecret: SECRET

@@ -16,6 +16,9 @@ func main() {
 	nodeID := flag.String("node-id", "", "Unique ID for this node (defaults to hostname)")
 	dataDir := flag.String("data-dir", "./narun-data", "Directory for storing binaries and data")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	masterKey := flag.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key for secrets (or use NARUN_MASTER_KEY env var)")
+	masterKeyPath := flag.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "The path to the file containing the base64 encoded AES-256 master key for secrets")
+
 	flag.Parse()
 
 	// Setup Logger
@@ -36,8 +39,17 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	if *masterKeyPath != "" {
+		keyBytes, err := os.ReadFile(*masterKeyPath)
+		if err != nil {
+			slog.Error("Failed to read master key file", "error", err)
+			os.Exit(1)
+		}
+		*masterKey = string(keyBytes)
+	}
+
 	// Create Node Runner
-	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, logger)
+	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, logger)
 	if err != nil {
 		logger.Error("Failed to initialize node runner", "error", err)
 		os.Exit(1)

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3" // Use v3 consistently if config uses it
 )
@@ -78,60 +79,68 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	logger := nr.logger.With("app", appName, "instance_id", instanceID, "tag", tag)
 	logger.Info("Attempting to start application instance")
 
-	configHash := appInfo.configHash // Get hash from locked appInfo
+	// Prepare Environment Variables (with secret resolution) ***
+	processEnv := os.Environ()
+	// Add Base env vars from spec, resolving secrets
+	for _, envVar := range spec.Env {
+		var resolvedValue string
+		var resErr error
 
-	// Check if an instance with this ID exists and is truly RUNNING.
-	instanceExists := false
-	for _, existingInstance := range appInfo.instances {
-		if existingInstance.InstanceID == instanceID {
-			instanceExists = true
-			if existingInstance.Status == StatusRunning {
-				logger.Warn("Attempted to start instance that is already running.", "status", existingInstance.Status, "pid", existingInstance.Pid)
-				return fmt.Errorf("instance %s already running with pid %d", instanceID, existingInstance.Pid)
+		if envVar.ValueFromSecret != "" {
+			// Resolve secret
+			secretName := envVar.ValueFromSecret
+			resolvedValue, resErr = nr.resolveSecret(ctx, secretName, logger)
+			if resErr != nil {
+				// Fail the instance start if a required secret cannot be resolved
+				logger.Error("Failed to resolve secret for env var", "secret_name", secretName, "env_var", envVar.Name, "error", resErr)
+				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", secretName, resErr)
+				// Cancel context before returning error? Yes.
+				// Note: We haven't created the process context yet. Use the passed ctx? Or just return.
+				// Let's just return the error. The caller (handleAppConfigUpdate) might handle cleanup.
+				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg) // Publish failure status
+				return fmt.Errorf("failed to resolve secret '%s' for env var '%s': %w", secretName, envVar.Name, resErr)
 			}
-			logger.Debug("Found existing non-running instance state, proceeding to replace.", "status", existingInstance.Status)
-			break
+			logger.Debug("Successfully resolved secret", "secret_name", secretName, "env_var", envVar.Name)
+		} else {
+			// Use direct value
+			resolvedValue = envVar.Value
 		}
+		// Append the resolved env var
+		processEnv = append(processEnv, fmt.Sprintf("%s=%s", envVar.Name, resolvedValue))
 	}
+	// Add instance-specific env vars
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_APP_NAME=%s", appName))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
+	// Create context for this specific instance (moved after env resolution)
+	processCtx, processCancel := context.WithCancel(nr.globalCtx)
 
-	// Fetch and Store Binary ** using tag and local platform **
-	binaryPath, err := nr.fetchAndStoreBinary(ctx, tag, appName, configHash)
-	if err != nil {
-		errMsg := fmt.Sprintf("Binary fetch failed for %s/%s: %v", nr.localOS, nr.localArch, err)
-		logger.Error(errMsg, "error", err) // Log error with platform info
-		if !instanceExists {
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-		}
-		return fmt.Errorf("failed to fetch binary for %s (%s/%s): %w", instanceID, nr.localOS, nr.localArch, err)
+	// Create command (using resolved binary path)
+	binaryPath := "" // Get this from fetchAndStoreBinary call earlier
+	var fetchErr error
+	binaryPath, fetchErr = nr.fetchAndStoreBinary(ctx, spec.Tag, appName, appInfo.configHash)
+	if fetchErr != nil {
+		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
+		logger.Error(errMsg, "error", fetchErr)
+		processCancel() // Cancel context
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+		return fmt.Errorf("failed to fetch binary for %s: %w", instanceID, fetchErr)
 	}
 	logger.Info("Binary downloaded/verified", "path", binaryPath)
-
-	// Prepare Command (Executable Check)
+	// Chmod after fetch, before Command creation
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		logger.Error("Failed to make binary executable", "path", binaryPath, "error", err)
-		if !instanceExists {
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
-		}
+		processCancel() // Cancel context
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
 		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
 	}
 
-	//  Create context for this specific instance
-	processCtx, processCancel := context.WithCancel(nr.globalCtx)
-
-	cmdPath := binaryPath // Use the fetched binary path
+	cmdPath := binaryPath
 	cmd := exec.CommandContext(processCtx, cmdPath, spec.Args...)
-	cmd.Env = os.Environ()
-	// Add BASE env vars
-	for _, envVar := range spec.Env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", envVar.Name, envVar.Value))
-	}
-	// Add instance-specific env vars
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_APP_NAME=%s", appName))
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID))
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex))
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID))
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
-	cmd.Env = append(cmd.Env, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
+	cmd.Env = processEnv // Assign the fully prepared environment
 
 	// Directory Setup
 	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
@@ -139,9 +148,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		processCancel()
 		logger.Error("Failed to create instance working directory", "dir", workDir, "error", err)
-		if !instanceExists {
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
-		}
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
 		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
 	}
 	cmd.Dir = workDir
@@ -152,9 +159,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	if err != nil {
 		processCancel()
 		logger.Error("Failed to get stdout pipe", "error", err)
-		if !instanceExists {
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stdout pipe failed: %v", err))
-		}
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stdout pipe failed: %v", err))
 		return fmt.Errorf("stdout pipe failed for %s: %w", instanceID, err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
@@ -162,18 +167,16 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		processCancel()
 		stdoutPipe.Close()
 		logger.Error("Failed to get stderr pipe", "error", err)
-		if !instanceExists {
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stderr pipe failed: %v", err))
-		}
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stderr pipe failed: %v", err))
 		return fmt.Errorf("stderr pipe failed for %s: %w", instanceID, err)
 	}
 
+	// Create/Update ManagedApp State
 	appInstance := &ManagedApp{
-		InstanceID: instanceID, Spec: spec, Cmd: cmd, Status: StatusStarting, ConfigHash: configHash,
+		InstanceID: instanceID, Spec: spec, Cmd: cmd, Status: StatusStarting, ConfigHash: appInfo.configHash,
 		BinaryPath: binaryPath, StdoutPipe: stdoutPipe, StderrPipe: stderrPipe,
 		StopSignal: make(chan struct{}), processCtx: processCtx, processCancel: processCancel, restartCount: 0,
 	}
-
 	foundAndReplaced := false
 	for i, existing := range appInfo.instances {
 		if existing.InstanceID == instanceID {
@@ -196,7 +199,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, "Starting process")
 
 	// Start Process
-	logger.Info("Starting process", "command", cmdPath, "args", spec.Args, "env_added", 6) // Env count updated
+	logger.Info("Starting process", "command", cmdPath, "args", spec.Args, "env_count", len(cmd.Env))
 	if startErr := cmd.Start(); startErr != nil {
 		errMsg := fmt.Sprintf("Failed to start process: %v", startErr)
 		logger.Error(errMsg, "error", startErr)
@@ -217,7 +220,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	go nr.forwardLogs(appInstance, appInstance.StderrPipe, "stderr", logger)
 	go nr.monitorAppInstance(appInstance, logger)
 
-	return nil // Signal success
+	return nil
 }
 
 // stopAppInstance gracefully stops an application instance process.
@@ -282,6 +285,42 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 		// Process exited, maybe cleanly or due to SIGTERM
 	}
 	return nil // Signal that stop attempt was made
+}
+
+// resolveSecret fetches and decrypts a secret from the KV store.
+func (nr *NodeRunner) resolveSecret(ctx context.Context, secretName string, logger *slog.Logger) (string, error) {
+	if nr.masterKey == nil {
+		return "", fmt.Errorf("cannot resolve secret '%s': node runner has no master key configured", secretName)
+	}
+
+	getCtx, cancel := context.WithTimeout(ctx, 5*time.Second) // Short timeout for KV get
+	defer cancel()
+
+	entry, err := nr.kvSecrets.Get(getCtx, secretName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return "", fmt.Errorf("secret '%s' not found in KV store '%s'", secretName, SecretKVBucket)
+		}
+		return "", fmt.Errorf("failed to get secret '%s' from KV: %w", secretName, err)
+	}
+
+	var storedSecret StoredSecret
+	if err := json.Unmarshal(entry.Value(), &storedSecret); err != nil {
+		return "", fmt.Errorf("failed to unmarshal stored secret data for '%s': %w", secretName, err)
+	}
+
+	// Use secret name as Additional Authenticated Data (AAD)
+	aad := []byte(secretName)
+
+	plaintextBytes, err := crypto.Decrypt(nr.masterKey, storedSecret.Ciphertext, storedSecret.Nonce, aad)
+	if err != nil {
+		logger.Error("Decryption failed", "secret_name", secretName, "error", err)
+		// Don't return the specific crypto error message to the user/logs ideally,
+		// just a generic "decryption failed" to avoid leaking info.
+		return "", fmt.Errorf("decryption failed for secret '%s'", secretName)
+	}
+
+	return string(plaintextBytes), nil
 }
 
 // forwardLogs reads logs from a pipe and publishes them to NATS.
