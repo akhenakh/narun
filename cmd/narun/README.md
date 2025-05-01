@@ -201,6 +201,60 @@ other-svc    other-svc-v2.0 node-arm64         running          linux/arm64    1
 Found 3 configured application(s).
 ```
 
+
+### `narun files`
+
+Manages shared, unencrypted files stored in the NATS Object Store bucket `narun-files`. These files can be mounted into the working directory of application instances using the `mounts` section in the `ServiceSpec`.
+
+**Subcommands:**
+
+*   `add <name> <local_path>`: Adds a new file or replaces an existing file with the given logical `<name>` using the content from `<local_path>`. The `<name>` is used as the key in the object store and referenced in `mounts.source.objectStore`.
+*   `list`: Lists the logical names, sizes, modification times, and digests of files stored in the `narun-files` bucket.
+*   `delete <name> [-y]`: Deletes the file with the specified logical `<name>` from the object store. Use `-y` to skip confirmation.
+*   `help`: Shows detailed help for the files command.
+
+**Options (Common):**
+
+*   `-nats <url>`: NATS server URL (default: "nats://localhost:4222").
+*   `-timeout <duration>`: Timeout for NATS operations (default: 15s).
+
+**Example Workflow:**
+
+1.  **Create a local configuration file:**
+    ```bash
+    echo '{"api_endpoint": "https://example.com/api"}' > ./myapp-settings.json
+    ```
+2.  **Add the file to Narun:**
+    ```bash
+    ./narun files add -nats nats://localhost:4222 my-app-settings ./myapp-settings.json
+    # -> Uploads myapp-settings.json to the 'narun-files' OS bucket
+    #    with the object name 'my-app-settings'
+    ```
+3.  **List Files:**
+    ```bash
+    ./narun files list -nats nats://localhost:4222
+    # NAME             SIZE  MODIFIED             ORIGINAL FILENAME    DIGEST
+    # ----             ----  --------             -----------------    ------
+    # my-app-settings  42    2023-10-29T14:00:00Z myapp-settings.json SHA-256=...
+    ```
+4.  **Use in `ServiceSpec`:** (See deploy example above)
+    ```yaml
+    mounts:
+      - path: config/settings.json # Relative path inside instance work dir
+        source:
+          objectStore: my-app-settings # Reference the name used in 'add'
+    # ...
+    ```
+5.  **Deploy App:** (Deploy command as shown before)
+6.  **Run `node-runner`:** (As shown before)
+7.  **Verification:** When the `hello-app` instance starts on a node, the `node-runner` will download the `my-app-settings` object from NATS and place its content at `/path/to/narun-data/instances/hello-app-0/work/config/settings.json` (adjusting for actual data dir and instance ID). The application can then read this file.
+8.  **Delete File:**
+    ```bash
+    ./narun files delete -nats nats://localhost:4222 my-app-settings -y
+    ```
+
+
+
 ### `narun secret`
 
 1.  **Generate a Master Key:** Create a strong 32-byte key and base64 encode it.
@@ -283,3 +337,16 @@ env:
   - name: SECRET
     valueFromSecret: SECRET # Example secret usage
 ```
+
+## Environment Variables for Instances
+
+The `node-runner` injects the following environment variables into running application instances:
+
+*   `NARUN_APP_NAME`: The name of the application (from `ServiceSpec.name`).
+*   `NARUN_INSTANCE_ID`: The unique ID for this specific replica (e.g., `my-app-0`).
+*   `NARUN_REPLICA_INDEX`: The numerical index of this replica (e.g., `0`).
+*   `NARUN_NODE_ID`: The ID of the node runner executing this instance.
+*   `NARUN_NODE_OS`: The operating system of the node (e.g., `linux`).
+*   `NARUN_NODE_ARCH`: The architecture of the node (e.g., `amd64`).
+*   `NARUN_INSTANCE_ROOT`: The absolute path to the instance's working directory root. For `exec` and `landlock` modes, this is the `work` directory within the instance's data directory on the host (e.g., `/data/narun/instances/my-app-0/work`). Applications can use this path to reliably locate mounted files (e.g., `$NARUN_INSTANCE_ROOT/config/settings.json`).
+*   *User-defined variables*: Any variables defined in `ServiceSpec.env` (including those resolved from secrets).

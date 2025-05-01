@@ -2,7 +2,6 @@ package noderunner
 
 import (
 	"fmt"
-	"log"
 	"runtime"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ const (
 	NodeStateKVBucket     = "node-runner-states"
 	NodeStateKVTTL        = 45 * time.Second   // Key expires if not updated within this duration
 	NodeHeartbeatInterval = NodeStateKVTTL / 3 // Update frequency (e.g., every 15s)
+	FileOSBucket          = "narun-files"      // Object store for user files
 	LogSubjectPrefix      = "logs"             // prefix for the logs
 	SecretKVBucket        = "narun-secrets"    // KV store for encrypted secrets
 )
@@ -27,6 +27,19 @@ type EnvVar struct {
 	Name            string `yaml:"name"`
 	Value           string `yaml:"value"`
 	ValueFromSecret string `yaml:"valueFromSecret,omitempty"` // Name of the secret in the SecretKVBucket
+}
+
+// SourceSpec defines the source of a mounted file or volume.
+// Currently, only ObjectStore is supported.
+type SourceSpec struct {
+	ObjectStore string `yaml:"objectStore,omitempty"` // Name of the file object in the FileOSBucket
+	// Could add Secret, ConfigMap, Volume later
+}
+
+// MountSpec defines a file or volume to be mounted into the instance's working directory.
+type MountSpec struct {
+	Path   string     `yaml:"path"`   // Relative path within the instance's working directory
+	Source SourceSpec `yaml:"source"` // Source of the mount content
 }
 
 // LandlockPathSpec defines a specific path and its allowed access modes for Landlock.
@@ -64,6 +77,7 @@ type ServiceSpec struct {
 	Nodes    []NodeSelectorSpec `yaml:"nodes,omitempty"`    // List of nodes to deploy on and replica counts
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
+	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
 }
 
 // StoredSecret is the structure stored as JSON in the SecretKVBucket.
@@ -94,8 +108,6 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 	if err := yaml.Unmarshal(data, &spec); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal ServiceSpec YAML: %w", err)
 	}
-
-	log.Println("DEBUG---------------------------------------------------------------------------", spec.Mode, spec)
 
 	if spec.Name == "" {
 		return nil, fmt.Errorf("service 'name' is required")
@@ -156,6 +168,17 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		// }
 		if strings.ContainsAny(env.Name, " =") {
 			return nil, fmt.Errorf("env var name '%s' contains invalid characters", env.Name)
+		}
+	}
+
+	// Validate Mounts
+	for i, mount := range spec.Mounts {
+		if strings.TrimSpace(mount.Path) == "" {
+			return nil, fmt.Errorf("mount at index %d: 'path' cannot be empty", i)
+		}
+		// Basic validation: currently only objectStore source is supported
+		if strings.TrimSpace(mount.Source.ObjectStore) == "" {
+			return nil, fmt.Errorf("mount '%s': source.objectStore name cannot be empty", mount.Path)
 		}
 	}
 

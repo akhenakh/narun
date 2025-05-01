@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,7 +31,8 @@ type NodeRunner struct {
 	kvAppConfigs jetstream.KeyValue
 	kvNodeStates jetstream.KeyValue
 	appBinaries  jetstream.ObjectStore
-	state        *AppStateManager // Updated state manager
+	fileStore    jetstream.ObjectStore // Add handle for file store
+	state        *AppStateManager      // Updated state manager
 	logger       *slog.Logger
 	kvSecrets    jetstream.KeyValue // KV store for encrypted secrets
 	masterKey    []byte             // Decoded master key
@@ -46,7 +48,6 @@ type NodeRunner struct {
 
 // NewNodeRunner creates and initializes a new NodeRunner.
 func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64 string, logger *slog.Logger) (*NodeRunner, error) {
-	// ... (hostname, dataDir, logger setup identical) ...
 	if nodeID == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -152,6 +153,16 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64 string, logger *slo
 	}
 	logger.Debug("Bound to Secret KV store", "bucket", SecretKVBucket)
 
+	// Bind to File Object Store
+	fileStore, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
+		Bucket: FileOSBucket, Description: "Shared files for Narun applications",
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to bind/create Object store '%s': %w", FileOSBucket, err)
+	}
+	logger.Info("Bound to File store", "bucket", FileOSBucket)
+
 	// Bind to Object Store
 	osBucket, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
 		Bucket: AppBinariesOSBucket, Description: "Stores application binaries.",
@@ -173,6 +184,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64 string, logger *slo
 		kvNodeStates: kvNodeStates,
 		kvSecrets:    kvSecrets, // Store handle
 		masterKey:    masterKey, // Store decoded key
+		fileStore:    fileStore, // Store handle for file store
 		appBinaries:  osBucket,
 		state:        NewAppStateManager(),
 		logger:       logger,
@@ -606,6 +618,128 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 	default:
 		logger.Warn("Ignoring unknown KV operation")
 	}
+}
+
+// fetchAndPlaceFile downloads a file from the file OS bucket and places it
+// at the target path within the instance's working directory.
+// It verifies hashes to avoid unnecessary downloads.
+func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanceWorkDir, targetRelativePath string, logger *slog.Logger) error {
+	logger = logger.With("mount_object", objectName, "mount_path", targetRelativePath)
+	logger.Info("Fetching and placing file mount")
+
+	// Get Object Info
+	objInfo, getInfoErr := nr.fileStore.GetInfo(ctx, objectName)
+	if getInfoErr != nil {
+		if errors.Is(getInfoErr, jetstream.ErrObjectNotFound) {
+			return fmt.Errorf("source file object '%s' not found in object store '%s': %w", objectName, FileOSBucket, getInfoErr)
+		}
+		return fmt.Errorf("failed to get info for file object '%s': %w", objectName, getInfoErr)
+	}
+
+	expectedDigest := objInfo.Digest
+	if expectedDigest == "" {
+		return fmt.Errorf("file object '%s' info is missing digest", objectName)
+	}
+
+	// Determine Local Path
+	// Ensure targetRelativePath is clean and doesn't escape instanceWorkDir
+	cleanRelativePath := filepath.Clean(targetRelativePath)
+	if strings.HasPrefix(cleanRelativePath, "..") || filepath.IsAbs(cleanRelativePath) {
+		return fmt.Errorf("invalid target mount path '%s': must be relative and within the work directory", targetRelativePath)
+	}
+	localPath := filepath.Join(instanceWorkDir, cleanRelativePath)
+	localDir := filepath.Dir(localPath)
+
+	// Check Local File and Hash
+	_, statErr := os.Stat(localPath)
+	if statErr == nil {
+		// File exists, verify hash
+		hashMatches, verifyErr := verifyLocalFileHash(localPath, expectedDigest)
+		if verifyErr == nil && hashMatches {
+			logger.Info("Local file mount exists and hash verified.", "path", localPath)
+			return nil // Success, local copy is up-to-date
+		}
+		logger.Warn("Local file mount exists but hash verification failed or errored. Re-downloading.", "path", localPath, "verify_err", verifyErr)
+	} else if !os.IsNotExist(statErr) {
+		// Error stating the file other than "not found"
+		return fmt.Errorf("failed to stat local file mount path %s: %w", localPath, statErr)
+	} else {
+		logger.Info("Local file mount not found.", "path", localPath)
+	}
+
+	// Download Needed
+	logger.Info("Downloading file mount object", "object", objectName, "local_path", localPath)
+	if err := os.MkdirAll(localDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory for mount path %s: %w", localDir, err)
+	}
+
+	// Use unique temp file name within the target directory
+	tempLocalPath := localPath + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
+	outFile, err := os.Create(tempLocalPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file %s: %w", tempLocalPath, err)
+	}
+
+	var finalErr error // To capture error for defer cleanup
+	defer func() {
+		if outFile != nil {
+			outFile.Close() // Ensure closed before potential remove
+		}
+		// Remove temp file if an error occurred during download/verify/rename
+		if finalErr != nil {
+			logger.Warn("Removing temporary mount file due to error", "path", tempLocalPath, "error", finalErr)
+			if remErr := os.Remove(tempLocalPath); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
+				logger.Error("Failed to remove temporary download file", "path", tempLocalPath, "error", remErr)
+			}
+		}
+	}()
+
+	// Get object reader
+	objResult, err := nr.fileStore.Get(ctx, objectName)
+	if err != nil {
+		finalErr = fmt.Errorf("failed to get object reader for %s: %w", objectName, err)
+		return finalErr
+	}
+	defer objResult.Close()
+
+	// Copy data
+	bytesCopied, err := io.Copy(outFile, objResult)
+	if err != nil {
+		finalErr = fmt.Errorf("failed to copy object data to %s: %w", tempLocalPath, err)
+		return finalErr
+	}
+	logger.Debug("File mount data copied", "temp_path", tempLocalPath, "bytes_copied", bytesCopied)
+
+	// Sync and close file before verification/rename
+	if syncErr := outFile.Sync(); syncErr != nil {
+		logger.Error("Failed to sync temporary file", "path", tempLocalPath, "error", syncErr)
+	}
+	if closeErr := outFile.Close(); closeErr != nil {
+		outFile = nil // Prevent double close in defer
+		finalErr = fmt.Errorf("failed to close temporary file %s: %w", tempLocalPath, closeErr)
+		return finalErr
+	}
+	outFile = nil // Mark as closed for defer
+
+	// Verify Checksum
+	hashMatches, verifyErr := verifyLocalFileHash(tempLocalPath, expectedDigest)
+	if verifyErr != nil || !hashMatches {
+		errMsg := fmt.Sprintf("hash verification failed (err: %v, match: %v)", verifyErr, hashMatches)
+		logger.Error(errMsg, "path", tempLocalPath, "expected_digest", expectedDigest)
+		finalErr = fmt.Errorf("hash verification failed for %s: %s", tempLocalPath, errMsg)
+		return finalErr
+	}
+
+	// Atomic Rename
+	logger.Debug("Verification successful, renaming mount file", "from", tempLocalPath, "to", localPath)
+	if err = os.Rename(tempLocalPath, localPath); err != nil {
+		finalErr = fmt.Errorf("failed to finalize file mount %s: %w", localPath, err)
+		_ = os.Remove(tempLocalPath) // Try removing temp file
+		return finalErr
+	}
+
+	logger.Info("File mount placed successfully", "path", localPath)
+	return nil // Success
 }
 
 // Helper to stop all running/starting instances for a specific app

@@ -1,22 +1,22 @@
-// narun/cmd/narun/main.go
-
 package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort" // Added for sorting output
+	"sort"
 	"strings"
 	"syscall"
-	"text/tabwriter" // Added for tabular output
+	"text/tabwriter"
 	"time"
 
 	"github.com/akhenakh/narun/internal/noderunner"
@@ -100,18 +100,17 @@ Options:
 	case "deploy":
 		handleDeployCmd(args)
 	case "logs":
-		// Add -h check for logs if desired
 		handleLogsCmd(args)
 	case "list-images":
-		// Add -h check for list-images if desired
 		handleListImagesCmd(args)
 	case "list-apps":
-		// Add -h check for list-apps if desired
 		handleListAppsCmd(args)
 	case "delete-app":
 		handleAppDeleteCmd(args)
 	case "secret":
 		handleSecretCmd(args)
+	case "files":
+		handleFilesCmd(args)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -134,6 +133,7 @@ Commands:
   list-apps     List deployed applications and their status on nodes.
   delete-app    Delete an application configuration from NATS KV.
   secret        Manage encrypted secrets (set, list, delete). Run '%s secret help' for details.
+  files         Manage shared files (add, list, delete). Run '%s files help' for details.
   help          Show this help message.
 
 Common Options (apply to multiple commands where relevant):
@@ -141,7 +141,7 @@ Common Options (apply to multiple commands where relevant):
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
 Use "<command> -h" for command-specific help.
-`, os.Args[0], os.Args[0], DefaultNatsURL, DefaultTimeout)
+`, os.Args[0], os.Args[0], os.Args[0], DefaultNatsURL, DefaultTimeout)
 }
 
 // Add specific usage functions for other commands if needed (for -h)
@@ -842,6 +842,341 @@ Options:
 
 	fmt.Printf("Successfully deleted application configuration '%s'.", appName)
 	slog.Debug(fmt.Sprintf("Node runners will now stop instances for this application."))
+}
+
+// Files Command Handling
+func handleFilesCmd(args []string) {
+	if len(args) < 1 {
+		printFilesUsage()
+		os.Exit(1)
+	}
+
+	subcommand := args[0]
+	subcommandArgs := args[1:]
+
+	switch subcommand {
+	case "add":
+		handleFilesAddCmd(subcommandArgs)
+	case "list":
+		handleFilesListCmd(subcommandArgs)
+	case "delete":
+		handleFilesDeleteCmd(subcommandArgs)
+	case "help", "-h", "--help":
+		printFilesUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "Error: Unknown files subcommand '%s'\n\n", subcommand)
+		printFilesUsage()
+		os.Exit(1)
+	}
+}
+
+func printFilesUsage() {
+	fmt.Fprintf(os.Stderr, `Usage: %s files <subcommand> [options] [arguments...]
+
+Manage shared files stored in the NATS Object Store bucket '%s'.
+These files can be mounted into application instances via the 'mounts' section
+in the ServiceSpec configuration.
+
+Subcommands:
+  add <name> <local_path>  Add or update a file with the given logical name.
+  list                     List the names and details of stored files.
+  delete <name>            Delete a file by its logical name.
+  help                     Show this help message.
+
+Common Options (apply to all subcommands):
+  -nats <url>     NATS server URL (default: %s)
+  -timeout <dur>  Timeout for NATS operations (default: %s)
+
+Options for 'add':
+  (No specific options other than common ones)
+
+Options for 'list':
+  (No specific options)
+
+Options for 'delete':
+  -y                  Skip confirmation prompt.
+
+`, os.Args[0], noderunner.FileOSBucket, DefaultNatsURL, DefaultTimeout)
+}
+
+func handleFilesAddCmd(args []string) {
+	addFlags := flag.NewFlagSet("files add", flag.ExitOnError)
+	natsURL := addFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	timeout := addFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+
+	addFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s files add [options] <name> <local_path>
+
+Adds or updates a file in the NATS Object Store '%s'.
+
+Arguments:
+  <name>         The logical name/key for the file in the object store (required).
+                 This name is used in the ServiceSpec 'mounts.source.objectStore'.
+  <local_path>   The path to the local file to upload (required).
+
+Options:
+`, os.Args[0], noderunner.FileOSBucket)
+		addFlags.PrintDefaults()
+	}
+
+	if err := addFlags.Parse(args); err != nil {
+		return
+	}
+
+	if addFlags.NArg() != 2 {
+		slog.Error("Error: 'files add' requires exactly two arguments: <name> and <local_path>")
+		addFlags.Usage()
+		os.Exit(1)
+	}
+	fileName := addFlags.Arg(0)
+	localPath := addFlags.Arg(1)
+
+	if strings.TrimSpace(fileName) == "" {
+		slog.Error("Error: File name cannot be empty.")
+		os.Exit(1)
+	}
+	if strings.ContainsAny(fileName, "/") { // Prevent path-like names for simplicity
+		slog.Error("Error: File name cannot contain '/' characters.")
+		os.Exit(1)
+	}
+
+	// Check local file exists
+	fileInfo, err := os.Stat(localPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			slog.Error("Error: Local file path does not exist.", "path", localPath)
+		} else {
+			slog.Error("Error accessing local file path.", "path", localPath, "error", err)
+		}
+		os.Exit(1)
+	}
+	if fileInfo.IsDir() {
+		slog.Error("Error: Local path is a directory, not a file.", "path", localPath)
+		os.Exit(1)
+	}
+
+	// Connect to NATS
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files")
+	if err != nil {
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+
+	// Get Object Store
+	fileStore, err := js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{
+		Bucket: noderunner.FileOSBucket, Description: "Shared files for Narun applications",
+	})
+	if err != nil {
+		slog.Error("Failed to access/create files object store", "bucket", noderunner.FileOSBucket, "error", err)
+		os.Exit(1)
+	}
+
+	// Open local file for reading
+	localFile, err := os.Open(localPath)
+	if err != nil {
+		slog.Error("Failed to open local file for reading", "path", localPath, "error", err)
+		os.Exit(1)
+	}
+	defer localFile.Close()
+
+	// Prepare metadata
+	meta := jetstream.ObjectMeta{
+		Name:        fileName, // Use the logical name as the object key
+		Description: fmt.Sprintf("Shared file '%s' uploaded from '%s'", fileName, filepath.Base(localPath)),
+		Metadata: map[string]string{
+			"original-filename": filepath.Base(localPath),
+			"upload-timestamp":  time.Now().UTC().Format(time.RFC3339),
+		},
+		// Consider adding ChunkSize if needed for large files
+	}
+
+	// Calculate SHA256 hash (optional but good for verification)
+	hasher := sha256.New()
+	_, err = io.Copy(hasher, localFile)
+	if err != nil {
+		slog.Error("Failed to hash local file", "path", localPath, "error", err)
+		os.Exit(1) // Fail if hashing fails
+	}
+	// Reset file offset after hashing
+	_, err = localFile.Seek(0, io.SeekStart)
+	if err != nil {
+		slog.Error("Failed to seek local file after hashing", "path", localPath, "error", err)
+		os.Exit(1)
+	}
+	// NATS calculates the digest automatically, but we could add our own hash to metadata if desired
+	// meta.Metadata["sha256-hex"] = fmt.Sprintf("%x", hasher.Sum(nil))
+
+	slog.Info("Uploading file to object store...", "name", fileName, "local_path", localPath, "bucket", noderunner.FileOSBucket)
+
+	// Upload
+	objInfo, err := fileStore.Put(ctx, meta, localFile)
+	if err != nil {
+		slog.Error("Failed to upload file to object store", "name", fileName, "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("File uploaded successfully", "name", objInfo.Name, "size", objInfo.Size, "digest", objInfo.Digest)
+}
+
+func handleFilesListCmd(args []string) {
+	listFlags := flag.NewFlagSet("files list", flag.ExitOnError)
+	natsURL := listFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	timeout := listFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+
+	listFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s files list [options]
+
+Lists files stored in the NATS Object Store '%s'.
+
+Options:
+`, os.Args[0], noderunner.FileOSBucket)
+		listFlags.PrintDefaults()
+	}
+
+	if err := listFlags.Parse(args); err != nil {
+		return
+	}
+	if listFlags.NArg() != 0 {
+		slog.Error("Error: 'files list' takes no arguments.")
+		listFlags.Usage()
+		os.Exit(1)
+	}
+
+	slog.Info("Listing files from object store...", "bucket", noderunner.FileOSBucket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files")
+	if err != nil {
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+
+	fileStore, err := js.ObjectStore(ctx, noderunner.FileOSBucket)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, nats.ErrBucketNotFound) {
+			slog.Info("Files object store not found. No files to list.", "bucket", noderunner.FileOSBucket)
+			return
+		}
+		slog.Error("Failed to access files object store", "bucket", noderunner.FileOSBucket, "error", err)
+		os.Exit(1)
+	}
+
+	objects, err := fileStore.List(ctx)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoObjectsFound) {
+			slog.Info("No files found in the object store.")
+			return
+		}
+		slog.Error("Failed to list objects in file store", "error", err)
+		os.Exit(1)
+	}
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tSIZE\tMODIFIED\tORIGINAL FILENAME\tDIGEST")
+	fmt.Fprintln(tw, "----\t----\t--------\t-----------------\t------")
+
+	count := 0
+	for _, objInfo := range objects {
+		if objInfo == nil {
+			continue
+		}
+		count++
+		modTime := objInfo.ModTime.Local().Format(time.RFC3339)
+		origFilename := objInfo.Metadata["original-filename"]
+		if origFilename == "" {
+			origFilename = "-"
+		}
+
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n",
+			objInfo.Name,
+			objInfo.Size,
+			modTime,
+			origFilename,
+			objInfo.Digest,
+		)
+	}
+	tw.Flush()
+	slog.Info(fmt.Sprintf("Found %d file(s).", count))
+}
+
+func handleFilesDeleteCmd(args []string) {
+	deleteFlags := flag.NewFlagSet("files delete", flag.ExitOnError)
+	natsURL := deleteFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	timeout := deleteFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
+	skipConfirm := deleteFlags.Bool("y", false, "Skip confirmation prompt")
+
+	deleteFlags.Usage = func() {
+		fmt.Fprintf(os.Stderr, `Usage: %s files delete [options] <name>
+
+Deletes a file from the NATS Object Store '%s'.
+
+Arguments:
+  <name>    The logical name/key of the file to delete (required).
+
+Options:
+`, os.Args[0], noderunner.FileOSBucket)
+		deleteFlags.PrintDefaults()
+	}
+
+	if err := deleteFlags.Parse(args); err != nil {
+		return
+	}
+
+	if deleteFlags.NArg() != 1 {
+		slog.Error("Error: 'files delete' requires exactly one argument: <name>")
+		deleteFlags.Usage()
+		os.Exit(1)
+	}
+	fileName := deleteFlags.Arg(0)
+
+	if !*skipConfirm {
+		fmt.Printf("WARNING: This will permanently delete the file '%s' from the object store.\n", fileName)
+		fmt.Print("Are you sure you want to proceed? (yes/no): ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(response) != "yes" {
+			slog.Info("Delete operation cancelled.")
+			os.Exit(0)
+		}
+	}
+
+	slog.Info("Deleting file from object store...", "name", fileName, "bucket", noderunner.FileOSBucket)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files")
+	if err != nil {
+		slog.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+
+	fileStore, err := js.ObjectStore(ctx, noderunner.FileOSBucket)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, nats.ErrBucketNotFound) {
+			slog.Error("Files object store not found. Cannot delete.", "bucket", noderunner.FileOSBucket)
+			os.Exit(1)
+		}
+		slog.Error("Failed to access files object store", "bucket", noderunner.FileOSBucket, "error", err)
+		os.Exit(1)
+	}
+
+	err = fileStore.Delete(ctx, fileName)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrObjectNotFound) {
+			slog.Error(fmt.Sprintf("File '%s' not found. Nothing to delete.", fileName))
+			os.Exit(0) // Not a failure if it's already gone
+		}
+		slog.Error("Failed to delete file from object store", "name", fileName, "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("File deleted successfully", "name", fileName)
 }
 
 func connectNATS(ctx context.Context, url string, clientName string) (*nats.Conn, jetstream.JetStream, error) {

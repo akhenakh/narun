@@ -79,6 +79,13 @@ func calculateSpecHash(spec *ServiceSpec) (string, error) {
 	return fmt.Sprintf("%x", h.Sum64()), nil
 }
 
+// Placeholder for landlock integration refinement - passing mount info
+type MountInfoForEnv struct {
+	Path        string `json:"path"`         // Relative path
+	Source      string `json:"source"`       // Object store name
+	ResolvedAbs string `json:"resolved_abs"` // Absolute path calculated *by parent*
+}
+
 // startAppInstance attempts to download the binary, configure, and start a single instance.
 // It assumes the calling code (handleAppConfigUpdate) holds the lock on appInfo.
 func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, replicaIndex int) error {
@@ -107,6 +114,38 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
 	}
 
+	// Prepare Instance Directory and Working Directory
+	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
+	workDir := filepath.Join(instanceDir, "work")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		logger.Error("Failed to create instance working directory", "dir", workDir, "error", err)
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
+		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
+	}
+	logger.Debug("Instance directory prepared", "path", workDir)
+
+	// ** Handle Mounts ** (Fetch files *before* preparing command env/args)
+	mountInfosForEnv := make([]MountInfoForEnv, 0, len(spec.Mounts)) // For landlock launcher
+	for _, mount := range spec.Mounts {
+		if mount.Source.ObjectStore != "" {
+			err := nr.fetchAndPlaceFile(ctx, mount.Source.ObjectStore, workDir, mount.Path, logger) // Pass workDir
+			if err != nil {
+				errMsg := fmt.Sprintf("Failed to process mount %s: %v", mount.Path, err)
+				logger.Error(errMsg, "source_object", mount.Source.ObjectStore)
+				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+				return fmt.Errorf(errMsg) // Treat mount failure as fatal for now
+			}
+			// Calculate absolute path for landlock launcher env
+			absMountPath := filepath.Join(workDir, filepath.Clean(mount.Path))
+			mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{
+				Path:        mount.Path,
+				Source:      mount.Source.ObjectStore,
+				ResolvedAbs: absMountPath,
+			})
+		} // else: handle other source types later
+	}
+	logger.Info("File mounts processed successfully", "count", len(spec.Mounts))
+
 	// Prepare Common Env Vars (including secrets)
 	processEnv := os.Environ()
 	// Add Base env vars from spec, resolving secrets
@@ -134,6 +173,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID))
+	processEnv = append(processEnv, fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
 	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
 
@@ -182,11 +222,22 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			return fmt.Errorf(errMsg)
 		}
 
+		// Serialize mount info for the launcher
+		mountInfosJSON, err := json.Marshal(mountInfosForEnv)
+		if err != nil {
+			processCancel()
+			errMsg := fmt.Sprintf("Failed to marshal mount info to JSON: %v", err)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			return fmt.Errorf(errMsg)
+		}
+
 		// Prepare the environment specifically for the LAUNCHER process
 		launcherEnv := append([]string{}, processEnv...) // Start with app's resolved env
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)))
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath)) // Pass the fetched application binary path
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)))
+		launcherEnv = append(launcherEnv, fmt.Sprintf("NARUN_INTERNAL_MOUNT_INFOS_JSON=%s", string(mountInfosJSON))) // Pass mount info
 
 		// Command to run the launcher (node-runner binary with the internal flag)
 		cmdPath = selfPath
@@ -205,14 +256,6 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	}
 
 	// Common Setup (Directory, Pipes, State)
-	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
-	workDir := filepath.Join(instanceDir, "work")
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		processCancel()
-		logger.Error("Failed to create instance working directory", "dir", workDir, "error", err)
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
-		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
-	}
 	cmd.Dir = workDir
 	// Ensure child process can be killed cleanly via process group
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

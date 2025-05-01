@@ -172,6 +172,23 @@ func runLandlockLauncher() {
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock group: Certs\n")
 	}
 
+	// Add Landlock rules for mounted files (read from environment)
+	mountInfosJSON := os.Getenv("NARUN_INTERNAL_MOUNT_INFOS_JSON")
+	if mountInfosJSON != "" {
+		var mountInfos []noderunner.MountInfoForEnv
+		if err := json.Unmarshal([]byte(mountInfosJSON), &mountInfos); err != nil {
+			fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Failed to parse mount info JSON: %v\n", err)
+			os.Exit(landlockLauncherErrCode)
+		}
+		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying rules for %d mounted file(s)...\n", len(mountInfos))
+		for _, mount := range mountInfos {
+			// Assume read-only access for mounted files by default.
+			// Use the absolute path resolved by the parent process.
+			landlockPaths = append(landlockPaths, ll.File(mount.ResolvedAbs, "r"))
+			fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock mount rule: Path=%s Modes=r\n", mount.ResolvedAbs)
+		}
+	}
+
 	for _, p := range landlockSpec.Paths {
 		// Use ll.File - it should handle directories appropriately for most access modes.
 		// If specific directory creation ('c' on a dir path) is needed, ll.Dir might be required,
@@ -204,8 +221,18 @@ func runLandlockLauncher() {
 	// Prepare arguments for syscall.Exec
 	// argv[0] must be the path to the executable being run (the target application).
 	argv := []string{targetCmdPath}
-	argv = append(argv, targetArgs...)
+	argv = append(argv, targetArgs...) // Append args from the spec
+
+	// Prepare environment for the final application process
+	// Start with the inherited environment (which includes NARUN vars set by parent)
 	envv := os.Environ() // Inherit the environment prepared by the parent node-runner
+	// Add the instance root based on the launcher's working directory
+	workDir := os.Getenv("PWD") // Should be set by the parent's cmd.Dir
+	if workDir == "" {          // Add a check just in case
+		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Could not determine working directory (PWD env var missing).\n")
+		os.Exit(landlockLauncherErrCode)
+	}
+	envv = append(envv, fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir))
 
 	// Execute the Target Application (Replace this Launcher Process)
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Executing target application: %s ...\n", targetCmdPath)

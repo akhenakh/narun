@@ -4,8 +4,17 @@ A simple ecosystem to deploy, maintain and expose services.
 
 It is built around an API gateway exposing backend HTTP/gRPC services (consumers) using the [NATS Micro](https://docs.nats.io/reference/nats-protocols/micro) protocol.
 
-And some optional tools to manage your running services lifecycle.
+Some optional tools to manage your running services lifecycle.
 It aims for simplicity and lightness targeting edge devices.
+
+## Concepts
+
+Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive. Narun aims to provide a simpler and more lightweight alternative for edge devices.
+It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache.
+So no need for stateful services, anything else is stateless and ephemeral.
+Modern developments ecosystem, Rust, Go, Zig do not require full containerized operating systems, static binaries are good enough in many situations. No need to ship containers so no need for a registry.
+NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.
+No support for multi tenancy.
 
 ## Components
 
@@ -71,7 +80,7 @@ It aims for simplicity and lightness targeting edge devices.
     *   Create its `ServiceSpec` YAML (e.g., `hello.yaml`), specifying the `binary_object` name and targeting nodes (e.g., `node-1`).
 4.  **Deploy Application:** Use `narun-deploy` to upload the binary and spec.
     ```bash
-    ./narun deploy -config hello.yaml -binary ./hello-consumer -nats <NATS_URL>
+    ./narun deploy -config hello.yaml -binary ./hello-consumer
     ```
     *   `node-runner` on `node-1` will detect the config, download the binary, and start the `hello-consumer` process. The consumer will register itself as a NATS Micro service (e.g., named "hello").
 5.  **Start Gateway:** Run `narun-gw` configured to route `/hello/` requests to the NATS Micro service named "hello".
@@ -247,7 +256,22 @@ This project is under active development. Components and APIs may change.
 - [X] dont store arch as GOARCH since it may be a binary coming from another language.
 - deploy without config dont start the actual app
 - after deploy it takes time for the status and running instances count to appear in list-apps, even after the run sometimes the status disappear
-
+- add metrics for the runners
+- [X] add shared files just like secrets
+- investigate inverted response:
+  ```
+    {
+        "consumer_host": "clot",
+        "message": "Hello, NATS USER! (processed by POST)",
+        "received_path": "/hello/"
+    }
+    HTTP/1.1 200 OK
+    Content-Type: application/json
+    X-Narun-Processed-By: clot
+    Date: Thu, 01 May 2025 00:56:38 GMT
+    Content-Length: 101
+  ```
+- rename narun delete-app to narun app delete/list/deploy
 ## Ideas
 - narun ui run a web server to interact with the cluster
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
@@ -289,6 +313,8 @@ This project is under active development. Components and APIs may change.
 - Logs to vector (easy nothing to do)
 - embed a nats server into the node runner
 - no need for health probe after the app is deployed, node runner should validate the app is listening.
+- cron scheduler
+- different nats user for the consumers to read only their own
 
 ### Won't
 Because of caddy providing the feature:

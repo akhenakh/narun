@@ -4,6 +4,10 @@ nodes:
   - name: clot # Target node runner with ID 'node1'
     replicas: 2 # Run 2 instances on node1
 mode: landlock # exec or landlock
+mounts:
+  - path: mydata # Relative path inside instance work dir
+    source:
+      objectStore: myfile # Reference the file name in the object store, it will be auto added to the landlock rules
 landlock:
   shared: true # common shared object files
   dns: true # DNS resolution

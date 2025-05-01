@@ -133,6 +133,28 @@ func main() {
 		logger.Debug("read /etc/lsb-release", "content", string(b))
 	}
 
+	// to validate filesystem restriction using landlock try to read /etc/lsb-release
+	b, err = os.ReadFile("/etc/lsb-release")
+	if err != nil {
+		logger.Error("failed to read /etc/lsb-release", "error", err)
+	} else {
+		logger.Debug("read /etc/lsb-release", "content", string(b))
+	}
+
+	// to validate filesystem restriction using landlock try to read NARUN_INSTANCE_ROOT
+	instanceRoot := os.Getenv("NARUN_INSTANCE_ROOT")
+	if instanceRoot != "" {
+		filePath := instanceRoot + "/mydata"
+		b, err = os.ReadFile(filePath) // Reuse b and err variables declared above
+		if err != nil {
+			logger.Error("failed to read file in instance root", "path", filePath, "error", err)
+		} else {
+			logger.Debug("read file in instance root", "path", filePath, "content", string(b))
+		}
+	} else {
+		logger.Warn("NARUN_INSTANCE_ROOT environment variable not set, skipping read test")
+	}
+
 	// Create handler
 	handler := &helloHandler{}
 
