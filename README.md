@@ -2,17 +2,22 @@
 
 A simple ecosystem to deploy, maintain and expose services.
 
-It is built around an API gateway exposing backend HTTP/gRPC services (consumers) using the [NATS Micro](https://docs.nats.io/reference/nats-protocols/micro) protocol.
+It is built around an API gateway exposing backend HTTP/gRPC services (consumers) using the [NATS Micro](https://docs.nats.io/reference/nats-protocols/micro) protocol and a node runner to watch the services lifecycle.
 
-Some optional tools to manage your running services lifecycle.
 It aims for simplicity and lightness targeting edge devices.
+
+## Status
+
+WORK IN PROGRESS, do not use in production unless you want to suffer.
 
 ## Concepts
 
-Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive. Narun aims to provide a simpler and more lightweight alternative for edge devices.
+Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive.
+Narun aims to provide a simpler and more lightweight alternative for edge devices.
 It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache.
 So no need for stateful services, anything else is stateless and ephemeral.
-Modern developments ecosystem, Rust, Go, Zig do not require full containerized operating systems, static binaries are good enough in many situations. No need to ship containers so no need for a registry.
+Modern developments ecosystem, Rust, Go, Zig do not require full containerized operating systems, static binaries are good enough in many situations.
+No need to ship containers so no need for a registry.
 NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.
 No support for multi tenancy.
 
@@ -64,6 +69,8 @@ No support for multi tenancy.
     *   `list-images`: List application binaries stored in NATS Object Store.
     *   `list-apps`: List deployed applications and their status on nodes.
     *   `delete-app`:  Delete an application configuration from NATS KV.
+    *   `narun secret`: Manage secrets for applications.
+    *   `narun files`: Manage files for applications.
     *   `help`: Show detailed help.
 
 ## Example Workflow
@@ -250,14 +257,16 @@ This project is under active development. Components and APIs may change.
 - global nats url in caddy rather than per path?
 - [X] SIGTERM on an app , node runner does not restart
 - [X] known bug the node-runner is not downloading and hashing the binary back properly.
-- Log history not just live follow or use external solution like vector
 - [X] check arch before downloading binary
 - [X] fix the version/tag system to long
 - [X] dont store arch as GOARCH since it may be a binary coming from another language.
-- deploy without config dont start the actual app
-- after deploy it takes time for the status and running instances count to appear in list-apps, even after the run sometimes the status disappear
-- add metrics for the runners
 - [X] add shared files just like secrets
+- rename narun delete-app to narun app delete/list/deploy
+- consistent naming of the KV/ObjectStore
+
+## BUGS
+- deploy without config dont start the actual app
+- after deploy it takes time for the status and running instances count to appear in list-apps, even after the run sometimes the status disappear the reappear
 - investigate inverted response:
   ```
     {
@@ -271,7 +280,7 @@ This project is under active development. Components and APIs may change.
     Date: Thu, 01 May 2025 00:56:38 GMT
     Content-Length: 101
   ```
-- rename narun delete-app to narun app delete/list/deploy
+  - delete-image
 
 ## Ideas
 - testsuite end to end, deploy (use APE to build a multiplatform test bin? https://justine.lol/ape.html), or just a bash script
@@ -281,6 +290,7 @@ This project is under active development. Components and APIs may change.
 - [X] routing to grpc
 - [X] caddy plugin
 - metrics for inflights
+- add metrics for the runners
 - direct response NAT
 - [X] send consumer logs to NATS
 - [X] move to protocol buffers, done them removed for nats micro
@@ -291,10 +301,10 @@ This project is under active development. Components and APIs may change.
   - [X] landlock https://github.com/shoenig/go-landlock
   - gvisor
   - firecracker
-  - exec
+  - [X] exec
   - systemd-nspawn
 - do not develop a node runner but interact with systemd only?
-- no registry needed for "images", binary can be compiled using ko like solution and uploaded to objectstore
+- [X] no registry needed for "images", binary can be compiled using ko like solution and uploaded to objectstore
 - zig musl + static go build
 - config stored in ELF .config
 - each gateway has a name, developer can target a specific gateway in its config
