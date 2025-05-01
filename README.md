@@ -272,7 +272,10 @@ This project is under active development. Components and APIs may change.
     Content-Length: 101
   ```
 - rename narun delete-app to narun app delete/list/deploy
+
 ## Ideas
+- testsuite end to end, deploy (use APE to build a multiplatform test bin? https://justine.lol/ape.html), or just a bash script
+- configure the object store based on the number of replicas (need a config.yaml for node-runner?)
 - narun ui run a web server to interact with the cluster
 - the gw to wait for a consumer to join on a a request, useful for scale to zero
 - [X] routing to grpc
@@ -307,7 +310,7 @@ This project is under active development. Components and APIs may change.
   - Export secret to pgp
 - Add auth gw to nats
 - Regroup into one command
-- For debug purpose addd handler http that can listen locally pass the listening address to the node runner
+- For debug purpose add handler http that can listen locally pass the listening address to the node runner
 - Outgoing wiry translation
 - Narun auto gitops (argocd like)
 - Logs to vector (easy nothing to do)

@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"slices"
+
 	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3"
@@ -233,7 +235,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		}
 
 		// Prepare the environment specifically for the LAUNCHER process
-		launcherEnv := append([]string{}, processEnv...) // Start with app's resolved env
+		launcherEnv := slices.Clone(processEnv) // Start with app's resolved env
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)))
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath)) // Pass the fetched application binary path
 		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)))
@@ -489,26 +491,47 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.Logger) {
 	instanceID := appInstance.InstanceID
 	appName := InstanceIDToAppName(instanceID)
-	spec := appInstance.Spec // Get spec reference
+	spec := appInstance.Spec // Get spec reference (might be nil if config deleted during run)
 
 	// Defer cleanup and state removal
 	defer func() {
 		appInstance.processCancel()
 		appInstance.LogWg.Wait()
 		logger.Debug("Monitor finished and log forwarders completed")
-		// Conditionally remove instance state (no restart pending and failed/stopped)
-		shouldRemove := false
-		select {
-		case <-appInstance.StopSignal: // Intentionally stopped
-			shouldRemove = (appInstance.Status == StatusStopped || appInstance.Status == StatusFailed)
-		case <-nr.globalCtx.Done(): // Runner shutting down
-			shouldRemove = true // Clean up on runner shutdown
-		default: // Process exited on its own
-			shouldRemove = (appInstance.Status == StatusFailed) || (appInstance.Status == StatusStopped) // Crashed gets handled by restart logic first
+
+		// Determine if this stop requires *physical* disk cleanup
+		shouldCleanupDisk := false
+		finalStatus := appInstance.Status // Get the final status set before defer runs
+
+		if finalStatus == StatusFailed { // Max restarts or unrecoverable error
+			shouldCleanupDisk = true
+			logger.Info("Instance failed permanently, scheduling disk cleanup.")
+		} else if nr.globalCtx.Err() != nil { // Runner is shutting down
+			shouldCleanupDisk = true
+			logger.Info("Runner is shutting down, scheduling disk cleanup.")
+		} else {
+			// Check if the app config itself was deleted *after* the process exited
+			appInfo := nr.state.GetAppInfo(appName)
+			appInfo.mu.RLock()
+			if appInfo.spec == nil { // Spec is nil only if config was deleted
+				shouldCleanupDisk = true
+				logger.Info("App config deleted, scheduling disk cleanup.")
+			}
+			appInfo.mu.RUnlock()
 		}
-		if shouldRemove {
+
+		if shouldCleanupDisk {
+			// Remove the instance's data directory
+			instanceDir := filepath.Dir(appInstance.Cmd.Dir) // Get parent of workDir (e.g., .../instances/app-0)
+			logger.Info("Performing permanent cleanup of instance data directory", "dir", instanceDir)
+			if err := os.RemoveAll(instanceDir); err != nil {
+				logger.Error("Failed to remove instance data directory", "dir", instanceDir, "error", err)
+			}
+			// Also remove the in-memory state since it's a permanent stop
 			nr.removeInstanceState(appName, instanceID, logger)
 		}
+		// If not cleaning up disk (e.g., crash with restart pending, or intentional scale-down),
+		// the restart logic or scale-down logic handles the in-memory state removal.
 	}()
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
