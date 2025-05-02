@@ -6,6 +6,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.10.0
 	github.com/nats-io/nats.go v1.41.2
 	github.com/prometheus/client_golang v1.22.0
+	github.com/shoenig/go-landlock v1.2.2
 	go.uber.org/zap v1.27.0
 	google.golang.org/grpc v1.67.1
 	google.golang.org/protobuf v1.36.6
@@ -85,7 +86,6 @@ require (
 	github.com/quic-go/quic-go v0.50.1 // indirect
 	github.com/rs/xid v1.5.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
-	github.com/shoenig/go-landlock v1.2.2 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/shurcooL/sanitized_anchor_name v1.0.0 // indirect
 	github.com/slackhq/nebula v1.6.1 // indirect

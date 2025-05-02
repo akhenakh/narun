@@ -266,8 +266,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		return d.ArgErr()
 	}
 
-	// REMOVED: h.Routes = []RouteConfig{}
-
 	for d.NextBlock(0) {
 		option := d.Val()
 		switch option {
@@ -285,8 +283,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("parsing request_timeout '%s': %v", timeoutStr, err)
 			}
 			h.RequestTimeout = caddy.Duration(dur)
-		// REMOVED: case "route": ...
-		case "service": // ADDED
+		case "service":
 			if !d.AllArgs(&h.Service) {
 				return d.ArgErr()
 			}
