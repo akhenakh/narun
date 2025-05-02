@@ -17,16 +17,21 @@ const (
 	RouteTypeGRPC RouteType = "grpc"
 )
 
-// RouteConfig defines a single routing rule. Only one of Path or GrpcService should be set.
 type RouteConfig struct {
 	// HTTP specific
-	Path    string   `yaml:"path,omitempty"`    // HTTP request path prefix/exact match
-	Methods []string `yaml:"methods,omitempty"` // HTTP methods
+	// Path defines the pattern for matching incoming HTTP requests.
+	// If Path ends with a '/', it acts as a prefix match (e.g., "/api/" matches "/api/users").
+	// Otherwise, it requires an exact match (e.g., "/status" only matches "/status").
+	Path string `yaml:"path,omitempty"`
+	// Methods defines the allowed HTTP methods for this route (e.g., "GET", "POST"). Case-insensitive on input, stored as uppercase.
+	Methods []string `yaml:"methods,omitempty"`
 
 	// gRPC specific
+	// GrpcService defines the fully qualified gRPC service name (e.g., "hello.v1.Greeter").
 	GrpcService string `yaml:"grpc,omitempty"` // Fully qualified gRPC service name
 
 	// Common
+	// Service defines the target NATS Micro service name that will handle requests matching this route. Required.
 	Service string `yaml:"service"` // Target NATS Micro service name (REQUIRED for both types)
 
 	// Internal

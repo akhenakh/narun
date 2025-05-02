@@ -9,9 +9,9 @@ request_timeout_seconds: 15 # Max time (seconds) to wait for a NATS reply
 # Define routes: map HTTP path/method OR gRPC service to NATS service
 routes:
   # --- HTTP Route Example ---
-  - path: "/hello/" # Incoming HTTP request path
-    methods: ["POST", "PUT"] # Incoming HTTP request methods
-    service: "hello" # Target NATS service name for these HTTP requests
+  - path: "/" # Incoming HTTP request path
+    methods: ["GET"] # Incoming HTTP request methods
+    service: "caradioamateur" # Target NATS service name for these HTTP requests
 
   # --- gRPC Route Example ---
   - grpc: "hello.v1.Greeter" # Fully qualified gRPC service name

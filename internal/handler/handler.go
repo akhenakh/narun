@@ -2,167 +2,192 @@ package handler
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/metrics"
 	"github.com/nats-io/nats.go"
-	// No micro import needed here for the client side
 )
 
 // Helper to check NATS errors - needed for errors.Is
 var _ error = nats.ErrTimeout // Ensure we have the nats error variables available
 
 type HttpHandler struct {
-	NatsConn *nats.Conn // Use the standard NATS connection
-	Config   *gwconfig.Config
-	Logger   *slog.Logger
-	// Remove serviceClient, it's not part of the standard micro client pattern
+	NatsConn    *nats.Conn // Use the standard NATS connection
+	Config      *gwconfig.Config
+	Logger      *slog.Logger
+	internalMux *http.ServeMux
 }
 
 func NewHttpHandler(logger *slog.Logger, nc *nats.Conn, cfg *gwconfig.Config) *HttpHandler {
-	// No need to create a micro.ServiceClient
-	return &HttpHandler{
-		NatsConn: nc,
-		Config:   cfg,
-		Logger:   logger,
+	handler := &HttpHandler{
+		NatsConn:    nc,
+		Config:      cfg,
+		Logger:      logger,
+		internalMux: http.NewServeMux(), // Initialize the internal mux
 	}
+
+	// Register routes with the internal mux
+	for i := range cfg.Routes {
+		// Need to capture the loop variable correctly for the closure
+		route := cfg.Routes[i]
+		if route.Type == gwconfig.RouteTypeHTTP {
+			// http.ServeMux handles prefix matching automatically if path ends with "/"
+			pattern := route.Path // Use the path directly from config
+			logger.Debug("Registering HTTP route with internal mux", "pattern", pattern, "nats_service", route.Service)
+			handler.internalMux.HandleFunc(pattern, handler.makeRouteHandler(&route)) // Pass pointer to route
+		}
+	}
+
+	return handler
 }
 
+// ServeHTTP now simply delegates to the internal mux.
 func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	startTime := time.Now()
-	path := r.URL.Path
-	method := r.Method
+	h.internalMux.ServeHTTP(w, r)
+}
 
-	routeCfg, found := h.Config.FindHttpRoute(path, method)
-	if !found {
-		h.Logger.Info("No route found", "method", method, "path", path)
-		http.NotFound(w, r)
-		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusNotFound)).Inc()
-		// Observe duration even for not found
-		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
-		return
-	}
+// makeRouteHandler creates an http.HandlerFunc for a specific route.
+// This closure captures the specific route configuration.
+func (h *HttpHandler) makeRouteHandler(routeCfg *gwconfig.RouteConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+		path := r.URL.Path // Path matched by ServeMux
+		method := r.Method
 
-	// Read request body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		h.Logger.Error("Error reading request body", "error", err)
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
-		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
-		return
-	}
-	defer r.Body.Close()
+		logger := h.Logger.With("path", path, "method", method, "nats_service", routeCfg.Service)
 
-	// Create NATS Request Message with Headers
-	// Use GetMicroSubject which handles the service name logic from config
-	subject := h.Config.GetNatsSubject(routeCfg)
-	natsRequest := nats.NewMsg(subject)
-	natsRequest.Data = body
-	natsRequest.Header = make(nats.Header) // Use nats.Header (which is http.Header)
-
-	// 1. Copy original HTTP headers to NATS headers
-	for key, values := range r.Header {
-		for _, value := range values {
-			natsRequest.Header.Add(key, value)
+		// Method Check (still useful even after mux routing)
+		methodAllowed := false
+		upperMethod := strings.ToUpper(method)
+		for _, allowedMethod := range routeCfg.Methods {
+			if upperMethod == allowedMethod { // Methods in config are already uppercase
+				methodAllowed = true
+				break
+			}
 		}
-	}
-
-	// 2. Add custom headers needed for reconstruction on the consumer side
-	natsRequest.Header.Set("X-Original-Method", method)
-	natsRequest.Header.Set("X-Original-Path", path)
-	natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery)
-	natsRequest.Header.Set("X-Original-Host", r.Host)
-	natsRequest.Header.Set("X-Original-RemoteAddr", r.RemoteAddr)
-	// Add any other necessary context if needed
-
-	h.Logger.Debug("Sending NATS request",
-		"subject", natsRequest.Subject,
-		"headers", natsRequest.Header, // Log headers being sent
-		"body_len", len(natsRequest.Data))
-
-	// Send request using standard NATS RequestMsg
-	natsReply, err := h.NatsConn.RequestMsg(natsRequest, h.Config.RequestTimeout)
-
-	// Handle NATS Response/Error
-	if err != nil {
-		statusCode := http.StatusInternalServerError
-		respBody := "Internal server error (NATS communication)"
-		natsStatus := metrics.StatusError // Default status for metrics
-
-		if errors.Is(err, nats.ErrTimeout) { // Use errors.Is for checking specific NATS errors
-			statusCode = http.StatusGatewayTimeout
-			respBody = "Request timed out waiting for backend processor"
-			h.Logger.Warn("NATS request timeout", "subject", subject, "timeout", h.Config.RequestTimeout)
-			natsStatus = metrics.StatusTimeout
-		} else {
-			h.Logger.Error("NATS request error", "subject", subject, "error", err)
-			// Keep natsStatus as metrics.StatusError
+		if !methodAllowed {
+			logger.Warn("Method not allowed for matched route")
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusMethodNotAllowed)).Inc()
+			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+			return
 		}
 
-		// Record NATS request metric
-		metrics.NatsRequestsTotal.WithLabelValues(subject, natsStatus).Inc()
+		// --- NATS Request Logic (Moved from original ServeHTTP) ---
 
-		// Send HTTP error response
+		// Read request body
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			logger.Error("Error reading request body", "error", err)
+			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
+			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+			return
+		}
+		defer r.Body.Close()
+
+		// Create NATS Request Message with Headers
+		subject := routeCfg.Service // Directly use the service from the captured route config
+		natsRequest := nats.NewMsg(subject)
+		natsRequest.Data = body
+		natsRequest.Header = make(nats.Header)
+
+		// 1. Copy original HTTP headers to NATS headers
+		for key, values := range r.Header {
+			for _, value := range values {
+				natsRequest.Header.Add(key, value)
+			}
+		}
+
+		// 2. Add custom headers needed for reconstruction on the consumer side
+		natsRequest.Header.Set("X-Original-Method", method)
+		natsRequest.Header.Set("X-Original-Path", path)            // Use the actual request path
+		natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery) // Pass query params
+		natsRequest.Header.Set("X-Original-Host", r.Host)
+		natsRequest.Header.Set("X-Original-RemoteAddr", r.RemoteAddr)
+
+		logger.Debug("Sending NATS request",
+			"subject", natsRequest.Subject,
+			"headers", natsRequest.Header,
+			"body_len", len(natsRequest.Data))
+
+		// Send request using standard NATS RequestMsg
+		natsReply, err := h.NatsConn.RequestMsg(natsRequest, h.Config.RequestTimeout)
+
+		// Handle NATS Response/Error
+		if err != nil {
+			statusCode := http.StatusInternalServerError
+			respBody := "Internal server error (NATS communication)"
+			natsStatus := metrics.StatusError
+
+			if errors.Is(err, nats.ErrTimeout) {
+				statusCode = http.StatusGatewayTimeout
+				respBody = "Request timed out waiting for backend processor"
+				logger.Warn("NATS request timeout", "subject", subject, "timeout", h.Config.RequestTimeout)
+				natsStatus = metrics.StatusTimeout
+			} else if errors.Is(err, nats.ErrNoResponders) {
+				// Added check for NoResponders
+				statusCode = http.StatusServiceUnavailable
+				respBody = "No backend service available"
+				logger.Warn("NATS no responders", "subject", subject)
+				natsStatus = metrics.StatusError // Treat as error for gateway metric
+			} else {
+				logger.Error("NATS request error", "subject", subject, "error", err)
+			}
+
+			metrics.NatsRequestsTotal.WithLabelValues(subject, natsStatus).Inc()
+			http.Error(w, respBody, statusCode) // Use http.Error for simplicity
+			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
+			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+			return
+		}
+
+		// Process Successful NATS Reply
+		logger.Debug("Received NATS reply",
+			"subject", natsReply.Subject,
+			"headers", natsReply.Header,
+			"body_len", len(natsReply.Data))
+
+		metrics.NatsRequestsTotal.WithLabelValues(subject, metrics.StatusSuccess).Inc()
+
+		// Determine HTTP status code from response header
+		statusCode := http.StatusOK
+		statusStr := natsReply.Header.Get("X-Response-Status-Code")
+		if statusStr != "" {
+			if code, err := strconv.Atoi(statusStr); err == nil && code >= 100 && code < 600 {
+				statusCode = code
+			} else {
+				logger.Warn("Invalid or missing X-Response-Status-Code header in NATS reply", "value", statusStr, "error", err)
+			}
+		}
+
+		// Copy headers from NATS reply header to HTTP response writer
+		respHeader := w.Header() // Get header map before writing status
+		for key, values := range natsReply.Header {
+			if key == "X-Response-Status-Code" || key == "Nats-Service-Error-Code" || key == "Nats-Service-Error" {
+				continue
+			}
+			// Assign the slice directly is more efficient for http.Header
+			respHeader[key] = values
+		}
+
+		// Write HTTP response status and body
 		w.WriteHeader(statusCode)
-		fmt.Fprint(w, respBody)
+		if len(natsReply.Data) > 0 {
+			_, writeErr := w.Write(natsReply.Data)
+			if writeErr != nil {
+				logger.Error("Error writing HTTP response body", "error", writeErr, "status", statusCode)
+				// Cannot change status code now, but log it
+			}
+		}
 
-		// Record HTTP metrics for error cases
 		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
 		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
-		return
 	}
-
-	// Process Successful NATS Reply
-	h.Logger.Debug("Received NATS reply",
-		"subject", natsReply.Subject, // Note: This is the reply subject, not the original request subject
-		"headers", natsReply.Header,
-		"body_len", len(natsReply.Data))
-
-	// Record successful NATS request metric
-	metrics.NatsRequestsTotal.WithLabelValues(subject, metrics.StatusSuccess).Inc()
-
-	// Determine HTTP status code from response header
-	statusCode := http.StatusOK // Default
-	statusStr := natsReply.Header.Get("X-Response-Status-Code")
-	if statusStr != "" {
-		if code, err := strconv.Atoi(statusStr); err == nil && code >= 100 && code < 600 {
-			statusCode = code
-		} else {
-			h.Logger.Warn("Invalid or missing X-Response-Status-Code header in NATS reply", "value", statusStr, "error", err)
-			// Keep default OK or consider setting an internal server error? Sticking with OK is likely safer.
-		}
-	}
-
-	// Copy headers from NATS reply header to HTTP response writer
-	for key, values := range natsReply.Header {
-		// Skip the internal status code header we just processed
-		if key == "X-Response-Status-Code" || key == "Nats-Service-Error-Code" || key == "Nats-Service-Error" { // Also skip standard NATS error headers
-			continue
-		}
-		// Skip other potential internal headers if needed (e.g., starting with "Nats-")
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-
-	// Write HTTP response status and body
-	w.WriteHeader(statusCode)
-	if len(natsReply.Data) > 0 {
-		_, writeErr := w.Write(natsReply.Data)
-		if writeErr != nil {
-			// Log error, but headers and status are already sent
-			h.Logger.Error("Error writing HTTP response body", "error", writeErr, "status", statusCode)
-		}
-	}
-
-	// Record HTTP metrics for successful case
-	metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
-	metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 }

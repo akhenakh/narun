@@ -281,8 +281,10 @@ This project is under active development. Components and APIs may change.
     Content-Length: 101
   ```
   - delete-image
+- [X] the gateway does not handle subpath
 
 ## Ideas
+- node-runner needs to exec applications in a different user
 - testsuite end to end, deploy (use APE to build a multiplatform test bin? https://justine.lol/ape.html), or just a bash script
 - configure the object store based on the number of replicas (need a config.yaml for node-runner?)
 - narun ui run a web server to interact with the cluster
