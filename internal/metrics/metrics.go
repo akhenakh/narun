@@ -87,7 +87,7 @@ var (
 			Name: "narun_node_runner_instance_up",
 			Help: "Indicates if a narun instance is currently considered up (1 for up, 0 for down).",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id", "run_id"},
 	)
 
 	NarunNodeRunnerInstanceRestartsTotal = promauto.NewCounterVec(
@@ -95,47 +95,47 @@ var (
 			Name: "narun_node_runner_instance_restarts_total",
 			Help: "Total number of times a narun instance has been restarted.",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id"}, // No run_id here, this is for the logical instance
 	)
 
 	NarunNodeRunnerInstanceMemoryMaxRSSBytes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "narun_node_runner_instance_memory_max_rss_bytes",
-			Help: "Maximum resident set size (RSS) in bytes used by the instance's last run. On Linux, this is based on kilobytes from rusage.",
+			Help: "Maximum resident set size (RSS) in bytes used by the instance's specific run. On Linux, this is based on kilobytes from rusage.",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id", "run_id"},
 	)
 
 	NarunNodeRunnerInstanceCPUUserSecondsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "narun_node_runner_instance_cpu_user_seconds_total",
-			Help: "Total user CPU time in seconds consumed by the narun instance.",
+			Help: "Total user CPU time in seconds consumed by the narun instance specific run.",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id", "run_id"},
 	)
 
 	NarunNodeRunnerInstanceCPUSystemSecondsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "narun_node_runner_instance_cpu_system_seconds_total",
-			Help: "Total system CPU time in seconds consumed by the narun instance.",
+			Help: "Total system CPU time in seconds consumed by the narun instance specific run.",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id", "run_id"},
 	)
 
 	NarunNodeRunnerInstanceInfo = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "narun_node_runner_instance_info",
-			Help: "Information about a narun instance. Value is always 1.",
+			Help: "Information about a narun instance specific run. Value is always 1.",
 		},
-		[]string{"app_name", "instance_id", "node_id", "spec_tag", "spec_mode", "binary_path"},
+		[]string{"app_name", "instance_id", "node_id", "run_id", "spec_tag", "spec_mode", "binary_path"},
 	)
 
 	NarunNodeRunnerInstanceLastExitCode = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "narun_node_runner_instance_last_exit_code",
-			Help: "The exit code of the narun instance from its last termination.",
+			Help: "The exit code of the narun instance specific run from its last termination.",
 		},
-		[]string{"app_name", "instance_id", "node_id"},
+		[]string{"app_name", "instance_id", "node_id", "run_id"},
 	)
 )
 

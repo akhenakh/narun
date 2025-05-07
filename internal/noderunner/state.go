@@ -25,6 +25,7 @@ const (
 // ManagedApp holds the runtime state for an application instance managed by the runner.
 type ManagedApp struct {
 	InstanceID    string             // Unique ID for this instance (e.g., "appName-0")
+	RunID         string             // Unique ID for this specific run of the instance process
 	Spec          *ServiceSpec       // The configuration this instance is running with (pointer to shared spec)
 	Cmd           *exec.Cmd          // The running process command
 	Status        AppStatus          // Current status of the app instance

@@ -940,29 +940,24 @@ func (s *simulatedDeleteEntry) Delta() uint64                   { return 0 }
 func (s *simulatedDeleteEntry) Operation() jetstream.KeyValueOp { return jetstream.KeyValueDelete }
 func (s *simulatedDeleteEntry) Bucket() string                  { return s.bucket }
 
-// cleanupInstanceMetrics removes Prometheus gauge metrics for a specific instance.
+// cleanupInstanceMetrics ensures metrics for a specific run are finalized.
+// With RunID, this no longer deletes metrics but ensures 'up' is 0.
+// This is likely redundant as monitorAppInstance already handles setting 'up' to 0.
 func (nr *NodeRunner) cleanupInstanceMetrics(instance *ManagedApp) {
 	if instance == nil {
 		nr.logger.Warn("cleanupInstanceMetrics called with nil instance")
 		return
 	}
-	// Spec might be nil if instance was part of a deleted app config
-	// In such cases, we might not have all labels for InstanceInfo, but can clean up others.
 	appName := InstanceIDToAppName(instance.InstanceID)
 	instanceID := instance.InstanceID
+	runID := instance.RunID // Get the specific run ID
 	nodeID := nr.nodeID
 
-	metrics.NarunNodeRunnerInstanceUp.DeleteLabelValues(appName, instanceID, nodeID)
-	if instance.Spec != nil && instance.BinaryPath != "" { // Only delete if we have all labels
-		specTag := instance.Spec.Tag
-		specMode := instance.Spec.Mode
-		binaryPath := instance.BinaryPath
-		metrics.NarunNodeRunnerInstanceInfo.DeleteLabelValues(appName, instanceID, nodeID, specTag, specMode, binaryPath)
-	} else {
-		nr.logger.Debug("Skipping NarunNodeRunnerInstanceInfo cleanup due to missing spec/binaryPath", "instance_id", instanceID)
-	}
-	metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.DeleteLabelValues(appName, instanceID, nodeID)
-	metrics.NarunNodeRunnerInstanceLastExitCode.DeleteLabelValues(appName, instanceID, nodeID)
-	// Counters are not deleted: NarunNodeRunnerInstanceRestartsTotal, NarunNodeRunnerInstanceCPUUserSecondsTotal, NarunNodeRunnerInstanceCPUSystemSecondsTotal
-	nr.logger.Debug("Cleaned up Prometheus gauges for instance", "instance_id", instanceID)
+	// Ensure the 'up' metric for this specific run is 0.
+	// This should be handled by monitorAppInstance on termination.
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nodeID, runID).Set(0)
+
+	// No deletion of other metrics (Info, Memory, CPU, ExitCode for this runID)
+	// They remain as a historical record for this run.
+	nr.logger.Debug("Metrics finalized for instance run (no deletion)", "instance_id", instanceID, "run_id", runID)
 }
