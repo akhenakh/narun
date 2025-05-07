@@ -1045,7 +1045,7 @@ Options:
 		os.Exit(1)
 	}
 
-	slog.Info("Listing files from object store...", "bucket", noderunner.FileOSBucket)
+	slog.Debug("Listing files from object store...", "bucket", noderunner.FileOSBucket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -1069,7 +1069,7 @@ Options:
 	objects, err := fileStore.List(ctx)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrNoObjectsFound) {
-			slog.Info("No files found in the object store.")
+			fmt.Println("No files found in the object store.")
 			return
 		}
 		slog.Error("Failed to list objects in file store", "error", err)
@@ -1101,7 +1101,7 @@ Options:
 		)
 	}
 	tw.Flush()
-	slog.Info(fmt.Sprintf("Found %d file(s).", count))
+	slog.Debug(fmt.Sprintf("Found %d file(s).", count))
 }
 
 func handleFilesDeleteCmd(args []string) {

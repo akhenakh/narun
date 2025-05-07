@@ -3,17 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"syscall"
 
 	ll "github.com/shoenig/go-landlock"
-
-	"slices"
 
 	"github.com/akhenakh/narun/internal/noderunner"
 )
@@ -47,6 +48,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	masterKey := flag.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key for secrets (or use NARUN_MASTER_KEY env var)")
 	masterKeyPath := flag.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "The path to the file containing the base64 encoded AES-256 master key for secrets")
+	metricsAddr := flag.String("metrics-addr", ":9100", "Address for Prometheus metrics HTTP endpoint (e.g., :9100). Set to empty to disable.")
 
 	flag.Parse()
 
@@ -78,23 +80,27 @@ func main() {
 	}
 
 	// Create Node Runner
-	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, logger)
+	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, *metricsAddr, logger)
 	if err != nil {
 		logger.Error("Failed to initialize node runner", "error", err)
 		os.Exit(1)
 	}
 
 	// Handle OS Signals for Graceful Shutdown
+	// This signal handler now primarily tells the runner to stop.
+	// The runner's Stop() method will then manage its internal components including the metrics server.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Goroutine to listen for signals and initiate shutdown
 	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigChan
 		logger.Info("Received OS signal, initiating shutdown...", "signal", sig.String())
 		runner.Stop() // Trigger graceful shutdown in the runner
 	}()
 
-	// Run the Node Runner
-	if err := runner.Run(); err != nil && err != context.Canceled {
+	// Run the Node Runner (this will block until shutdown)
+	if err := runner.Run(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("Node runner exited with error", "error", err)
 		os.Exit(1)
 	}

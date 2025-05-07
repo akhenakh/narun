@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	"github.com/akhenakh/narun/internal/crypto"
+	"github.com/akhenakh/narun/internal/metrics" // Added for metrics
 	"github.com/nats-io/nats.go/jetstream"
 	"gopkg.in/yaml.v3"
 )
@@ -107,12 +108,14 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
 		logger.Error(errMsg, "error", fetchErr)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 		return fmt.Errorf("failed to fetch binary for %s: %w", instanceID, fetchErr)
 	}
 	logger.Info("Binary downloaded/verified", "path", binaryPath)
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		logger.Error("Failed to make binary executable", "path", binaryPath, "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
 	}
 
@@ -122,6 +125,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		logger.Error("Failed to create instance working directory", "dir", workDir, "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
 	}
 	logger.Debug("Instance directory prepared", "path", workDir)
@@ -135,7 +139,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 				errMsg := fmt.Sprintf("Failed to process mount %s: %v", mount.Path, err)
 				logger.Error(errMsg, "source_object", mount.Source.ObjectStore)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-				return fmt.Errorf(errMsg) // Treat mount failure as fatal for now
+				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+				return fmt.Errorf("%s", errMsg)                                                          // Treat mount failure as fatal for now
 			}
 			// Calculate absolute path for landlock launcher env
 			absMountPath := filepath.Join(workDir, filepath.Clean(mount.Path))
@@ -162,6 +167,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 				logger.Error("Failed to resolve secret for env var", "secret_name", secretName, "env_var", envVar.Name, "error", resErr)
 				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", secretName, resErr)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 				return fmt.Errorf("failed to resolve secret '%s' for env var '%s': %w", secretName, envVar.Name, resErr)
 			}
 			logger.Debug("Successfully resolved secret", "secret_name", secretName, "env_var", envVar.Name)
@@ -194,7 +200,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := "landlock mode is only supported on Linux"
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			return fmt.Errorf(errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+			return fmt.Errorf("%s", errMsg)
 		}
 
 		selfPath, err := os.Executable() // Path to the node-runner binary itself
@@ -203,7 +210,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := fmt.Sprintf("Failed to get node-runner executable path: %v", err)
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			return fmt.Errorf(errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+			return fmt.Errorf("%s", errMsg)
 		}
 
 		// Serialize config needed by the launcher child process
@@ -213,7 +221,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := fmt.Sprintf("Failed to marshal landlock config to JSON: %v", err)
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			return fmt.Errorf(errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+			return fmt.Errorf("%s", errMsg)
 		}
 		targetArgsJSON, err := json.Marshal(spec.Args)
 		if err != nil {
@@ -221,7 +230,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := fmt.Sprintf("Failed to marshal target args to JSON: %v", err)
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			return fmt.Errorf(errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+			return fmt.Errorf("%s", errMsg)
 		}
 
 		// Serialize mount info for the launcher
@@ -231,7 +241,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := fmt.Sprintf("Failed to marshal mount info to JSON: %v", err)
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			return fmt.Errorf(errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+			return fmt.Errorf("%s", errMsg)
 		}
 
 		// Prepare the environment specifically for the LAUNCHER process
@@ -268,6 +279,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		processCancel()
 		logger.Error("Failed to get stdout pipe", "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stdout pipe failed: %v", err))
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 		return fmt.Errorf("stdout pipe failed for %s: %w", instanceID, err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
@@ -276,6 +288,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		stdoutPipe.Close() // Close previous pipe on error
 		logger.Error("Failed to get stderr pipe", "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stderr pipe failed: %v", err))
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
 		return fmt.Errorf("stderr pipe failed for %s: %w", instanceID, err)
 	}
 
@@ -303,6 +316,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			if existing.processCancel != nil {
 				existing.processCancel() // Cancel old context if replacing
 			}
+			// Explicitly clean up metrics for the old instance being replaced
+			nr.cleanupInstanceMetrics(existing)
 			appInfo.instances[i] = appInstance
 			foundAndReplaced = true
 			break
@@ -324,7 +339,9 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		appInstance.Status = StatusFailed
 		appInstance.processCancel() // Ensure context is cancelled
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-		nr.removeInstanceState(appName, instanceID, logger) // Clean up state if start fails
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down
+		nr.removeInstanceState(appName, instanceID, logger)                                      // Clean up state if start fails
+		nr.cleanupInstanceMetrics(appInstance)                                                   // Cleanup metrics on start fail
 		return fmt.Errorf("failed to start %s: %w", instanceID, startErr)
 	}
 
@@ -334,6 +351,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	appInstance.Status = StatusRunning
 	logger.Info("Process started successfully", "pid", appInstance.Pid)
 	nr.publishStatusUpdate(instanceID, StatusRunning, &appInstance.Pid, nil, "")
+
+	// Update metrics for successful start
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(1)
+	metrics.NarunNodeRunnerInstanceInfo.WithLabelValues(appName, instanceID, nr.nodeID, spec.Tag, spec.Mode, binaryPath).Set(1)
 
 	// Start log forwarding and monitoring goroutines
 	appInstance.LogWg.Add(2)
@@ -347,7 +368,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 // stopAppInstance gracefully stops an application instance process.
 func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool) error {
 	instanceID := appInstance.InstanceID
-	logger := nr.logger.With("app", InstanceIDToAppName(instanceID), "instance_id", instanceID)
+	appName := InstanceIDToAppName(instanceID)
+	logger := nr.logger.With("app", appName, "instance_id", instanceID)
 
 	if appInstance.Status == StatusStopped || appInstance.Status == StatusStopping || appInstance.Status == StatusFailed {
 		logger.Info("Stop request: Instance not running or already stopping/stopped/failed.", "status", appInstance.Status)
@@ -360,12 +382,14 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 			appInstance.processCancel() // Ensure context is cancelled
 		}
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, "Inconsistent state during stop") // Publish failure
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0)     // Mark as down
 		return fmt.Errorf("inconsistent state for instance %s", instanceID)
 	}
 
 	pid := appInstance.Pid
 	logger.Info("Stopping application instance process", "pid", pid)
 	appInstance.Status = StatusStopping
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0) // Mark as down now
 	nr.publishStatusUpdate(instanceID, StatusStopping, &pid, nil, "")
 
 	// Close stop signal channel if not already closed
@@ -529,9 +553,10 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 			}
 			// Also remove the in-memory state since it's a permanent stop
 			nr.removeInstanceState(appName, instanceID, logger)
+			nr.cleanupInstanceMetrics(appInstance) // Cleanup metrics for permanently removed instance
 		}
 		// If not cleaning up disk (e.g., crash with restart pending, or intentional scale-down),
-		// the restart logic or scale-down logic handles the in-memory state removal.
+		// the restart logic or scale-down logic handles the in-memory state removal and metrics.
 	}()
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
@@ -542,6 +567,31 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	intentionalStop := false
 	errMsg := ""
 	finalStatus := StatusStopped // Default to stopped
+
+	// Update metrics for termination
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID).Set(0)
+
+	// Get Rusage for CPU/Memory metrics
+	if appInstance.Cmd.ProcessState != nil {
+		if rusage, ok := appInstance.Cmd.ProcessState.SysUsage().(*syscall.Rusage); ok && rusage != nil {
+			var rssBytes float64
+			if nr.localOS == "linux" {
+				rssBytes = float64(rusage.Maxrss * 1024) // Kilobytes to Bytes
+			} else if nr.localOS == "darwin" {
+				rssBytes = float64(rusage.Maxrss) // Already in Bytes
+			} else {
+				logger.Warn("MaxRSS reporting for OS not explicitly handled, may be inaccurate or in unknown units.", "os", nr.localOS, "raw_maxrss", rusage.Maxrss)
+				rssBytes = float64(rusage.Maxrss) // Best guess, could be 0 or NaN if value is meaningless
+			}
+			metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(appName, instanceID, nr.nodeID).Set(rssBytes)
+			metrics.NarunNodeRunnerInstanceCPUUserSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID).Add(metrics.TimevalToSeconds(rusage.Utime))
+			metrics.NarunNodeRunnerInstanceCPUSystemSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID).Add(metrics.TimevalToSeconds(rusage.Stime))
+		} else {
+			logger.Warn("Could not get Rusage for process, CPU/Memory metrics will not be updated.", "instance_id", instanceID)
+		}
+	} else {
+		logger.Warn("ProcessState is nil, cannot get Rusage.", "instance_id", instanceID)
+	}
 
 	select {
 	case <-appInstance.StopSignal:
@@ -558,6 +608,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		errMsg = waitErr.Error()
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
+			metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID).Set(float64(exitCode))
 			// Check if it was the launcher that failed
 			isLauncherFailure := false
 			if spec.Mode == "landlock" && strings.HasSuffix(appInstance.Cmd.Path, "node-runner") { // Check if we ran the launcher
@@ -589,12 +640,14 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		} else { // Wait failed for other reasons (e.g., start failed, IO error)
 			logger.Error("Process wait failed", "error", waitErr)
 			finalStatus = StatusFailed
-			intentionalStop = true // Treat non-exit errors as fatal
+			intentionalStop = true                                                                              // Treat non-exit errors as fatal
+			metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID).Set(-1) // Indicate error not from exit code
 		}
 	} else { // Exited cleanly (code 0)
 		exitCode = 0
 		logger.Info("Process exited cleanly", "pid", appInstance.Pid)
 		finalStatus = StatusStopped
+		metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID).Set(0)
 	}
 
 	// Update internal state and publish status
@@ -607,6 +660,9 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	if intentionalStop || finalStatus == StatusFailed || nr.globalCtx.Err() != nil {
 		logger.Info("Instance stopped/failed or runner shutting down. No restart.",
 			"status", finalStatus, "intentional", intentionalStop, "runner_shutdown", nr.globalCtx.Err() != nil)
+		// The defer block will handle necessary cleanup if shouldCleanupDisk becomes true.
+		// If it's an intentional stop like scale-down (intentionalStop=true, but not a permanent failure),
+		// the calling function (e.g., handleAppConfigUpdate) is responsible for nr.cleanupInstanceMetrics.
 		return // Exit monitor
 	}
 
@@ -616,11 +672,9 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	appInfo.mu.RLock()
 	configHashMatches := appInfo.configHash == appInstance.ConfigHash
 	instanceStillManaged := false
-	var currentReplicaIndex = -1
-	for idx, inst := range appInfo.instances {
+	for _, inst := range appInfo.instances {
 		if inst.InstanceID == instanceID {
 			instanceStillManaged = true
-			currentReplicaIndex = idx
 			break
 		}
 	}
@@ -634,8 +688,10 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		logger.Info("Configuration changed since instance started. No restart.", "old_hash", appInstance.ConfigHash, "new_hash", appInfo.configHash)
 		return
 	}
-	if currentReplicaIndex == -1 {
-		logger.Error("Could not determine replica index for restarting instance. Aborting restart.", "instance_id", instanceID)
+
+	numericalReplicaIndex := extractReplicaIndex(instanceID)
+	if numericalReplicaIndex == -1 {
+		logger.Error("Could not determine numerical replica index for restarting instance. Aborting restart.", "instance_id", instanceID)
 		return
 	}
 
@@ -644,11 +700,13 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		logger.Error("Instance crashed too many times. Giving up.", "max_restarts", MaxRestarts)
 		appInstance.Status = StatusFailed // Mark as permanently failed
 		nr.publishStatusUpdate(instanceID, StatusFailed, &appInstance.Pid, &exitCode, "Exceeded max restarts")
+		// Defer will handle cleanup as finalStatus is Failed.
 		return // Exit monitor
 	}
 
 	// Proceed with restart
 	appInstance.restartCount++
+	metrics.NarunNodeRunnerInstanceRestartsTotal.WithLabelValues(appName, instanceID, nr.nodeID).Inc()
 	logger.Warn("Instance crashed/stopped unexpectedly. Attempting restart.", "restart_count", appInstance.restartCount, "max_restarts", MaxRestarts, "delay", RestartDelay)
 	appInstance.Status = StatusStarting // Set status before publishing
 	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, fmt.Sprintf("Restarting (%d/%d)", appInstance.restartCount, MaxRestarts))
@@ -691,12 +749,12 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		logger.Info("Config changed during restart delay. Aborting restart.")
 	} else {
 		// Attempt the actual restart
-		err := nr.startAppInstance(context.Background(), appInfo, currentReplicaIndex)
+		err := nr.startAppInstance(context.Background(), appInfo, numericalReplicaIndex)
 		if err != nil {
 			logger.Error("Failed to restart application instance", "error", err)
 			appInstance.Status = StatusFailed
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, &exitCode, fmt.Sprintf("Restart failed: %v", err))
-			// Let defer handle final cleanup
+			// Let defer handle final cleanup as StatusFailed
 		} else {
 			logger.Info("Instance restarted successfully")
 			// Restart succeeded, THIS monitor goroutine's job is done.
