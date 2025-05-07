@@ -22,7 +22,6 @@ const (
 )
 
 // helloHandler implements the business logic as an http.Handler.
-// (handler code remains the same)
 type helloHandler struct{}
 
 func (h *helloHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

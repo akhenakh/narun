@@ -19,6 +19,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// Secret Command Handling
 func handleSecretCmd(args []string) {
 	if len(args) < 1 {
 		printSecretUsage()
@@ -61,6 +62,7 @@ Common Options (apply to all subcommands):
 
 Options for 'set':
   -master-key <key>   Base64 encoded AES-256 master key (REQUIRED, or use NARUN_MASTER_KEY env var).
+  -master-key-path <path> Path to file containing the master key.
   <name>              The name/key of the secret (required argument).
   <value>             The plaintext value of the secret (required argument).
   -desc <text>        Optional description for the secret.
@@ -76,13 +78,12 @@ Options for 'delete':
 }
 
 // --- Subcommand Handlers ---
-
 func handleSecretSetCmd(args []string) {
 	setFlags := flag.NewFlagSet("secret set", flag.ExitOnError)
 	natsURL := setFlags.String("nats", DefaultNatsURL, "NATS server URL")
 	timeout := setFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
-	masterKeyBase64 := setFlags.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key (REQUIRED)")
-	masterKeyPath := flag.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "The path to the file containing the base64 encoded AES-256 master key for secrets")
+	masterKeyBase64 := setFlags.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key")
+	masterKeyPath := setFlags.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "Path to file containing the master key")
 	description := setFlags.String("desc", "", "Optional description for the secret")
 
 	setFlags.Usage = func() {
@@ -102,7 +103,6 @@ Options:
 	if err := setFlags.Parse(args); err != nil {
 		return
 	}
-
 	if setFlags.NArg() != 2 {
 		slog.Error("Error: 'secret set' requires exactly two arguments: <name> and <value>")
 		setFlags.Usage()
@@ -111,20 +111,19 @@ Options:
 	secretName := setFlags.Arg(0)
 	secretValue := setFlags.Arg(1)
 
-	if *masterKeyBase64 == "" {
-		slog.Error("Error: Master key is required for 'secret set'. Use -master-key flag or NARUN_MASTER_KEY env var.")
-		os.Exit(1)
-	}
-
 	if *masterKeyPath != "" {
 		keyBytes, err := os.ReadFile(*masterKeyPath)
 		if err != nil {
-			slog.Error("Failed to read master key file", "error", err)
+			slog.Error("Failed to read master key file", "path", *masterKeyPath, "error", err)
 			os.Exit(1)
 		}
-		*masterKeyBase64 = string(keyBytes)
+		*masterKeyBase64 = strings.TrimSpace(string(keyBytes))
 	}
 
+	if *masterKeyBase64 == "" {
+		slog.Error("Error: Master key is required for 'secret set'. Use -master-key, -master-key-path, or NARUN_MASTER_KEY env var.")
+		os.Exit(1)
+	}
 	if secretName == "" {
 		slog.Error("Error: Secret name cannot be empty.")
 		os.Exit(1)
@@ -137,7 +136,6 @@ Options:
 	}
 
 	slog.Info("Encrypting secret...", "name", secretName)
-	// Use secret name as AAD
 	aad := []byte(secretName)
 	ciphertext, nonce, err := crypto.Encrypt(masterKey, []byte(secretValue), aad)
 	if err != nil {
@@ -147,18 +145,17 @@ Options:
 
 	now := time.Now()
 	storedSecret := noderunner.StoredSecret{
-		Name:        secretName, // Store name in payload for potential verification on read
+		Name:        secretName,
 		Ciphertext:  ciphertext,
 		Nonce:       nonce,
 		Description: *description,
-		CreatedAt:   now, // Set CreatedAt on initial set
+		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 
-	// NATS Connection and KV Operation
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret")
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-set")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -173,18 +170,16 @@ Options:
 		os.Exit(1)
 	}
 
-	// Check if key exists to update CreatedAt timestamp correctly
 	existingEntry, getErr := kvSecrets.Get(ctx, secretName)
 	if getErr == nil {
 		var existingSecret noderunner.StoredSecret
 		if json.Unmarshal(existingEntry.Value(), &existingSecret) == nil {
-			storedSecret.CreatedAt = existingSecret.CreatedAt // Preserve original creation time
+			storedSecret.CreatedAt = existingSecret.CreatedAt
 		} else {
 			slog.Warn("Could not unmarshal existing secret to preserve CreatedAt", "name", secretName)
 		}
 	} else if !errors.Is(getErr, jetstream.ErrKeyNotFound) {
 		slog.Warn("Could not check for existing secret", "name", secretName, "error", getErr)
-		// Proceed with current timestamp for CreatedAt
 	}
 
 	secretData, err := json.Marshal(storedSecret)
@@ -198,7 +193,6 @@ Options:
 		slog.Error("Failed to put secret into KV store", "name", secretName, "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("Secret set successfully", "name", secretName, "revision", rev)
 }
 
@@ -216,7 +210,6 @@ Options:
 `, os.Args[0], noderunner.SecretKVBucket)
 		listFlags.PrintDefaults()
 	}
-
 	if err := listFlags.Parse(args); err != nil {
 		return
 	}
@@ -227,10 +220,9 @@ Options:
 	}
 
 	slog.Info("Listing secrets...")
-
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret")
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-list")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -267,7 +259,7 @@ listLoop:
 			slog.Warn("Timed out listing secret keys", "error", ctx.Err())
 			break listLoop
 		case key, ok := <-keysChan:
-			if !ok { // Channel closed
+			if !ok {
 				break listLoop
 			}
 			if key != "" {
@@ -275,20 +267,14 @@ listLoop:
 			}
 		}
 	}
-
 	if ctx.Err() != nil {
-		// Exit if timeout occurred during listing
 		os.Exit(1)
 	}
-
 	if len(secretNames) == 0 {
 		slog.Info("No secrets found.")
 		return
 	}
-
 	sort.Strings(secretNames)
-
-	// Use tabwriter for nice output
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	fmt.Fprintln(tw, "SECRET NAME")
 	fmt.Fprintln(tw, "-----------")
@@ -297,7 +283,6 @@ listLoop:
 	}
 	tw.Flush()
 	slog.Info(fmt.Sprintf("Found %d secret(s).", len(secretNames)))
-
 }
 
 func handleSecretDeleteCmd(args []string) {
@@ -318,11 +303,9 @@ Options:
 `, os.Args[0], noderunner.SecretKVBucket)
 		deleteFlags.PrintDefaults()
 	}
-
 	if err := deleteFlags.Parse(args); err != nil {
 		return
 	}
-
 	if deleteFlags.NArg() != 1 {
 		slog.Error("Error: 'secret delete' requires exactly one argument: <name>")
 		deleteFlags.Usage()
@@ -342,10 +325,9 @@ Options:
 	}
 
 	slog.Info("Deleting secret...", "name", secretName)
-
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret")
+	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-delete")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -358,16 +340,14 @@ Options:
 		os.Exit(1)
 	}
 
-	// Delete the key. Use Purge to remove all history.
-	err = kvSecrets.Purge(ctx, secretName) // Use Purge to remove history
+	err = kvSecrets.Purge(ctx, secretName)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			slog.Error(fmt.Sprintf("Secret '%s' not found. Nothing to delete.", secretName))
-			os.Exit(0) // Not a failure if it's already gone
+			os.Exit(0)
 		}
 		slog.Error("Failed to delete secret", "name", secretName, "error", err)
 		os.Exit(1)
 	}
-
 	slog.Info("Secret deleted successfully", "name", secretName)
 }

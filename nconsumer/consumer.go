@@ -92,7 +92,6 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	concurrencySem := make(chan struct{}, opts.MaxConcurrent)
 	logger.Debug("Concurrency limit set", "max", opts.MaxConcurrent)
 
-	//  (NATS connection setup remains the same)
 	natsOpts := []nats.Option{
 		nats.Name(fmt.Sprintf("NATS Micro Service - %s", opts.ServiceName)),
 		nats.MaxReconnects(-1),
