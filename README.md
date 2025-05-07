@@ -247,13 +247,10 @@ Key metrics include:
 
 The nconsumer library can also expose metrics (e.g., processing time, active workers) if configured - see its implementation for details.
 
-Status
-
-This project is under active development. Components and APIs may change.
 
 ## TODO
 - route grpc from Caddy
-- caddy config does not need the path
+- [X] caddy config does not need the path
 - global nats url in caddy rather than per path?
 - [X] SIGTERM on an app , node runner does not restart
 - [X] known bug the node-runner is not downloading and hashing the binary back properly.
@@ -261,8 +258,10 @@ This project is under active development. Components and APIs may change.
 - [X] fix the version/tag system to long
 - [X] dont store arch as GOARCH since it may be a binary coming from another language.
 - [X] add shared files just like secrets
-- rename narun delete-app to narun app delete/list/deploy
+- [X] rename narun delete-app to narun app delete/list/deploy
+- add a backgroup loop to monitor memory and cpu and update the metrics
 - consistent naming of the KV/ObjectStore
+- [] Mount a directory from the host (wait until isolation or chroot)
 
 ## BUGS
 - deploy without config dont start the actual app
@@ -282,8 +281,15 @@ This project is under active development. Components and APIs may change.
   ```
   - delete-image
 - [X] the gateway does not handle subpath
+- [X] the NATS disconnecting is terminating caddy
 
 ## Ideas
+- if the app is a nats consumer:
+  - in the deploy file add a section `nats` to describe what subject the app is allowed to consume, then auto provision nkeys and subscribe the application only for its own subject.
+  - pass the nkeys to the application in files exposed by the node runners.
+- provision nkeys and subscribe the application only for its own subject
+- expose the nkeys from filesystem
+- restrict filestore to one service
 - node-runner needs to exec applications in a different user
 - testsuite end to end, deploy (use APE to build a multiplatform test bin? https://justine.lol/ape.html), or just a bash script
 - configure the object store based on the number of replicas (need a config.yaml for node-runner?)
@@ -292,7 +298,7 @@ This project is under active development. Components and APIs may change.
 - [X] routing to grpc
 - [X] caddy plugin
 - metrics for inflights
-- add metrics for the runners
+- [X] add metrics for the runners
 - direct response NAT
 - [X] send consumer logs to NATS
 - [X] move to protocol buffers, done them removed for nats micro
@@ -314,7 +320,7 @@ This project is under active development. Components and APIs may change.
   - external
 - SSE gateway helper handler
 - Gw ui
-- Mount config map
+- [X] Mount config map
 - Store disk Zstd  transferable pvc, big file
 - Incoming webhook handler (bento?)
 - Proxy to existing http app via nats (using gw as a sidecar pseudo mesh)
@@ -330,6 +336,9 @@ This project is under active development. Components and APIs may change.
 - no need for health probe after the app is deployed, node runner should validate the app is listening.
 - cron scheduler
 - different nats user for the consumers to read only their own
+- set a convetion naming to pass
+  - number of JetSream enabled replica in the cluster (so the app can request for proper replication on files)
+  - NATS hosts cluster member list
 
 ### Won't
 Because of caddy providing the feature:

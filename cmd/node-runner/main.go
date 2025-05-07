@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 
 	ll "github.com/shoenig/go-landlock"
@@ -45,7 +46,7 @@ func main() {
 	natsURL := flag.String("nats-url", "nats://localhost:4222", "NATS server URL")
 	nodeID := flag.String("node-id", "", "Unique ID for this node (defaults to hostname)")
 	dataDir := flag.String("data-dir", "./narun-data", "Directory for storing binaries and data")
-	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+	logLevel := flag.String("log-level", os.Getenv("LOG_LEVEL"), "Log level (debug, info, warn, error)")
 	masterKey := flag.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key for secrets (or use NARUN_MASTER_KEY env var)")
 	masterKeyPath := flag.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "The path to the file containing the base64 encoded AES-256 master key for secrets")
 	metricsAddr := flag.String("metrics-addr", ":9100", "Address for Prometheus metrics HTTP endpoint (e.g., :9100). Set to empty to disable.")
@@ -59,7 +60,7 @@ func main() {
 		"warn":  slog.LevelWarn,
 		"error": slog.LevelError,
 	}
-	level, ok := levelMap[*logLevel]
+	level, ok := levelMap[strings.ToLower(*logLevel)]
 	if !ok {
 		slog.Warn("Invalid log level specified, using info", "level", *logLevel)
 		level = slog.LevelInfo

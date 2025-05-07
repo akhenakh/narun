@@ -15,11 +15,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
-	"slices"
 
 	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/akhenakh/narun/internal/metrics" // Added for metrics
@@ -371,7 +371,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Placeholder
 
 	// Start log forwarding and monitoring goroutines
-	appInstance.LogWg.Add(2)
+	appInstance.LogWg.Add(2) // 2 for stdout/stderr
 	go nr.forwardLogs(appInstance, appInstance.StdoutPipe, "stdout", logger)
 	go nr.forwardLogs(appInstance, appInstance.StderrPipe, "stderr", logger)
 	go nr.monitorAppInstance(appInstance, logger) // Monitor handles cmd.Wait()
@@ -532,10 +532,35 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 
 	logger = logger.With("run_id", runID) // Add RunID to monitor's logger context
 
+	// Start periodic memory polling goroutine if on Linux
+	if runtime.GOOS == "linux" {
+		// This goroutine will periodically update the memory metric.
+		// It's managed by the appInstance.processCtx.
+		appInstance.LogWg.Add(1) // Add to a wait group to ensure it exits cleanly
+		go func() {
+			defer appInstance.LogWg.Done()
+			pollTicker := time.NewTicker(5 * time.Second)
+			defer pollTicker.Stop()
+			logger.Debug("Starting periodic memory metric poller for process")
+			for {
+				select {
+				case <-pollTicker.C:
+					// Check if process is still considered running before polling
+					if appInstance.Status == StatusRunning && appInstance.Pid > 0 {
+						nr.doPollMemoryAndUpdateMetric(appInstance, logger)
+					}
+				case <-appInstance.processCtx.Done():
+					logger.Debug("Stopping periodic memory metric poller due to process context done")
+					return
+				}
+			}
+		}()
+	}
+
 	defer func() {
-		appInstance.processCancel()
-		appInstance.LogWg.Wait()
-		logger.Debug("Monitor finished and log forwarders completed")
+		appInstance.processCancel() // This will also stop the memory poller goroutine
+		appInstance.LogWg.Wait()    // Wait for log forwarders AND memory poller
+		logger.Debug("Monitor finished and auxiliary goroutines (logs, memory poller) completed")
 
 		shouldCleanupDisk := false
 		finalStatus := appInstance.Status
@@ -980,5 +1005,71 @@ func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *sl
 		logger.Info("Removed instance state.", "remaining_instances", len(newInstances))
 	} else {
 		logger.Warn("Attempted to remove instance state, but it was not found.")
+	}
+}
+
+// doPollMemoryAndUpdateMetric polls memory usage for a running instance (Linux specific for now)
+// and updates the Prometheus gauge.
+func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *slog.Logger) {
+	if instance.Cmd == nil || instance.Cmd.Process == nil || instance.Pid <= 0 {
+		logger.Debug("Skipping memory poll, process or PID not valid", "pid", instance.Pid)
+		return
+	}
+
+	pid := instance.Pid
+	var VmHWMkB int64 = -1 // VmHWM (Peak resident set size) in KB
+
+	// This logic is Linux-specific, reading /proc/[pid]/status
+	if runtime.GOOS == "linux" {
+		filePath := fmt.Sprintf("/proc/%d/status", pid)
+		file, err := os.Open(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				logger.Debug("Failed to open proc status file (process likely exited while polling)", "pid", pid, "path", filePath, "error", err)
+			} else {
+				logger.Warn("Failed to open proc status file", "pid", pid, "path", filePath, "error", err)
+			}
+			return
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "VmHWM:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					val, parseErr := strconv.ParseInt(parts[1], 10, 64)
+					if parseErr == nil {
+						VmHWMkB = val
+						break
+					} else {
+						logger.Warn("Failed to parse VmHWM value from proc status", "pid", pid, "line", line, "error", parseErr)
+					}
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			logger.Warn("Error scanning proc status file", "pid", pid, "path", filePath, "error", err)
+			return
+		}
+	} else {
+		// For non-Linux, we don't poll live memory this way.
+		// The final Rusage will provide MaxRSS on exit.
+		return
+	}
+
+	if VmHWMkB != -1 {
+		memoryBytes := float64(VmHWMkB * 1024) // Convert KB to Bytes
+		metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(
+			InstanceIDToAppName(instance.InstanceID),
+			instance.InstanceID,
+			nr.nodeID,
+			instance.RunID,
+		).Set(memoryBytes)
+		logger.Debug("Updated live memory (VmHWM) metric", "pid", pid, "VmHWM_kB", VmHWMkB, "bytes", memoryBytes)
+	} else {
+		// VmHWM not found, or not Linux. Log less verbosely or not at all.
+		// logger.Debug("VmHWM not found in proc status or not on Linux, memory metric not updated this cycle", "pid", pid)
 	}
 }

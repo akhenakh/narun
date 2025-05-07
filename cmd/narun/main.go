@@ -636,7 +636,7 @@ func handleServiceListCmd(args []string) {
 		return
 	}
 
-	slog.Info("Listing deployed services and node status...")
+	slog.Debug("Listing deployed services and node status...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -687,7 +687,7 @@ func handleServiceListCmd(args []string) {
 			nodeKeysWatcher.Stop()
 		}
 	}
-	slog.Info(fmt.Sprintf("Found %d active node(s).", len(nodeStates)))
+	slog.Debug(fmt.Sprintf("Found %d active node(s).", len(nodeStates)))
 
 	appConfigs := make(map[string]noderunner.ServiceSpec)
 	kvAppConfigs, err := js.KeyValue(ctx, noderunner.AppConfigKVBucket)
@@ -1014,7 +1014,7 @@ func handleServiceDeleteCmd(args []string) {
 		}
 	}
 
-	slog.Info("Deleting service configuration...", "service_name", appName)
+	slog.Debug("Deleting service configuration...", "service_name", appName)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -1041,14 +1041,14 @@ func handleServiceDeleteCmd(args []string) {
 		os.Exit(1)
 	}
 
-	slog.Info("Deleting key from KV store...", "key", appName, "bucket", noderunner.AppConfigKVBucket)
+	slog.Debug("Deleting key from KV store...", "key", appName, "bucket", noderunner.AppConfigKVBucket)
 	err = kvStore.Delete(ctx, appName) // Delete vs Purge? Delete keeps history, Purge removes.
 	if err != nil {                    // Let's use Delete for now, allows rollback if needed.
 		slog.Error("Delete Service Error: failed to delete key", "key", appName, "error", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Successfully deleted service configuration '%s'.\n", appName)
-	slog.Info("Node runners will now stop instances for this service.")
+	slog.Debug("Node runners will now stop instances for this service.")
 }
 
 // Files Command Handling
