@@ -4,6 +4,9 @@
 
 ```sh
 xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
+
+# local
+xcaddy build  --with github.com/caddy-dns/cloudflare --with github.com/akhenakh/narun/caddynarun --with  github.com/protomaps/go-pmtiles/caddy --replace github.com/akhenakh/narun=.
 ```
 
 This will create a custom `caddy` binary in your current directory.
