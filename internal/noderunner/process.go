@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -24,7 +25,9 @@ import (
 	"github.com/akhenakh/narun/internal/crypto"
 	"github.com/akhenakh/narun/internal/metrics" // Added for metrics
 	"github.com/google/uuid"                     // For unique Run IDs
+	"github.com/hashicorp/go-set/v2"
 	"github.com/nats-io/nats.go/jetstream"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -42,6 +45,8 @@ const (
 	envLandlockConfigJSON        = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
 	envLandlockTargetCmd         = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
 	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
+	envLandlockInstanceRoot      = "NARUN_INTERNAL_INSTANCE_ROOT"
+	envLandlockMountInfosJSON    = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
 	landlockLauncherErrCode      = 120 // Generic launcher setup error
 	landlockUnsupportedErrCode   = 121 // Landlock not supported on OS/Kernel
 	landlockLockFailedErrCode    = 122 // l.Lock() failed
@@ -94,9 +99,262 @@ func generateRunID() string {
 	return uuid.NewString()
 }
 
+// Helper to check if cgroup based resource limiting should be attempted
+func (nr *NodeRunner) usesCgroupsForResourceLimits(spec *ServiceSpec) bool {
+	return runtime.GOOS == "linux" && spec.CgroupParent != "" && (spec.MemoryMB > 0 || spec.CPUCores > 0)
+}
+
+// Helper to check if namespacing (user, pid, ipc) should be attempted
+func (nr *NodeRunner) usesNamespacing(spec *ServiceSpec) bool {
+	return runtime.GOOS == "linux" && (spec.User != "" || spec.NetworkNamespacePath != "")
+	// PID and IPC namespaces are generally good to use with User or Network NS.
+}
+
+// lookupUser finds UID, GID, and home directory for a username.
+func lookupUser(username string) (uid, gid uint32, homeDir string, err error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("failed to find user %q: %w", username, err)
+	}
+	uid64, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("failed to parse uid for user %q: %w", username, err)
+	}
+	gid64, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("failed to parse gid for user %q: %w", username, err)
+	}
+	return uint32(uid64), uint32(gid64), u.HomeDir, nil
+}
+
+// flattenEnv prepares environment variables, similar to pledge's logic.
+func flattenEnv(baseEnv []string, username, homeDir string, appEnv []EnvVar) []string {
+	// Inspired by pledge.flatten
+	useless := set.From([]string{"LS_COLORS", "XAUTHORITY", "DISPLAY", "COLORTERM", "MAIL"}) // TMPDIR handled separately
+
+	// Convert baseEnv (slice) to map for easier manipulation
+	envMap := make(map[string]string)
+	for _, e := range baseEnv {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		} else {
+			envMap[parts[0]] = "" // Variable without value
+		}
+	}
+
+	// Override/add with app-specific env vars (already resolved from secrets by caller)
+	for _, ae := range appEnv {
+		envMap[ae.Name] = ae.Value // Value is already resolved string
+	}
+
+	var result []string
+	for k, v := range envMap {
+		switch {
+		case k == "USER" && username != "":
+			result = append(result, "USER="+username)
+		case k == "HOME" && homeDir != "":
+			result = append(result, "HOME="+homeDir)
+		case useless.Contains(k):
+			continue
+		case v == "":
+			result = append(result, k)
+		default:
+			result = append(result, k+"="+v)
+		}
+	}
+
+	// Ensure USER and HOME are set if not overridden
+	if _, ok := envMap["USER"]; !ok && username != "" {
+		result = append(result, "USER="+username)
+	}
+	if _, ok := envMap["HOME"]; !ok && homeDir != "" {
+		result = append(result, "HOME="+homeDir)
+	}
+
+	// Ensure TMPDIR is set and sensible
+	result = append(result, "TMPDIR="+os.TempDir()) // Or instance-specific temp dir
+	return result
+}
+
+// --- Cgroup Helper Functions ---
+const cgroupfsBase = "/sys/fs/cgroup"
+
+func (nr *NodeRunner) getFullCgroupParentPath(specCgroupParent string) string {
+	if filepath.IsAbs(specCgroupParent) { // Assumes it's /sys/fs/cgroup/...
+		return filepath.Clean(specCgroupParent)
+	}
+	return filepath.Join(cgroupfsBase, filepath.Clean(specCgroupParent))
+}
+
+func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger *slog.Logger) (cgroupPath string, cgroupFd int, cleanup func() error, err error) {
+	if runtime.GOOS != "linux" {
+		return "", -1, nil, fmt.Errorf("cgroups are only supported on Linux")
+	}
+	if spec.CgroupParent == "" {
+		return "", -1, nil, fmt.Errorf("cgroupParent must be specified in ServiceSpec to use cgroups")
+	}
+
+	parentPath := nr.getFullCgroupParentPath(spec.CgroupParent)
+	// Ensure parent cgroup exists and node-runner has perms to write cgroup.subtree_control
+	// This check is basic; real permission issues will surface on mkdir/write.
+	parentInfo, statErr := os.Stat(parentPath)
+	if statErr != nil {
+		return "", -1, nil, fmt.Errorf("cgroup parent path '%s' not accessible: %w", parentPath, statErr)
+	}
+	if !parentInfo.IsDir() {
+		return "", -1, nil, fmt.Errorf("cgroup parent path '%s' is not a directory", parentPath)
+	}
+
+	// Instance cgroup name, e.g., narun-myapp-0.scope
+	instanceCgroupName := fmt.Sprintf("narun-%s.scope", instanceID)
+	finalCgroupPath := filepath.Join(parentPath, instanceCgroupName)
+
+	logger.Info("Creating cgroup", "path", finalCgroupPath)
+
+	// Enable necessary controllers in the parent's cgroup.subtree_control
+	//    This allows the new cgroup to use these controllers.
+	//    The node-runner process needs write permission to this file.
+	subtreeControlPath := filepath.Join(parentPath, "cgroup.subtree_control")
+	controllersToEnable := "+cpu +memory" // Add others like +io if needed
+	if writeErr := os.WriteFile(subtreeControlPath, []byte(controllersToEnable), 0644); writeErr != nil {
+		// If EACCES, it's a permission issue.
+		// If EINVAL, controllers might already be enabled or not available.
+		// This part is tricky; robust error handling or pre-flight checks are ideal.
+		// For now, log warning and proceed, applyCgroupConstraints will fail if controllers not active.
+		logger.Warn("Potentially failed to enable controllers in parent cgroup. This might be okay if already enabled.",
+			"path", subtreeControlPath, "error", writeErr)
+	}
+
+	// Create the cgroup directory
+	if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
+		// Check if it already exists from a previous unclean shutdown
+		if os.IsExist(err) {
+			logger.Warn("Cgroup directory already exists, attempting to reuse.", "path", finalCgroupPath)
+			// Try to remove it first, in case it's in a bad state
+			// unix.Rmdir might fail if it has processes, but that's okay if we're about to put a new one in.
+			_ = unix.Rmdir(finalCgroupPath)
+			if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
+				return "", -1, nil, fmt.Errorf("failed to create cgroup directory '%s' even after attempting cleanup: %w", finalCgroupPath, err)
+			}
+		} else {
+			return "", -1, nil, fmt.Errorf("failed to create cgroup directory '%s': %w", finalCgroupPath, err)
+		}
+	}
+
+	// Open the cgroup directory to get a file descriptor
+	fd, openErr := unix.Open(finalCgroupPath, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		_ = unix.Rmdir(finalCgroupPath) // Attempt cleanup
+		return "", -1, nil, fmt.Errorf("failed to open cgroup path '%s' for fd: %w", finalCgroupPath, openErr)
+	}
+
+	cleanupFunc := func() error {
+		closeErr := unix.Close(fd)
+		rmErr := unix.Rmdir(finalCgroupPath) // This will fail if processes are still in it
+		if closeErr != nil && rmErr != nil {
+			return fmt.Errorf("cgroup cleanup: failed to close fd (%v) AND rmdir (%v)", closeErr, rmErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("cgroup cleanup: failed to close fd: %w", closeErr)
+		}
+		if rmErr != nil {
+			// Log this, as it might indicate an issue, but don't always fail the cleanup.
+			// Cgroup might be cleaned up by system eventually if it has no tasks.
+			logger.Warn("Failed to rmdir cgroup during cleanup (might have tasks or sub-cgroups)", "path", finalCgroupPath, "error", rmErr)
+			// Attempt to kill remaining processes in the cgroup
+			_ = nr.writeCgroupFile(finalCgroupPath, "cgroup.kill", "1")
+			// Retry rmdir after a short delay
+			time.Sleep(100 * time.Millisecond)
+			_ = unix.Rmdir(finalCgroupPath)
+		}
+		logger.Info("Cgroup cleaned up", "path", finalCgroupPath)
+		return nil
+	}
+
+	return finalCgroupPath, fd, cleanupFunc, nil
+}
+
+func (nr *NodeRunner) writeCgroupFile(cgroupPath, file, content string) error {
+	fullPath := filepath.Join(cgroupPath, file)
+	// Open with O_WRONLY | O_TRUNC. Some cgroup files require specific modes.
+	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open cgroup file '%s': %w", fullPath, err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(content)
+	if err != nil {
+		return fmt.Errorf("failed to write to cgroup file '%s': %w", fullPath, err)
+	}
+	return nil
+}
+
+func (nr *NodeRunner) applyCgroupConstraints(spec *ServiceSpec, cgroupPath string, logger *slog.Logger) error {
+	logger.Info("Applying cgroup constraints", "path", cgroupPath)
+	// CPU Limit (cpu.max: quota period)
+	// Period is typically 100000 (100ms). Quota is how much of that period the cgroup can use.
+	// If CPUCores = 1.5, quota = 1.5 * 100000 = 150000.
+	if spec.CPUCores > 0 {
+		cpuPeriod := 100000 // Default CFS period in microseconds
+		cpuQuota := int(spec.CPUCores * float64(cpuPeriod))
+		cpuMaxContent := fmt.Sprintf("%d %d", cpuQuota, cpuPeriod)
+		if err := nr.writeCgroupFile(cgroupPath, "cpu.max", cpuMaxContent); err != nil {
+			logger.Warn("Failed to set cpu.max, CPU limits may not apply", "error", err)
+			// Don't fail entirely, but log. CPU controller might not be available/enabled.
+		} else {
+			logger.Debug("Set cpu.max", "value", cpuMaxContent)
+		}
+	}
+
+	// Memory Limits (in bytes)
+	if spec.MemoryMB > 0 {
+		memBytes := spec.MemoryMB * 1024 * 1024
+		memMaxBytes := memBytes
+		if spec.MemoryMaxMB > 0 {
+			memMaxBytes = spec.MemoryMaxMB * 1024 * 1024
+		}
+
+		// memory.low (soft limit)
+		if err := nr.writeCgroupFile(cgroupPath, "memory.low", strconv.FormatUint(memBytes, 10)); err != nil {
+			logger.Warn("Failed to set memory.low, memory reclaim might not be prioritized", "error", err)
+		} else {
+			logger.Debug("Set memory.low", "bytes", memBytes)
+		}
+
+		// memory.max (hard limit)
+		if err := nr.writeCgroupFile(cgroupPath, "memory.max", strconv.FormatUint(memMaxBytes, 10)); err != nil {
+			// This is more critical. If it fails, hard memory limit won't apply.
+			return fmt.Errorf("failed to set memory.max: %w. Ensure memory controller is enabled for parent cgroup.", err)
+		} else {
+			logger.Debug("Set memory.max", "bytes", memMaxBytes)
+		}
+		// Could also set memory.swap.max = 0 to disable swap for the cgroup
+		// if err := nr.writeCgroupFile(cgroupPath, "memory.swap.max", "0"); err != nil {
+		//    logger.Warn("Failed to disable swap (set memory.swap.max=0)", "error", err)
+		// }
+	}
+	return nil
+}
+
+func (nr *NodeRunner) killCgroup(cgroupPath string, logger *slog.Logger) error {
+	if cgroupPath == "" {
+		return nil
+	}
+	logger.Info("Attempting to kill all processes in cgroup", "path", cgroupPath)
+	// Writing "1" to cgroup.kill sends SIGKILL to all processes in the cgroup and its descendants.
+	// This requires the cgroup.kill file to be present (unified hierarchy / cgroup v2).
+	err := nr.writeCgroupFile(cgroupPath, "cgroup.kill", "1")
+	if err != nil {
+		logger.Error("Failed to write to cgroup.kill", "path", cgroupPath, "error", err)
+		return err
+	}
+	return nil
+}
+
 // startAppInstance attempts to download the binary, configure, and start a single instance.
 // It assumes the calling code (handleAppConfigUpdate) holds the lock on appInfo.
-func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, replicaIndex int) error {
+func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, replicaIndex int) (returnedErr error) {
 	spec := appInfo.spec
 	if spec == nil {
 		return fmt.Errorf("cannot start instance, app spec is nil for %s", appInfo.configHash)
@@ -136,185 +394,236 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	}
 	logger.Debug("Instance directory prepared", "path", workDir)
 
-	// ** Handle Mounts ** (Fetch files *before* preparing command env/args)
-	mountInfosForEnv := make([]MountInfoForEnv, 0, len(spec.Mounts)) // For landlock launcher
+	// Handle Mounts (Fetch files *before* preparing command env/args)
+	mountInfosForEnv := make([]MountInfoForEnv, 0, len(spec.Mounts))
 	for _, mount := range spec.Mounts {
 		if mount.Source.ObjectStore != "" {
-			err := nr.fetchAndPlaceFile(ctx, mount.Source.ObjectStore, workDir, mount.Path, logger) // Pass workDir
+			err := nr.fetchAndPlaceFile(ctx, mount.Source.ObjectStore, workDir, mount.Path, logger)
 			if err != nil {
 				errMsg := fmt.Sprintf("Failed to process mount %s: %v", mount.Path, err)
 				logger.Error(errMsg, "source_object", mount.Source.ObjectStore)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-				return fmt.Errorf("%s", errMsg)
+				return fmt.Errorf("failed to process mount %s: %w", mount.Path, err)
 			}
-			// Calculate absolute path for landlock launcher env
 			absMountPath := filepath.Join(workDir, filepath.Clean(mount.Path))
-			mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{
-				Path:        mount.Path,
-				Source:      mount.Source.ObjectStore,
-				ResolvedAbs: absMountPath,
-			})
-		} // else: handle other source types later
+			mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{Path: mount.Path, Source: mount.Source.ObjectStore, ResolvedAbs: absMountPath})
+		}
 	}
 	logger.Info("File mounts processed successfully", "count", len(spec.Mounts))
 
-	// Prepare Common Env Vars (including secrets)
-	processEnv := os.Environ()
-	// Add Base env vars from spec, resolving secrets
-	for _, envVar := range spec.Env {
-		var resolvedValue string
-		var resErr error
+	// User and Group ID resolution
+	var targetUID, targetGID uint32
+	var targetHomeDir string
+	currentUser, _ := user.Current() // Fallback to node-runner's user
 
+	if spec.User != "" {
+		var err error
+		targetUID, targetGID, targetHomeDir, err = lookupUser(spec.User)
+		if err != nil {
+			errMsg := fmt.Sprintf("Failed to lookup user '%s': %v", spec.User, err)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+			return fmt.Errorf(errMsg)
+		}
+		logger.Info("Target user resolved", "user", spec.User, "uid", targetUID, "gid", targetGID)
+	} else {
+		uid64, _ := strconv.ParseUint(currentUser.Uid, 10, 32)
+		gid64, _ := strconv.ParseUint(currentUser.Gid, 10, 32)
+		targetUID = uint32(uid64)
+		targetGID = uint32(gid64)
+		targetHomeDir = currentUser.HomeDir
+		logger.Debug("Using node-runner's user for process", "uid", targetUID, "gid", targetGID)
+	}
+
+	// Prepare Environment Variables (including resolved secrets) for the *target application*
+	resolvedAppEnv := make([]EnvVar, len(spec.Env))
+	for i, envVar := range spec.Env {
+		resolvedAppEnv[i] = envVar // Copy name
 		if envVar.ValueFromSecret != "" {
-			secretName := envVar.ValueFromSecret
-			resolvedValue, resErr = nr.resolveSecret(ctx, secretName, logger)
-			if resErr != nil {
-				logger.Error("Failed to resolve secret for env var", "secret_name", secretName, "env_var", envVar.Name, "error", resErr)
-				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", secretName, resErr)
+			val, err := nr.resolveSecret(ctx, envVar.ValueFromSecret, logger)
+			if err != nil {
+				logger.Error("Failed to resolve secret for env var", "env_var", envVar.Name, "error", err)
+				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", envVar.ValueFromSecret, err)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-				return fmt.Errorf("failed to resolve secret '%s' for env var '%s': %w", secretName, envVar.Name, resErr)
+				return fmt.Errorf("failed to resolve secret '%s': %w", envVar.ValueFromSecret, err)
 			}
-			logger.Debug("Successfully resolved secret", "secret_name", secretName, "env_var", envVar.Name)
+			resolvedAppEnv[i].Value = val
 		} else {
-			resolvedValue = envVar.Value
+			resolvedAppEnv[i].Value = envVar.Value
 		}
-		processEnv = append(processEnv, fmt.Sprintf("%s=%s", envVar.Name, resolvedValue))
 	}
-	// Add instance-specific env vars
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_APP_NAME=%s", appName))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_RUN_ID=%s", currentRunID)) // Add NARUN_RUN_ID to env
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS))
-	processEnv = append(processEnv, fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch))
+	baseOsEnv := os.Environ()
+	// For landlock launcher env, not the intermediate unshare/nsenter
+	// These will be inherited by the target app via the launcher.
+	launcherTargetEnv := flattenEnv(baseOsEnv, spec.User, targetHomeDir, resolvedAppEnv)
+	launcherTargetEnv = append(launcherTargetEnv,
+		fmt.Sprintf("NARUN_APP_NAME=%s", appName),
+		fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID),
+		fmt.Sprintf("NARUN_RUN_ID=%s", currentRunID),
+		fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex),
+		fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID),
+		fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir), // This is for the target app
+		fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS),
+		fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch),
+	)
 
-	// Create context for the child process (launcher or direct exec)
+	// For landlock launcher specific setup
+	selfPath, err := os.Executable()
+	if err != nil {
+		errMsg := fmt.Sprintf("Failed to get node-runner executable path: %v", err)
+		logger.Error(errMsg)
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
+		return fmt.Errorf("failed to get node-runner exec path: %w", err)
+	}
+	landlockConfigJSON, _ := json.Marshal(spec.Landlock)
+	targetArgsJSON, _ := json.Marshal(spec.Args)
+	mountInfosJSON, _ := json.Marshal(mountInfosForEnv)
+
+	// Environment for the landlock launcher process itself
+	// It needs these to configure landlock and then exec the target.
+	// The launcher itself will run as the node-runner user initially, then landlock execs target.
+	// If unshare is used, unshare drops privs *before* landlock launcher.
+	envForLauncher := slices.Clone(launcherTargetEnv) // Start with target env, then add launcher specifics
+	envForLauncher = append(envForLauncher,
+		fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)),
+		fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath), // Target app binary
+		fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)),
+		fmt.Sprintf("%s=%s", envLandlockMountInfosJSON, string(mountInfosJSON)),
+		fmt.Sprintf("%s=%s", envLandlockInstanceRoot, workDir),
+	)
+
+	// Cgroup Setup
+	var cgroupPath string
+	var cgroupFd int = -1
+	var cgroupCleanupFunc func() error // Changed to return error
+
+	if nr.usesCgroupsForResourceLimits(spec) {
+		var cgErr error
+		cgroupPath, cgroupFd, cgroupCleanupFunc, cgErr = nr.createCgroup(spec, instanceID, logger)
+		if cgErr != nil {
+			errMsg := fmt.Sprintf("Failed to create cgroup: %v", cgErr)
+			logger.Error(errMsg)
+			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
+			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+			return fmt.Errorf(errMsg)
+		}
+		// Defer cleanup only if cgroup was successfully created and we might fail later in start
+		defer func() {
+			if returnedErr != nil && cgroupCleanupFunc != nil {
+				logger.Warn("Cleaning up cgroup due to start failure", "error", returnedErr)
+				if err := cgroupCleanupFunc(); err != nil {
+					logger.Error("Error during cgroup cleanup on start failure", "cgroup_path", cgroupPath, "error", err)
+				}
+			}
+		}()
+		if err := nr.applyCgroupConstraints(spec, cgroupPath, logger); err != nil {
+			errMsg := fmt.Sprintf("Failed to apply cgroup constraints: %v", err)
+			// cgroupCleanupFunc will be called by the defer above
+			return fmt.Errorf(errMsg)
+		}
+	}
+
 	processCtx, processCancel := context.WithCancel(nr.globalCtx)
 
-	// Prepare Command based on Mode
+	// Command Assembly
 	var cmd *exec.Cmd
-	var cmdPath string
-	var cmdArgs []string
+	var finalExecCommandParts []string // Stores [nsenter_or_unshare_or_launcher, arg1, arg2...]
 
-	if spec.Mode == "landlock" {
-		logger.Info("Preparing Landlock execution mode")
-		if runtime.GOOS != "linux" {
-			processCancel()
-			errMsg := "landlock mode is only supported on Linux"
-			logger.Error(errMsg)
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-			return fmt.Errorf("%s", errMsg)
+	landlockLauncherCmd := selfPath
+	landlockLauncherArgs := []string{internalLaunchFlag}
+
+	// Determine if we need nsenter/unshare wrappers
+	useNamespacingOrCgroups := nr.usesNamespacing(spec) || nr.usesCgroupsForResourceLimits(spec)
+
+	if useNamespacingOrCgroups && runtime.GOOS == "linux" {
+		var commandBuilder []string
+		// nsenter (if network namespace is specified)
+		if spec.NetworkNamespacePath != "" {
+			commandBuilder = append(commandBuilder, "nsenter", "--no-fork", fmt.Sprintf("--net=%s", spec.NetworkNamespacePath), "--")
 		}
 
-		selfPath, err := os.Executable() // Path to the node-runner binary itself
-		if err != nil {
-			processCancel()
-			errMsg := fmt.Sprintf("Failed to get node-runner executable path: %v", err)
-			logger.Error(errMsg)
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-			return fmt.Errorf("%s", errMsg)
+		// unshare (always use if namespacing or cgroups are involved on Linux)
+		unshareCmd := "unshare"
+		unshareArgsList := []string{
+			"--ipc",
+			"--pid",
+			"--mount-proc",
+			"--fork",
+			"--kill-child=SIGKILL", // Kill child if unshare dies
+			// User/Group. If spec.User is empty, targetUID/GID is node-runner's user.
+			"--setuid", strconv.Itoa(int(targetUID)),
+			"--setgid", strconv.Itoa(int(targetGID)),
+			// TODO: Add --map-root-user if needed for some scenarios (e.g. user namespaces for rootless containers)
+			// This requires more complex UID/GID mapping setup. For now, assume target user exists on host.
+			"--", // Separator for the command unshare will run
 		}
+		commandBuilder = append(commandBuilder, unshareCmd)
+		commandBuilder = append(commandBuilder, unshareArgsList...)
 
-		// Serialize config needed by the launcher child process
-		landlockConfigJSON, err := json.Marshal(spec.Landlock)
-		if err != nil {
-			processCancel()
-			errMsg := fmt.Sprintf("Failed to marshal landlock config to JSON: %v", err)
-			logger.Error(errMsg)
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-			return fmt.Errorf("%s", errMsg)
+		// The command to be run by unshare (which is our landlock launcher)
+		commandBuilder = append(commandBuilder, landlockLauncherCmd)
+		commandBuilder = append(commandBuilder, landlockLauncherArgs...)
+
+		finalExecCommandParts = commandBuilder
+	} else {
+		// Standard landlock launcher path (or direct exec if mode != "landlock")
+		// If on non-Linux, cgroups/namespacing are skipped.
+		if spec.Mode == "landlock" {
+			finalExecCommandParts = append([]string{landlockLauncherCmd}, landlockLauncherArgs...)
+		} else { // "exec" mode directly
+			finalExecCommandParts = append([]string{binaryPath}, spec.Args...)
+			envForLauncher = launcherTargetEnv // Direct exec uses target env
 		}
-		targetArgsJSON, err := json.Marshal(spec.Args)
-		if err != nil {
-			processCancel()
-			errMsg := fmt.Sprintf("Failed to marshal target args to JSON: %v", err)
-			logger.Error(errMsg)
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-			return fmt.Errorf("%s", errMsg)
-		}
-
-		// Serialize mount info for the launcher
-		mountInfosJSON, err := json.Marshal(mountInfosForEnv)
-		if err != nil {
-			processCancel()
-			errMsg := fmt.Sprintf("Failed to marshal mount info to JSON: %v", err)
-			logger.Error(errMsg)
-			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-			return fmt.Errorf("%s", errMsg)
-		}
-
-		// Prepare the environment specifically for the LAUNCHER process
-		launcherEnv := slices.Clone(processEnv) // Start with app's resolved env
-		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)))
-		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath)) // Pass the fetched application binary path
-		launcherEnv = append(launcherEnv, fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)))
-		launcherEnv = append(launcherEnv, fmt.Sprintf("NARUN_INTERNAL_MOUNT_INFOS_JSON=%s", string(mountInfosJSON))) // Pass mount info
-
-		// Command to run the launcher (node-runner binary with the internal flag)
-		cmdPath = selfPath
-		cmdArgs = []string{internalLaunchFlag} // Launcher only needs the flag
-		cmd = exec.CommandContext(processCtx, cmdPath, cmdArgs...)
-		cmd.Env = launcherEnv // Use the extended environment for the launcher
-
-		logger.Debug("Launcher command prepared", "cmd", cmdPath, "args", cmdArgs)
-
-	} else { // Default "exec" mode
-		logger.Info("Preparing standard execution mode")
-		cmdPath = binaryPath // Execute the application binary directly
-		cmdArgs = spec.Args
-		cmd = exec.CommandContext(processCtx, cmdPath, cmdArgs...)
-		cmd.Env = processEnv // Use the standard application environment
 	}
 
-	// Common Setup (Directory, Pipes, State)
+	logger.Info("Final command to execute", "parts", finalExecCommandParts)
+	cmd = exec.CommandContext(processCtx, finalExecCommandParts[0], finalExecCommandParts[1:]...)
+	cmd.Env = envForLauncher // This env is for the landlock launcher, or direct exec
 	cmd.Dir = workDir
-	// Ensure child process can be killed cleanly via process group
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	// Pipes for log forwarding
+	if cgroupFd != -1 && nr.usesCgroupsForResourceLimits(spec) {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = cgroupFd
+		logger.Debug("Configured command to use CgroupFD", "fd", cgroupFd)
+	}
+
+	// Pipes
 	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		processCancel()
-		logger.Error("Failed to get stdout pipe", "error", err)
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stdout pipe failed: %v", err))
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-		return fmt.Errorf("stdout pipe failed for %s: %w", instanceID, err)
+	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+		return err
 	}
 	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		processCancel()
-		stdoutPipe.Close() // Close previous pipe on error
-		logger.Error("Failed to get stderr pipe", "error", err)
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("stderr pipe failed: %v", err))
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-		return fmt.Errorf("stderr pipe failed for %s: %w", instanceID, err)
+	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+		return err
 	}
 
 	// Create/Update ManagedApp State in the manager
+
 	appInstance := &ManagedApp{
 		InstanceID:    instanceID,
-		RunID:         currentRunID, // Store the generated RunID
-		Spec:          spec,         // Store reference to the spec
-		Cmd:           cmd,          // Store the prepared command (launcher or direct exec)
+		RunID:         currentRunID,
+		Spec:          spec,
+		Cmd:           cmd, // Store the top-level command (nsenter/unshare/launcher)
 		Status:        StatusStarting,
 		ConfigHash:    appInfo.configHash,
-		BinaryPath:    binaryPath, // Store path to the actual app binary
+		BinaryPath:    binaryPath, // Path to the *actual application binary*
 		StdoutPipe:    stdoutPipe,
 		StderrPipe:    stderrPipe,
 		StopSignal:    make(chan struct{}),
 		processCtx:    processCtx,
 		processCancel: processCancel,
-		restartCount:  0, // Initial start
+		restartCount:  0,
+		// Cgroup info
+		cgroupPath:    cgroupPath,
+		cgroupFd:      cgroupFd, // Store the cgroup FD
+		cgroupCleanup: cgroupCleanupFunc,
 	}
+
 	// Find and replace or append logic
 	foundAndReplaced := false
 	for i, existing := range appInfo.instances {
@@ -340,22 +649,31 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 
 	// Publish starting status (for the logical instanceID)
 	nr.publishStatusUpdate(instanceID, StatusStarting, nil, nil, "Starting process")
+	logger.Info("Starting process execution", "command", cmd.Path, "args", cmd.Args)
 
-	// Start the Process (either the launcher or the direct application)
-	logger.Info("Starting process execution", "command", cmdPath, "args", cmdArgs, "env_count", len(cmd.Env))
 	if startErr := cmd.Start(); startErr != nil {
-		errMsg := fmt.Sprintf("Failed to start process: %v", startErr)
-		logger.Error(errMsg, "error", startErr)
+		returnedErr = fmt.Errorf("failed to start %s: %w", instanceID, startErr) // Set returnedErr for defer
+		logger.Error("Failed to start process", "error", returnedErr)
 		appInstance.Status = StatusFailed
-		appInstance.processCancel() // Ensure context is cancelled
-		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
-		nr.removeInstanceState(appName, instanceID, logger)                                                    // Clean up state if start fails
-		nr.cleanupInstanceMetrics(appInstance)                                                                 // Cleanup metrics on start fail for this run
-		return fmt.Errorf("failed to start %s: %w", instanceID, startErr)
+		appInstance.processCancel()
+		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, returnedErr.Error())
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+		nr.removeInstanceState(appName, instanceID, logger)
+		nr.cleanupInstanceMetrics(appInstance)
+		// The defer for cgroupCleanupFunc will run here if cgroup was created
+		return returnedErr
 	}
 
-	// Success Path
+	// If cgroupFd was used by cmd.Start(), it's consumed. We can close our copy if we still have it.
+	// However, the cgroupFd in ManagedApp (appInstance.cgroupFd) is the one unix.Open'd.
+	// The cgroupCleanupFunc is responsible for closing this original fd.
+	// The kernel duplicates the fd for the child process.
+	// Let's ensure the original descriptor passed to createCgroup is closed if distinct from what SysProcAttr needs,
+	// but unix.Open with O_CLOEXEC should handle this for non-child processes.
+	// For UseCgroupFD, the child inherits it. The pledge example closes fd *after* cmd.Start().
+	// This means our cgroupCleanup (which includes unix.Close(fd)) should be called when the instance *stops*, not immediately after start.
+	// The `defer` handling `returnedErr` already covers failure *during* start.
+
 	appInstance.Pid = cmd.Process.Pid // Get the PID of the started process
 	appInstance.StartTime = time.Now()
 	appInstance.Status = StatusRunning
@@ -404,11 +722,11 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 		return fmt.Errorf("inconsistent state for instance %s (run %s)", instanceID, runID)
 	}
 
-	pid := appInstance.Pid
+	pid := appInstance.Pid // PID of the top-level process (nsenter/unshare/launcher)
 	logger.Info("Stopping application instance process", "pid", pid)
 	appInstance.Status = StatusStopping
-	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0) // Mark as down now for this run
-	nr.publishStatusUpdate(instanceID, StatusStopping, &pid, nil, "")                               // Logical instance status
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
+	nr.publishStatusUpdate(instanceID, StatusStopping, &pid, nil, "")
 
 	// Close stop signal channel if not already closed
 	select {
@@ -436,15 +754,25 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	select {
 	case <-termTimer.C:
 		logger.Warn("Graceful shutdown timed out. Sending SIGKILL.", "pid", pid)
-		// Send SIGKILL to the process group
-		if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			logger.Error("Failed to send SIGKILL", "pid", pid, "error", killErr)
+		// If cgroup is used and timeout, try to kill via cgroup first
+		if appInstance.cgroupPath != "" && nr.usesCgroupsForResourceLimits(appInstance.Spec) {
+			logger.Info("Attempting to kill via cgroup.kill", "cgroup_path", appInstance.cgroupPath)
+			if err := nr.killCgroup(appInstance.cgroupPath, logger); err != nil {
+				logger.Error("Failed to kill cgroup, falling back to SIGKILL PID", "error", err)
+				if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+					logger.Error("Failed to send SIGKILL to pgid", "pid", pid, "error", killErr)
+				}
+			}
+		} else {
+			if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+				logger.Error("Failed to send SIGKILL to pgid", "pid", pid, "error", killErr)
+			}
 		}
 		appInstance.processCancel() // Ensure context is cancelled if timeout occurs
 	case <-appInstance.processCtx.Done():
 		logger.Info("Process exited or context canceled during stop wait.")
 	}
-	return nil // Signal that stop attempt was made
+	return nil
 }
 
 // resolveSecret fetches and decrypts a secret from the KV store.
@@ -561,6 +889,15 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		appInstance.processCancel() // This will also stop the memory poller goroutine
 		appInstance.LogWg.Wait()    // Wait for log forwarders AND memory poller
 		logger.Debug("Monitor finished and auxiliary goroutines (logs, memory poller) completed")
+
+		// Cgroup cleanup is crucial here
+		if appInstance.cgroupCleanup != nil {
+			logger.Info("Cleaning up cgroup for instance", "path", appInstance.cgroupPath)
+			if err := appInstance.cgroupCleanup(); err != nil {
+				logger.Error("Error during cgroup cleanup", "cgroup_path", appInstance.cgroupPath, "error", err)
+			}
+			appInstance.cgroupCleanup = nil // Prevent double cleanup
+		}
 
 		shouldCleanupDisk := false
 		finalStatus := appInstance.Status

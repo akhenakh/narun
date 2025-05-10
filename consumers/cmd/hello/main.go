@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 
 	// "time" // No longer needed for default stream name constant
 
@@ -154,6 +155,27 @@ func main() {
 		logger.Warn("NARUN_INSTANCE_ROOT environment variable not set, skipping read test")
 	}
 
+	instanceRoot = os.Getenv("NARUN_INTERNAL_INSTANCE_ROOT")
+	if instanceRoot != "" {
+		filePath := instanceRoot + "/mydata"
+		b, err = os.ReadFile(filePath) // Reuse b and err variables declared above
+		if err != nil {
+			logger.Error("failed to read file in instance root", "path", filePath, "error", err)
+		} else {
+			logger.Debug("read file in instance root", "path", filePath, "content", string(b))
+		}
+	} else {
+		logger.Warn("NARUN_INERNAL_INSTANCE_ROOT environment variable not set, skipping read test")
+	}
+
+	// listing /
+	files, err := ls()
+	if err != nil {
+		logger.Error("failed to read /", "error", err)
+	} else {
+		logger.Info("listed /", "files", files)
+	}
+
 	// Create handler
 	handler := &helloHandler{}
 
@@ -179,4 +201,35 @@ func main() {
 	}
 
 	logger.Info("consumer listener stopped cleanly") // This might not be reached on error exit
+}
+
+func ls() (string, error) {
+	// Path to list
+	path := "/"
+
+	// Open the directory
+	dir, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer dir.Close()
+
+	// Read directory entries
+	entries, err := dir.ReadDir(-1) // -1 means read all entries
+	if err != nil {
+		return "", err
+	}
+
+	// Create a slice to store entry names
+	fileNames := make([]string, 0, len(entries))
+
+	// Add each entry name to the slice
+	for _, entry := range entries {
+		fileNames = append(fileNames, entry.Name())
+	}
+
+	// Join the names with commas to create a list string
+	listString := "[" + strings.Join(fileNames, ", ") + "]"
+
+	return listString, nil
 }

@@ -41,6 +41,11 @@ type ManagedApp struct {
 	processCancel context.CancelFunc // Function to cancel the process context
 	restartCount  int                // Number of times restarted since last config change/start
 	lastExitCode  *int               // Store the last exit code
+
+	// cgroups related
+	cgroupPath    string       // Absolute path to the instance's cgroup
+	cgroupFd      int          // File descriptor for the cgroup directory (for UseCgroupFD)
+	cgroupCleanup func() error // Function to clean up the cgroup
 }
 
 // appInfo holds the state for all instances of a single application on this node.

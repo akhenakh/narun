@@ -98,14 +98,14 @@ func (h *HttpHandler) makeRouteHandler(routeCfg *gwconfig.RouteConfig) http.Hand
 		natsRequest.Data = body
 		natsRequest.Header = make(nats.Header)
 
-		// 1. Copy original HTTP headers to NATS headers
+		// Copy original HTTP headers to NATS headers
 		for key, values := range r.Header {
 			for _, value := range values {
 				natsRequest.Header.Add(key, value)
 			}
 		}
 
-		// 2. Add custom headers needed for reconstruction on the consumer side
+		// Add custom headers needed for reconstruction on the consumer side
 		natsRequest.Header.Set("X-Original-Method", method)
 		natsRequest.Header.Set("X-Original-Path", path)            // Use the actual request path
 		natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery) // Pass query params

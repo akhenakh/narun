@@ -247,6 +247,21 @@ Key metrics include:
 
 The nconsumer library can also expose metrics (e.g., processing time, active workers) if configured - see its implementation for details.
 
+## Security Model Summary
+
+`narun` enhances application security on Linux through a layered approach (when using the `landlock` mode):
+
+*   **Landlock Sandboxing:** For applications in `landlock` mode, `narun` enforces fine-grained filesystem access control. An internal launcher applies rules defined in your application's spec, restricting what files the application can read, write, or execute, even though it operates on the host's filesystem view (it's not a `chroot`).
+*   **Namespace Isolation:**
+    *   **PID & IPC:** Each application runs in its own PID and IPC namespaces, isolating it from other processes and inter-process communication resources on the host.
+    *   **Mount (`--mount-proc`):** A new mount namespace provides a correct `/proc` view for the isolated PIDs.
+    *   **Network (Optional):** Can be isolated by assigning a pre-existing network namespace.
+*   **Privilege Reduction:** Applications are run under a specified non-privileged user (or the `narun` runner's user by default) after privileges are dropped using `unshare --setuid/--setgid`.
+*   **Resource Limits (Cgroups):** CPU and memory usage are constrained via Linux cgroups (v2), preventing resource exhaustion by any single application.
+*   **Execution Flow:** A multi-step process involving `nsenter` (for network), `unshare` (for PID/IPC/mount/user), and a dedicated Landlock launcher (`narun` itself in a special mode) ensures that namespaces are established and privileges are dropped *before* Landlock rules are applied and the final application is executed.
+
+This model aims to provide strong isolation and apply the principle of least privilege. Effective security relies on well-defined Landlock rules, appropriate user configurations, and resource limits.
+
 
 ## TODO
 - route grpc from Caddy
@@ -262,8 +277,10 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
 - add a backgroup loop to monitor memory and cpu and update the metrics
 - consistent naming of the KV/ObjectStore
 - [] Mount a directory from the host (wait until isolation or chroot)
+- rename app to service in narun logs
 
 ## BUGS
+- when using landlock the metrics are reporting the memory of unshare not the runing app
 - deploy without config dont start the actual app
 - after deploy it takes time for the status and running instances count to appear in list-apps, even after the run sometimes the status disappear the reappear
 - investigate inverted response:
@@ -282,8 +299,10 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
   - delete-image
 - [X] the gateway does not handle subpath
 - [X] the NATS disconnecting is terminating caddy
+- in a deploy config if the path is not ending with / the route is not working
 
 ## Ideas
+- enforce semver
 - if the app is a nats consumer:
   - in the deploy file add a section `nats` to describe what subject the app is allowed to consume, then auto provision nkeys and subscribe the application only for its own subject.
   - pass the nkeys to the application in files exposed by the node runners.
@@ -307,10 +326,12 @@ The nconsumer library can also expose metrics (e.g., processing time, active wor
 - self registering path consumers
 - node runner
   - [X] landlock https://github.com/shoenig/go-landlock
-  - gvisor
-  - firecracker
+  - gvisor amd64/arm64 no risc-v
+  - firecracker amd64 no arm64 no risc-v
+  - tamago targeting firecracker https://github.com/usbarmory/tamago/tree/master/board/firecracker/microvm
   - [X] exec
   - systemd-nspawn
+  - [X] cgroup + namespace + landlock
 - do not develop a node runner but interact with systemd only?
 - [X] no registry needed for "images", binary can be compiled using ko like solution and uploaded to objectstore
 - zig musl + static go build

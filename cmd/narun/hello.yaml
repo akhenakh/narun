@@ -15,6 +15,9 @@ landlock:
   paths:
     - path: /etc/issue
       modes: "r"
+user: akh # user to run process under
+memoryMaxMB: 30
+CPUCores: 0.1
 
 # Original args/env
 args:

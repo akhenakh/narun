@@ -18,10 +18,8 @@ import (
 	"github.com/akhenakh/narun/internal/grpcgateway"
 	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/handler"
-	"github.com/akhenakh/narun/internal/natsutil"
-
-	// Import metrics package to register collectors
 	_ "github.com/akhenakh/narun/internal/metrics"
+	"github.com/akhenakh/narun/internal/natsutil"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"

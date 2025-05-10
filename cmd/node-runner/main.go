@@ -21,14 +21,18 @@ import (
 )
 
 const (
-	internalLaunchFlag           = "--internal-landlock-launch"
-	envLandlockConfigJSON        = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
-	envLandlockTargetCmd         = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
-	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
-	landlockLauncherErrCode      = 120 // Specific exit code for launcher errors
-	landlockUnsupportedErrCode   = 121 // Specific exit code if landlock unsupported
-	landlockLockFailedErrCode    = 122 // Specific exit code if l.Lock fails
-	landlockTargetExecFailedCode = 123 // Specific exit code if syscall.Exec fails
+	internalLaunchFlag              = "--internal-landlock-launch"
+	envLandlockConfigJSON           = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
+	envLandlockTargetCmd            = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
+	envLandlockTargetArgsJSON       = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
+	envLandlockInstanceRoot         = "NARUN_INTERNAL_INSTANCE_ROOT"
+	envLandlockMountInfosJSON       = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
+	landlockLauncherErrCode         = 120 // Specific exit code for launcher errors
+	landlockUnsupportedErrCode      = 121 // Specific exit code if landlock unsupported
+	landlockLockFailedErrCode       = 122 // Specific exit code if l.Lock fails
+	landlockTargetExecFailedCode    = 123 // Specific exit code if syscall.Exec fails
+	landlockMissingInstanceRootCode = 124 // Specific exit code if NARUN_INTERNAL_INSTANCE_ROOT is missing
+
 )
 
 func main() {
@@ -126,12 +130,20 @@ func runLandlockLauncher() {
 	configJSON := os.Getenv(envLandlockConfigJSON)
 	targetCmdPath := os.Getenv(envLandlockTargetCmd) // Path to the actual application binary
 	targetArgsJSON := os.Getenv(envLandlockTargetArgsJSON)
+	instanceRoot := os.Getenv(envLandlockInstanceRoot) // Get instance root from env
+	mountInfosJSON := os.Getenv(envLandlockMountInfosJSON)
 
 	if configJSON == "" || targetCmdPath == "" || targetArgsJSON == "" {
-		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Missing required environment variables (%s, %s, %s).\n",
+		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Missing required environment variables for basic operation (%s, %s, %s).\n",
 			envLandlockConfigJSON, envLandlockTargetCmd, envLandlockTargetArgsJSON)
 		os.Exit(landlockLauncherErrCode)
 	}
+
+	if instanceRoot == "" {
+		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Missing required environment variable %s.\n", envLandlockInstanceRoot)
+		os.Exit(landlockMissingInstanceRootCode)
+	}
+	fmt.Fprintf(os.Stderr, "[narun-launcher] Instance root: %s\n", instanceRoot)
 
 	var landlockSpec noderunner.LandlockSpec
 	if err := json.Unmarshal([]byte(configJSON), &landlockSpec); err != nil {
@@ -180,7 +192,6 @@ func runLandlockLauncher() {
 	}
 
 	// Add Landlock rules for mounted files (read from environment)
-	mountInfosJSON := os.Getenv("NARUN_INTERNAL_MOUNT_INFOS_JSON")
 	if mountInfosJSON != "" {
 		var mountInfos []noderunner.MountInfoForEnv
 		if err := json.Unmarshal([]byte(mountInfosJSON), &mountInfos); err != nil {
@@ -189,17 +200,12 @@ func runLandlockLauncher() {
 		}
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying rules for %d mounted file(s)...\n", len(mountInfos))
 		for _, mount := range mountInfos {
-			// Assume read-only access for mounted files by default.
-			// Use the absolute path resolved by the parent process.
 			landlockPaths = append(landlockPaths, ll.File(mount.ResolvedAbs, "r"))
 			fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock mount rule: Path=%s Modes=r\n", mount.ResolvedAbs)
 		}
 	}
 
 	for _, p := range landlockSpec.Paths {
-		// Use ll.File - it should handle directories appropriately for most access modes.
-		// If specific directory creation ('c' on a dir path) is needed, ll.Dir might be required,
-		// but let's start simple.
 		landlockPaths = append(landlockPaths, ll.File(p.Path, p.Modes))
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock custom path: Path=%s Modes=%s\n", p.Path, p.Modes)
 	}
@@ -210,39 +216,31 @@ func runLandlockLauncher() {
 
 	// Apply Landlock Rules to this launcher process
 	l := ll.New(landlockPaths...)
-	// Use Mandatory: fail hard if Landlock isn't supported or rules are bad.
-	// Use OnlySupported if you want to allow running on older kernels without Landlock, but still attempt it.
-	// For security, Mandatory is often preferred.
 	applyMode := ll.Mandatory
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Attempting to apply Landlock rules (Mode: %v)...\n", applyMode)
 	err := l.Lock(applyMode)
 	if err != nil {
-		// Check for unsupported error specifically if needed, though Mandatory implies failure.
-		// Example check (might depend on library error types):
-		// if errors.Is(err, ll.ErrLandlockUnsupported) { exitCode = landlockUnsupportedErrCode }
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Failed to apply Landlock rules: %v\n", err)
 		os.Exit(landlockLockFailedErrCode)
 	}
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Landlock rules applied successfully.\n")
 
 	// Prepare arguments for syscall.Exec
-	// argv[0] must be the path to the executable being run (the target application).
 	argv := []string{targetCmdPath}
-	argv = append(argv, targetArgs...) // Append args from the spec
+	argv = append(argv, targetArgs...)
 
 	// Prepare environment for the final application process
-	// Start with the inherited environment (which includes NARUN vars set by parent)
-	envv := os.Environ() // Inherit the environment prepared by the parent node-runner
-	// Add the instance root based on the launcher's working directory
-	workDir := os.Getenv("PWD") // Should be set by the parent's cmd.Dir
-	if workDir == "" {          // Add a check just in case
-		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Could not determine working directory (PWD env var missing).\n")
-		os.Exit(landlockLauncherErrCode)
-	}
-	envv = append(envv, fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir))
+	// Start with the inherited environment
+	envv := os.Environ()
+	// Ensure NARUN_INSTANCE_ROOT is correctly set for the final application
+	// It was retrieved from the environment above, so it will be part of os.Environ()
+	// If we wanted to be absolutely sure or override, we could:
+	// envv = append(envv, fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", instanceRoot))
+	// However, since instanceRoot is already read from the environment set by the parent,
+	// it will be passed along correctly via os.Environ().
 
 	// Execute the Target Application (Replace this Launcher Process)
-	fmt.Fprintf(os.Stderr, "[narun-launcher] Executing target application: %s ...\n", targetCmdPath)
+	fmt.Fprintf(os.Stderr, "[narun-launcher] Executing target application: %s with env: %v\n", targetCmdPath, envv) // Log env for debugging
 	err = syscall.Exec(targetCmdPath, argv, envv)
 
 	// If syscall.Exec returns, it's always an error.

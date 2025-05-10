@@ -850,7 +850,7 @@ func handleServiceInfoCmd(args []string) {
 	}
 	defer nc.Close()
 
-	// 1. Fetch ServiceSpec
+	// Fetch ServiceSpec
 	kvAppConfigs, err := js.KeyValue(ctx, noderunner.AppConfigKVBucket)
 	if err != nil {
 		slog.Error("Could not access App Config KV", "bucket", noderunner.AppConfigKVBucket, "error", err)
@@ -875,7 +875,7 @@ func handleServiceInfoCmd(args []string) {
 	fmt.Println("--- Configuration (ServiceSpec) ---")
 	fmt.Println(string(entry.Value())) // Print raw YAML
 
-	// 2. Fetch NodeStates
+	// Fetch NodeStates
 	nodeStates := make(map[string]noderunner.NodeState)
 	kvNodeStates, err := js.KeyValue(ctx, noderunner.NodeStateKVBucket)
 	if err != nil {
@@ -916,7 +916,7 @@ func handleServiceInfoCmd(args []string) {
 		}
 	}
 
-	// 3. Display Node Status & Instances
+	// Display Node Status & Instances
 	fmt.Println("\n--- Node Status & Instances ---")
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 1, ' ', 0)
 	fmt.Fprintln(tw, "NODE ID\tSTATUS\tPLATFORM\tDESIRED\tRUNNING\tINSTANCE IDS")
@@ -956,7 +956,7 @@ func handleServiceInfoCmd(args []string) {
 	}
 	tw.Flush()
 
-	// 4. Orphaned Instances Check
+	// Orphaned Instances Check
 	hasOrphans := false
 	orphanedTw := tabwriter.NewWriter(os.Stdout, 0, 8, 1, ' ', 0) // Separate tabwriter for orphans
 	fmt.Fprintln(orphanedTw, "\n--- Orphaned Instances (Running on nodes not in current spec) ---")

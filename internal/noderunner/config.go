@@ -78,6 +78,17 @@ type ServiceSpec struct {
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
+
+	User                 string  `yaml:"user,omitempty"`                 // User to run the process as. If empty, runs as node-runner's user.
+	MemoryMB             uint64  `yaml:"memoryMB,omitempty"`             // Memory soft limit in MiB.
+	MemoryMaxMB          uint64  `yaml:"memoryMaxMB,omitempty"`          // Memory hard limit in MiB (0 means same as MemoryMB).
+	CPUCores             float64 `yaml:"cpuCores,omitempty"`             // CPU bandwidth in terms of cores (e.g., 0.5 for 50%, 1.0 for 1 core). 0 means no limit.
+	NetworkNamespacePath string  `yaml:"networkNamespacePath,omitempty"` // Optional: path to an existing network namespace to join.
+	// CgroupParent defines the cgroup parent directory under /sys/fs/cgroup where the instance's cgroup scope will be created.
+	// Example: "system.slice" or "user.slice/user-1000.slice".
+	// The node-runner process must have permission to create sub-cgroups here.
+	// If empty, cgroup-based resource limits will not be applied.
+	CgroupParent string `yaml:"cgroupParent,omitempty"`
 }
 
 // StoredSecret is the structure stored as JSON in the SecretKVBucket.
@@ -151,6 +162,27 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 				}
 			}
 		}
+	}
+
+	if spec.CPUCores < 0 {
+		return nil, fmt.Errorf("cpuCores cannot be negative")
+	}
+	if spec.MemoryMB > 0 && spec.MemoryMaxMB > 0 && spec.MemoryMaxMB < spec.MemoryMB {
+		return nil, fmt.Errorf("memoryMaxMB cannot be less than memoryMB")
+	}
+	if spec.CgroupParent != "" && !strings.HasPrefix(spec.CgroupParent, "/") {
+		// A simple check; more robust validation might involve checking /sys/fs/cgroup.
+		// For now, we assume if set, it's a path relative to /sys/fs/cgroup or absolute.
+		// The node-runner will prepend /sys/fs/cgroup if it's not absolute.
+		// Better: CgroupParent should be the path relative to /sys/fs/cgroup.
+		// e.g. "system.slice" or "mycompany.slice/services.slice"
+		// The runner will then form /sys/fs/cgroup/<CgroupParent>/narun-<app>-<id>.scope
+	}
+	if (spec.MemoryMB > 0 || spec.CPUCores > 0) && spec.CgroupParent == "" {
+		return nil, fmt.Errorf("cgroupParent must be specified when memoryMB or cpuCores limits are set")
+	}
+	if spec.CgroupParent != "" && runtime.GOOS != "linux" {
+		fmt.Printf("Warning: cgroupParent specified for app '%s', but current OS is not Linux (%s). Cgroup limits will be ignored.\n", spec.Name, runtime.GOOS)
 	}
 
 	// Validate Env Vars: only one of value or valueFromSecret should be set

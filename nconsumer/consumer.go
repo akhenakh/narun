@@ -340,7 +340,7 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 		startTime := time.Now()
 		reqLogger := logger // Create request-scoped logger if needed later
 
-		// 1. Get Original gRPC Method
+		// Get Original gRPC Method
 		originalMethod := req.Headers().Get("X-Original-Grpc-Method")
 		if originalMethod == "" {
 			reqLogger.Error("Missing X-Original-Grpc-Method header")
@@ -352,7 +352,7 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 		}
 		reqLogger = reqLogger.With("grpc_method", originalMethod)
 
-		// 2. Find Method Descriptor
+		// Find Method Descriptor
 		mDesc, found := methodMap[originalMethod]
 		if !found {
 			reqLogger.Warn("Received request for unknown or unhandled gRPC method")
@@ -364,7 +364,7 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 			return
 		}
 
-		// 3. Prepare Decoder Function
+		// Prepare Decoder Function
 		// This function will be called by the MethodDesc.Handler
 		dec := func(v interface{}) error {
 			// v will be a pointer to the correct request proto type (e.g., *SayHelloRequest)
@@ -383,14 +383,13 @@ func ListenAndServeGRPC(opts Options, desc *grpc.ServiceDesc, impl interface{}) 
 			return nil
 		}
 
-		// 4. Call the gRPC Method Handler
+		// Call the gRPC Method Handler
 		// We need a context. For now, use background. Could potentially pass tracing info via headers later.
 		ctx := context.Background()
 		// The handler expects: service implementation, context, decoder func, interceptor (nil for now)
 		// It returns: response object (interface{}), error
 		resp, err := mDesc.Handler(impl, ctx, dec, nil) // No interceptor support yet
 
-		// 5. Handle Response/Error
 		if err != nil {
 			reqLogger.Warn("gRPC handler returned an error", "error", err)
 			// Check if it's a gRPC status error
