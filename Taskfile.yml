@@ -1,0 +1,134 @@
+# https://taskfile.dev
+
+version: '3'
+
+vars:
+  TARGETS: narun-gw narun node-runner hello
+  ARCHES: amd64 arm64 riscv64
+  ZIG_AMD64: zig cc -target x86_64-linux-musl
+  ZIG_ARM64: zig cc -target aarch64-linux-musl
+  ZIG_RISCV64: zig cc -target riscv64-linux-musl
+  LDFLAGS: -linkmode=external -extldflags=-static
+  GO_BUILD_FLAGS: -trimpath
+
+tasks:
+  default:
+    deps: [build]
+    cmds:
+      - echo "Build complete. Run 'task --list' to see available tasks."
+    silent: true
+
+  build:
+    desc: "Build all targets for all architectures (non-static)"
+    deps: [narun-gw, narun, node-runner, hello]
+
+  clean:
+    desc: "Clean build artifacts"
+    cmds:
+      - rm -rf bin/
+
+  test:
+    desc: "Run all tests"
+    cmds:
+      - go test ./...
+
+  test-race:
+    desc: "Run all tests with race detection"
+    env:
+      CGO_ENABLED: 1
+    cmds:
+      - go test -race ./...
+
+  lint:
+    desc: "Run linter"
+    cmds:
+      - golangci-lint run ./...
+
+
+  build-regular:
+    desc: "Build a target for all architectures using standard Go build"
+    internal: true
+    vars:
+      TARGET: '{{.TARGET}}'
+      PATH: '{{.PATH}}'
+    cmds:
+      - mkdir -p bin/
+      - for: { var: ARCHES }
+        cmd: GOOS=linux GOARCH={{.ITEM}} go build {{.GO_BUILD_FLAGS}} -o bin/{{.TARGET}}-{{.ITEM}} {{.PATH}}
+
+  build-static:
+    desc: "Build a target for all architectures using static linking with zig"
+    internal: true
+    vars:
+      TARGET: '{{.TARGET}}'
+      PATH: '{{.PATH}}'
+    cmds:
+      - mkdir -p bin/
+      - for: { var: ARCHES }
+        cmd: |
+          # Set the appropriate Zig compiler based on architecture
+          if [ "{{.ITEM}}" = "amd64" ]; then
+            ZIG_CC="{{.ZIG_AMD64}}"
+          elif [ "{{.ITEM}}" = "arm64" ]; then
+            ZIG_CC="{{.ZIG_ARM64}}"
+          elif [ "{{.ITEM}}" = "riscv64" ]; then
+            ZIG_CC="{{.ZIG_RISCV64}}"
+          fi
+          GOOS=linux GOARCH={{.ITEM}} CGO_ENABLED=1 CC="$ZIG_CC" go build {{.GO_BUILD_FLAGS}} -o bin/{{.TARGET}}-{{.ITEM}}-static --ldflags '{{.LDFLAGS}}' {{.PATH}}
+
+  # narun-gw tasks
+  narun-gw:
+    desc: "Build narun-gw for all architectures"
+    cmds:
+      - task: build-regular
+        vars: { TARGET: narun-gw, PATH: ./cmd/narun-gw }
+
+  narun-gw:static:
+    desc: "Build static narun-gw for all architectures"
+    cmds:
+      - task: build-static
+        vars: { TARGET: narun-gw, PATH: ./cmd/narun-gw }
+
+  # narun tasks
+  narun:
+    desc: "Build narun for all architectures"
+    cmds:
+      - task: build-regular
+        vars: { TARGET: narun, PATH: ./cmd/narun }
+
+  narun:static:
+    desc: "Build static narun for all architectures"
+    cmds:
+      - task: build-static
+        vars: { TARGET: narun, PATH: ./cmd/narun }
+
+  # node-runner tasks
+  node-runner:
+    desc: "Build node-runner for all architectures"
+    cmds:
+      - task: build-regular
+        vars: { TARGET: node-runner, PATH: ./cmd/node-runner }
+
+  node-runner:static:
+    desc: "Build static node-runner for all architectures"
+    cmds:
+      - task: build-static
+        vars: { TARGET: node-runner, PATH: ./cmd/node-runner }
+
+  # hello tasks
+  hello:
+    desc: "Build hello for all architectures"
+    cmds:
+      - task: build-regular
+        vars: { TARGET: hello, PATH: ./consumers/cmd/hello }
+
+  hello:static:
+    desc: "Build static hello for all architectures"
+    cmds:
+      - task: build-static
+        vars: { TARGET: hello, PATH: ./consumers/cmd/hello }
+
+  # Meta tasks
+  all:static:
+    desc: "Build all targets with static linking"
+    deps: [narun-gw:static, narun:static, node-runner:static, hello:static]
