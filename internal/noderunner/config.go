@@ -19,6 +19,7 @@ const (
 	FileOSBucket          = "narun-files"      // Object store for user files
 	LogSubjectPrefix      = "logs"             // prefix for the logs
 	SecretKVBucket        = "narun-secrets"    // KV store for encrypted secrets
+	CronJobHistoryKVBucket = "narun-cron-history" // KV store for cron job execution records
 )
 
 // EnvVar defines an environment variable for the service.
@@ -89,6 +90,12 @@ type ServiceSpec struct {
 	// The node-runner process must have permission to create sub-cgroups here.
 	// If empty, cgroup-based resource limits will not be applied.
 	CgroupParent string `yaml:"cgroupParent,omitempty"`
+
+	// Cron-specific fields
+	CronSchedule      string `yaml:"cronSchedule,omitempty"`
+	JobMaxRetries     int    `yaml:"jobMaxRetries,omitempty"`
+	JobTimeoutSeconds int    `yaml:"jobTimeoutSeconds,omitempty"`
+	RunMode           string `yaml:"runMode,omitempty"` // "service" or "cron"
 }
 
 // StoredSecret is the structure stored as JSON in the SecretKVBucket.
@@ -139,6 +146,33 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 	}
 	if spec.Mode != "exec" && spec.Mode != "landlock" {
 		return nil, fmt.Errorf("invalid mode '%s': must be 'exec' or 'landlock'", spec.Mode)
+	}
+
+	// Validate RunMode and Cron-specific fields
+	if spec.RunMode == "" {
+		spec.RunMode = "service" // Default RunMode
+	}
+	if spec.RunMode != "service" && spec.RunMode != "cron" {
+		return nil, fmt.Errorf("invalid runMode '%s': must be 'service' or 'cron'", spec.RunMode)
+	}
+
+	if spec.RunMode == "cron" {
+		if strings.TrimSpace(spec.CronSchedule) == "" {
+			return nil, fmt.Errorf("cronSchedule is required when runMode is 'cron'")
+		}
+		// TODO: Implement proper cron expression validation
+		// For now, we just check if it's a non-empty string.
+		// Example: _, err := cronexpr.Parse(spec.CronSchedule)
+		// if err != nil {
+		//    return nil, fmt.Errorf("invalid cronSchedule format: %w", err)
+		// }
+	}
+
+	if spec.JobMaxRetries < 0 {
+		return nil, fmt.Errorf("jobMaxRetries cannot be negative")
+	}
+	if spec.JobTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("jobTimeoutSeconds cannot be negative")
 	}
 
 	// Validate Landlock spec only if mode is landlock

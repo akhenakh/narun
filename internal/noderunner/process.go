@@ -72,6 +72,28 @@ type logEntry struct {
 	Timestamp  time.Time `json:"timestamp"`
 }
 
+// GenerateJobInstanceID creates a unique ID for a job's execution environment.
+func GenerateJobInstanceID(appName, runID string) string {
+	return fmt.Sprintf("%s-cronjob-%s", appName, runID)
+}
+
+// CronJobExecutionRecord stores the result of a single cron job execution.
+type CronJobExecutionRecord struct {
+	AppName           string    `json:"appName"`
+	RunID             string    `json:"runID"`
+	CronSchedule      string    `json:"cronSchedule"`    // From spec
+	RequestedTime     time.Time `json:"requestedTime"`   // Time the cron was scheduled to fire
+	StartTime         time.Time `json:"startTime"`
+	EndTime           time.Time `json:"endTime"`
+	Status            string    `json:"status"` // e.g., "success", "failure", "timeout", "retrying"
+	ExitCode          int       `json:"exitCode"`
+	JobMaxRetries     int       `json:"jobMaxRetries"` // From spec
+	RetriesAttempted  int       `json:"retriesAttempted"`
+	JobTimeoutSeconds int       `json:"jobTimeoutSeconds"` // From spec
+	ErrorMessage      string    `json:"errorMessage,omitempty"`
+	NodeID            string    `json:"nodeID"`
+}
+
 // calculateSpecHash generates a simple hash of the ServiceSpec for change detection.
 func calculateSpecHash(spec *ServiceSpec) (string, error) {
 	// Use YAML representation for hashing
@@ -1399,7 +1421,7 @@ func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *
 	if VmHWMkB != -1 {
 		memoryBytes := float64(VmHWMkB * 1024) // Convert KB to Bytes
 		metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(
-			InstanceIDToAppName(instance.InstanceID),
+			InstanceIDToAppName(instance.InstanceID), // This will extract appName from job instance ID
 			instance.InstanceID,
 			nr.nodeID,
 			instance.RunID,
@@ -1408,5 +1430,549 @@ func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *
 	} else {
 		// VmHWM not found, or not Linux. Log less verbosely or not at all.
 		// logger.Debug("VmHWM not found in proc status or not on Linux, memory metric not updated this cycle", "pid", pid)
+	}
+}
+
+// startJobInstance attempts to download the binary, configure, and start a single job execution.
+// It is similar to startAppInstance but tailored for transient, timed cron jobs.
+func (nr *NodeRunner) startJobInstance(baseCtx context.Context, spec *ServiceSpec, runID string, attemptNumber int, scheduledTime time.Time) (returnedAppInstance *ManagedApp, returnedErr error) {
+	appName := spec.Name
+	tag := spec.Tag
+	// Create a unique instance ID for this job run for directory management and logging.
+	jobSpecificInstanceID := GenerateJobInstanceID(appName, runID)
+
+	logger := nr.logger.With("app", appName, "instance_id", jobSpecificInstanceID, "run_id", runID, "tag", tag, "mode", spec.Mode, "attempt", attemptNumber)
+	logger.Info("Attempting to start job instance")
+
+	// Context for this specific job run, potentially with timeout
+	var processCtx context.Context
+	var processCancel context.CancelFunc
+	if spec.JobTimeoutSeconds > 0 {
+		timeoutDuration := time.Duration(spec.JobTimeoutSeconds) * time.Second
+		processCtx, processCancel = context.WithTimeout(baseCtx, timeoutDuration)
+		logger = logger.With("timeout_seconds", spec.JobTimeoutSeconds)
+	} else {
+		processCtx, processCancel = context.WithCancel(baseCtx)
+	}
+	defer func() {
+		// If startJobInstance itself errors out before monitorJobInstance is called,
+		// or if monitorJobInstance is not reached, ensure processCancel is called.
+		// monitorJobInstance has its own defer processCancel.
+		if returnedErr != nil && processCancel != nil {
+			logger.Debug("Cancelling job process context due to start error", "error", returnedErr)
+			processCancel()
+		}
+	}()
+
+	// Fetch Binary First (config hash is not relevant for transient jobs like this, use RunID or fixed value)
+	// Using runID as a proxy for configHash to ensure uniqueness if binary changes while job is scheduled.
+	binaryPath, fetchErr := nr.fetchAndStoreBinary(processCtx, spec.Tag, appName, runID)
+	if fetchErr != nil {
+		errMsg := fmt.Sprintf("Binary fetch failed for job: %v", fetchErr)
+		logger.Error(errMsg, "error", fetchErr)
+		// No status update here, monitorJobInstance will record this
+		return nil, fmt.Errorf("failed to fetch binary for job %s (run %s): %w", appName, runID, fetchErr)
+	}
+	logger.Info("Binary downloaded/verified for job", "path", binaryPath)
+	if err := os.Chmod(binaryPath, 0755); err != nil {
+		logger.Error("Failed to make binary executable for job", "path", binaryPath, "error", err)
+		return nil, fmt.Errorf("failed making binary executable %s for job: %w", binaryPath, err)
+	}
+
+	// Prepare Instance Directory and Working Directory
+	// Use jobSpecificInstanceID for directory uniqueness to allow concurrent job runs (if ever needed)
+	// and to separate workspaces.
+	instanceDir := filepath.Join(nr.dataDir, "instances", jobSpecificInstanceID)
+	workDir := filepath.Join(instanceDir, "work")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		logger.Error("Failed to create job instance working directory", "dir", workDir, "error", err)
+		return nil, fmt.Errorf("failed to create work dir %s for job instance %s: %w", workDir, jobSpecificInstanceID, err)
+	}
+	logger.Debug("Job instance directory prepared", "path", workDir)
+	// Defer cleanup of the entire instanceDir for the job, only if start fails.
+	// If start succeeds, monitorJobInstance will handle cleanup.
+	defer func() {
+		if returnedErr != nil {
+			logger.Warn("Cleaning up job instance directory due to start failure", "dir", instanceDir, "error", returnedErr)
+			if err := os.RemoveAll(instanceDir); err != nil {
+				logger.Error("Failed to remove job instance directory on start failure", "dir", instanceDir, "error", err)
+			}
+		}
+	}()
+
+	// Handle Mounts
+	mountInfosForEnv := make([]MountInfoForEnv, 0, len(spec.Mounts))
+	for _, mount := range spec.Mounts {
+		if mount.Source.ObjectStore != "" {
+			err := nr.fetchAndPlaceFile(processCtx, mount.Source.ObjectStore, workDir, mount.Path, logger)
+			if err != nil {
+				errMsg := fmt.Sprintf("Failed to process mount %s for job: %v", mount.Path, err)
+				logger.Error(errMsg, "source_object", mount.Source.ObjectStore)
+				return nil, fmt.Errorf("failed to process mount %s for job: %w", mount.Path, err)
+			}
+			absMountPath := filepath.Join(workDir, filepath.Clean(mount.Path))
+			mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{Path: mount.Path, Source: mount.Source.ObjectStore, ResolvedAbs: absMountPath})
+		}
+	}
+	logger.Info("File mounts processed successfully for job", "count", len(spec.Mounts))
+
+	// User and Group ID resolution (same as startAppInstance)
+	var targetUID, targetGID uint32
+	var targetHomeDir string
+	currentUser, _ := user.Current()
+	if spec.User != "" {
+		var err error
+		targetUID, targetGID, targetHomeDir, err = lookupUser(spec.User)
+		if err != nil {
+			return nil, fmt.Errorf("failed to lookup user '%s' for job: %w", spec.User, err)
+		}
+	} else {
+		uid64, _ := strconv.ParseUint(currentUser.Uid, 10, 32)
+		gid64, _ := strconv.ParseUint(currentUser.Gid, 10, 32)
+		targetUID = uint32(uid64)
+		targetGID = uint32(gid64)
+		targetHomeDir = currentUser.HomeDir
+	}
+
+	// Prepare Environment Variables
+	resolvedAppEnv := make([]EnvVar, len(spec.Env))
+	for i, envVar := range spec.Env {
+		resolvedAppEnv[i] = envVar
+		if envVar.ValueFromSecret != "" {
+			val, err := nr.resolveSecret(processCtx, envVar.ValueFromSecret, logger)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve secret '%s' for job: %w", envVar.ValueFromSecret, err)
+			}
+			resolvedAppEnv[i].Value = val
+		} else {
+			resolvedAppEnv[i].Value = envVar.Value
+		}
+	}
+	baseOsEnv := os.Environ()
+	launcherTargetEnv := flattenEnv(baseOsEnv, spec.User, targetHomeDir, resolvedAppEnv)
+	launcherTargetEnv = append(launcherTargetEnv,
+		fmt.Sprintf("NARUN_APP_NAME=%s", appName),
+		fmt.Sprintf("NARUN_INSTANCE_ID=%s", jobSpecificInstanceID), // Use the job-specific ID
+		fmt.Sprintf("NARUN_RUN_ID=%s", runID),
+		fmt.Sprintf("NARUN_REPLICA_INDEX=%d", -1), // Not applicable for cron jobs
+		fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID),
+		fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir),
+		fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS),
+		fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch),
+		fmt.Sprintf("NARUN_JOB_ATTEMPT=%d", attemptNumber),
+		fmt.Sprintf("NARUN_JOB_SCHEDULED_TIME=%s", scheduledTime.Format(time.RFC3339Nano)),
+	)
+
+	selfPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get node-runner exec path for job: %w", err)
+	}
+	landlockConfigJSON, _ := json.Marshal(spec.Landlock)
+	targetArgsJSON, _ := json.Marshal(spec.Args)
+	mountInfosJSON, _ := json.Marshal(mountInfosForEnv)
+	envForLauncher := slices.Clone(launcherTargetEnv)
+	envForLauncher = append(envForLauncher,
+		fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)),
+		fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath),
+		fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)),
+		fmt.Sprintf("%s=%s", envLandlockMountInfosJSON, string(mountInfosJSON)),
+		fmt.Sprintf("%s=%s", envLandlockInstanceRoot, workDir),
+	)
+
+	// Cgroup Setup
+	var cgroupPath string
+	var cgroupFd int = -1
+	var cgroupCleanupFunc func() error
+	if nr.usesCgroupsForResourceLimits(spec) {
+		var cgErr error
+		// Use jobSpecificInstanceID for cgroup name to ensure uniqueness
+		cgroupPath, cgroupFd, cgroupCleanupFunc, cgErr = nr.createCgroup(spec, jobSpecificInstanceID, logger)
+		if cgErr != nil {
+			return nil, fmt.Errorf("failed to create cgroup for job: %w", cgErr)
+		}
+		defer func() { // Ensure cgroup is cleaned up if start fails *after* its creation
+			if returnedErr != nil && cgroupCleanupFunc != nil {
+				logger.Warn("Cleaning up cgroup due to job start failure", "error", returnedErr)
+				if err := cgroupCleanupFunc(); err != nil {
+					logger.Error("Error during cgroup cleanup on job start failure", "cgroup_path", cgroupPath, "error", err)
+				}
+			}
+		}()
+		if err := nr.applyCgroupConstraints(spec, cgroupPath, logger); err != nil {
+			return nil, fmt.Errorf("failed to apply cgroup constraints for job: %w", err)
+		}
+	}
+
+	// Command Assembly (same logic as startAppInstance)
+	var cmd *exec.Cmd
+	var finalExecCommandParts []string
+	landlockLauncherCmd := selfPath
+	landlockLauncherArgs := []string{internalLaunchFlag}
+	useNamespacingOrCgroups := nr.usesNamespacing(spec) || nr.usesCgroupsForResourceLimits(spec)
+
+	if useNamespacingOrCgroups && runtime.GOOS == "linux" {
+		var commandBuilder []string
+		if spec.NetworkNamespacePath != "" {
+			commandBuilder = append(commandBuilder, "nsenter", "--no-fork", fmt.Sprintf("--net=%s", spec.NetworkNamespacePath), "--")
+		}
+		unshareCmd := "unshare"
+		unshareArgsList := []string{"--ipc", "--pid", "--mount-proc", "--fork", "--kill-child=SIGKILL", "--setuid", strconv.Itoa(int(targetUID)), "--setgid", strconv.Itoa(int(targetGID)), "--"}
+		commandBuilder = append(commandBuilder, unshareCmd)
+		commandBuilder = append(commandBuilder, unshareArgsList...)
+		commandBuilder = append(commandBuilder, landlockLauncherCmd)
+		commandBuilder = append(commandBuilder, landlockLauncherArgs...)
+		finalExecCommandParts = commandBuilder
+	} else {
+		if spec.Mode == "landlock" {
+			finalExecCommandParts = append([]string{landlockLauncherCmd}, landlockLauncherArgs...)
+		} else {
+			finalExecCommandParts = append([]string{binaryPath}, spec.Args...)
+			envForLauncher = launcherTargetEnv
+		}
+	}
+
+	logger.Info("Final command to execute for job", "parts", finalExecCommandParts)
+	cmd = exec.CommandContext(processCtx, finalExecCommandParts[0], finalExecCommandParts[1:]...)
+	cmd.Env = envForLauncher
+	cmd.Dir = workDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cgroupFd != -1 && nr.usesCgroupsForResourceLimits(spec) {
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = cgroupFd
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stdout pipe for job: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stderr pipe for job: %w", err)
+	}
+
+	appInstance := &ManagedApp{
+		InstanceID:    jobSpecificInstanceID, // Use the unique ID for this job run
+		RunID:         runID,
+		Spec:          spec, // Store the original spec for reference in monitorJobInstance
+		Cmd:           cmd,
+		Status:        StatusStarting, // Job-specific status, or reuse existing if applicable
+		ConfigHash:    "",             // Not directly applicable like for versioned services
+		BinaryPath:    binaryPath,
+		StdoutPipe:    stdoutPipe,
+		StderrPipe:    stderrPipe,
+		StopSignal:    make(chan struct{}), // Could be used for timeout implementation
+		processCtx:    processCtx,
+		processCancel: processCancel, // Crucial for timeout and cleanup
+		restartCount:  0,             // Not used for retries in the same way; job retries create new instances
+		cgroupPath:    cgroupPath,
+		cgroupFd:      cgroupFd,
+		cgroupCleanup: cgroupCleanupFunc,
+	}
+
+	logger.Info("Starting job process execution", "command", cmd.Path, "args", cmd.Args)
+	if startErr := cmd.Start(); startErr != nil {
+		// returnedErr will be set by the defer for cgroup and workDir cleanup
+		return nil, fmt.Errorf("failed to start job %s (run %s): %w", appName, runID, startErr)
+	}
+
+	appInstance.Pid = cmd.Process.Pid
+	appInstance.StartTime = time.Now() // Actual start time of this attempt
+	appInstance.Status = StatusRunning  // Mark as running
+	logger.Info("Job process started successfully", "pid", appInstance.Pid)
+
+	// Initialize metrics for this job run
+	// Note: InstanceID for metrics will be jobSpecificInstanceID
+	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, jobSpecificInstanceID, nr.nodeID, runID).Set(1)
+	metrics.NarunNodeRunnerInstanceInfo.WithLabelValues(appName, jobSpecificInstanceID, nr.nodeID, runID, spec.Tag, spec.Mode, binaryPath).Set(1)
+	// Other metrics (CPU, Mem, ExitCode) will be set by monitorJobInstance or doPollMemory
+
+	appInstance.LogWg.Add(2)
+	go nr.forwardLogs(appInstance, appInstance.StdoutPipe, "stdout", logger)
+	go nr.forwardLogs(appInstance, appInstance.StderrPipe, "stderr", logger)
+
+	// Start the job monitor
+	go nr.monitorJobInstance(appInstance, spec, runID, attemptNumber, scheduledTime)
+
+	return appInstance, nil // Success
+}
+
+// monitorJobInstance waits for a cron job instance to exit, records its execution, and handles retries.
+func (nr *NodeRunner) monitorJobInstance(appInstance *ManagedApp, spec *ServiceSpec, runID string, currentAttempt int, scheduledTime time.Time) {
+	instanceID := appInstance.InstanceID // This is jobSpecificInstanceID like appName-cronjob-runID
+	appName := spec.Name                 // The actual app name from spec
+	logger := nr.logger.With("app", appName, "instance_id", instanceID, "run_id", runID, "attempt", currentAttempt)
+
+	// Start periodic memory polling goroutine if on Linux
+	if runtime.GOOS == "linux" && appInstance.Pid > 0 {
+		appInstance.LogWg.Add(1)
+		go func() {
+			defer appInstance.LogWg.Done()
+			pollTicker := time.NewTicker(5 * time.Second)
+			defer pollTicker.Stop()
+			logger.Debug("Starting periodic memory metric poller for job process")
+			for {
+				select {
+				case <-pollTicker.C:
+					if appInstance.Status == StatusRunning && appInstance.Pid > 0 {
+						nr.doPollMemoryAndUpdateMetric(appInstance, logger)
+					}
+				case <-appInstance.processCtx.Done():
+					logger.Debug("Stopping periodic memory metric poller for job due to process context done")
+					return
+				}
+			}
+		}()
+	}
+
+	defer func() {
+		// This defer block handles cleanup after the job process (and any retries spawned from here) are done.
+		appInstance.processCancel() // Cancel context for this specific job run/attempt
+		appInstance.LogWg.Wait()    // Wait for log forwarders and memory poller
+
+		if appInstance.cgroupCleanup != nil {
+			logger.Info("Cleaning up cgroup for job instance", "path", appInstance.cgroupPath)
+			if err := appInstance.cgroupCleanup(); err != nil {
+				logger.Error("Error during cgroup cleanup for job", "cgroup_path", appInstance.cgroupPath, "error", err)
+			}
+		}
+
+		// Cleanup the job's specific working directory
+		jobWorkDir := filepath.Join(nr.dataDir, "instances", instanceID) // instanceID is jobSpecificInstanceID
+		logger.Info("Cleaning up job instance work directory", "dir", jobWorkDir)
+		if err := os.RemoveAll(jobWorkDir); err != nil {
+			logger.Error("Failed to remove job instance work directory", "dir", jobWorkDir, "error", err)
+		}
+
+		// Finalize metrics for this specific job run/instance
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
+		// Other metrics like CPU/Mem usage are set within wait block or poller
+		logger.Debug("Job instance monitoring and cleanup finished for this attempt.")
+	}()
+
+	logger.Info("Monitoring job process instance", "pid", appInstance.Pid)
+	waitErr := appInstance.Cmd.Wait() // Wait for the process to exit
+
+	// Record execution details
+	record := &CronJobExecutionRecord{
+		AppName:           appName,
+		RunID:             runID, // This is the RunID for the current attempt
+		CronSchedule:      spec.CronSchedule,
+		RequestedTime:     scheduledTime,
+		StartTime:         appInstance.StartTime, // Set in startJobInstance
+		EndTime:           time.Now(),
+		JobMaxRetries:     spec.JobMaxRetries,
+		RetriesAttempted:  currentAttempt,
+		JobTimeoutSeconds: spec.JobTimeoutSeconds,
+		NodeID:            nr.nodeID,
+	}
+
+	exitCode := -1
+	errMsg := ""
+
+	// Check for timeout first
+	if appInstance.processCtx.Err() == context.DeadlineExceeded {
+		logger.Warn("Job instance timed out", "timeout_seconds", spec.JobTimeoutSeconds)
+		record.Status = "timeout"
+		errMsg = fmt.Sprintf("Job exceeded timeout of %d seconds", spec.JobTimeoutSeconds)
+		// Try to kill the process if timeout occurred, Cmd.Wait() might return an error or nil
+		if appInstance.Cmd.Process != nil {
+			if err := nr.stopAppInstance(appInstance, true); err != nil { // Use stopAppInstance for graceful then forceful kill
+				logger.Error("Failed to stop timed-out job instance", "error", err)
+			}
+		}
+	} else if waitErr != nil {
+		errMsg = waitErr.Error()
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			record.ExitCode = exitCode
+			// Check for landlock launcher specific errors
+			isLauncherFailure := false
+			if spec.Mode == "landlock" && strings.HasSuffix(appInstance.Cmd.Path, "node-runner") {
+				switch exitCode {
+				case landlockLauncherErrCode, landlockUnsupportedErrCode, landlockLockFailedErrCode, landlockTargetExecFailedCode:
+					isLauncherFailure = true
+				}
+			}
+
+			if isLauncherFailure {
+				logger.Error("Job landlock launcher failed", "exit_code", exitCode, "error", errMsg)
+				record.Status = "launcher_failure" // More specific than generic failure
+			} else if status, okSys := exitErr.Sys().(syscall.WaitStatus); okSys && status.Signaled() {
+				sig := status.Signal()
+				logger.Warn("Job process killed by signal", "pid", appInstance.Pid, "signal", sig)
+				record.Status = "failure" // Or "signaled"
+				errMsg = fmt.Sprintf("Job process killed by signal: %s. %s", sig.String(), errMsg)
+			} else {
+				logger.Warn("Job process exited non-zero", "pid", appInstance.Pid, "exit_code", exitCode)
+				record.Status = "failure"
+			}
+		} else {
+			logger.Error("Job process wait failed with unexpected error", "error", waitErr)
+			record.Status = "failure" // Generic failure
+			errMsg = fmt.Sprintf("Unexpected wait error: %s", waitErr.Error())
+		}
+	} else { // No error from Wait()
+		exitCode = 0
+		record.ExitCode = 0
+		record.Status = "success"
+		logger.Info("Job process exited cleanly", "pid", appInstance.Pid)
+	}
+	record.ErrorMessage = errMsg
+	metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(float64(exitCode))
+
+	// Handle Rusage for metrics
+	if appInstance.Cmd.ProcessState != nil {
+		if rusage, ok := appInstance.Cmd.ProcessState.SysUsage().(*syscall.Rusage); ok && rusage != nil {
+			var rssBytes float64
+			if nr.localOS == "linux" {
+				rssBytes = float64(rusage.Maxrss * 1024)
+			} else if nr.localOS == "darwin" {
+				rssBytes = float64(rusage.Maxrss)
+			}
+			metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(rssBytes)
+			metrics.NarunNodeRunnerInstanceCPUUserSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(metrics.TimevalToSeconds(rusage.Utime))
+			metrics.NarunNodeRunnerInstanceCPUSystemSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(metrics.TimevalToSeconds(rusage.Stime))
+		}
+	}
+
+	// Retry Logic
+	// Retry only on "failure" (not "timeout", "launcher_failure", or "success")
+	if record.Status == "failure" && currentAttempt < spec.JobMaxRetries {
+		logger.Warn("Job failed, attempting retry", "retry_delay", RestartDelay)
+		record.Status = "retrying" // Update status before storing for this attempt
+		nr.storeCronJobExecutionRecord(record)
+
+		// Wait for RestartDelay, but be cancellable by global shutdown
+		retryTimer := time.NewTimer(RestartDelay)
+		select {
+		case <-retryTimer.C:
+			// Continue to retry
+		case <-nr.globalCtx.Done():
+			logger.Info("Retry canceled due to runner shutdown.", "app", appName, "run_id", runID)
+			retryTimer.Stop()
+			// Store a final record indicating retrying was cut short by shutdown
+			record.Status = "retrying_aborted_shutdown"
+			record.EndTime = time.Now()
+			record.ErrorMessage = "Retry aborted due to node runner shutdown."
+			nr.storeCronJobExecutionRecord(record)
+			return
+		}
+
+		// For retry, generate a new RunID for the next attempt's execution environment and logs
+		nextRunID := GenerateJobInstanceID(appName, fmt.Sprintf("%s-retry%d", runID, currentAttempt+1))
+		logger.Info("Executing retry for job", "next_run_id_for_env", nextRunID, "next_attempt_num", currentAttempt+1)
+
+		// Use nr.globalCtx as the base context for the next attempt. Timeout will be re-applied within startJobInstance.
+		// The scheduledTime remains the original one for tracking purposes.
+		_, err := nr.startJobInstance(nr.globalCtx, spec, nextRunID, currentAttempt+1, scheduledTime)
+		if err != nil {
+			// If starting the retry fails immediately
+			logger.Error("Failed to start retry job instance", "error", err)
+			// Store a final record for the *original* runID indicating retry attempt failed to start
+			finalFailRecord := &CronJobExecutionRecord{
+				AppName:           appName,
+				RunID:             runID, // Original RunID this monitor was for
+				CronSchedule:      spec.CronSchedule,
+				RequestedTime:     scheduledTime,
+				StartTime:         record.StartTime, // From the attempt that just failed
+				EndTime:           time.Now(),
+				Status:            "failure_to_retry",
+				ExitCode:          exitCode, // From the attempt that just failed
+				JobMaxRetries:     spec.JobMaxRetries,
+				RetriesAttempted:  currentAttempt + 1, // This was the attempt number for the failed retry
+				JobTimeoutSeconds: spec.JobTimeoutSeconds,
+				ErrorMessage:      fmt.Sprintf("Attempt %d: Original failure: '%s'. Failed to start retry attempt: %v", currentAttempt, record.ErrorMessage, err),
+				NodeID:            nr.nodeID,
+			}
+			nr.storeCronJobExecutionRecord(finalFailRecord)
+		}
+		// If retry start succeeds, a new monitorJobInstance will take over for that new run.
+		// This current monitorJobInstance has completed its work for *this* attempt.
+	} else {
+		// Not retrying (success, timeout, launcher_failure, or max retries reached)
+		if record.Status == "failure" && currentAttempt >= spec.JobMaxRetries {
+			logger.Warn("Job failed and max retries reached.", "max_retries", spec.JobMaxRetries)
+			record.ErrorMessage = fmt.Sprintf("Job failed after %d attempts. Final error: %s", currentAttempt+1, record.ErrorMessage)
+		}
+		nr.storeCronJobExecutionRecord(record)
+		logger.Info("Final job execution record stored.", "final_status", record.Status)
+	}
+}
+
+// storeCronJobExecutionRecord stores the job's execution record in the KV store
+// and performs basic history pruning.
+func (nr *NodeRunner) storeCronJobExecutionRecord(record *CronJobExecutionRecord) {
+	logger := nr.logger.With("app", record.AppName, "run_id", record.RunID, "status", record.Status)
+	kvStore := nr.kvCronHistory // Assume this is initialized in NewNodeRunner
+
+	if kvStore == nil {
+		logger.Error("Cron job history KV store is not initialized. Cannot store record.")
+		return
+	}
+
+	recordData, err := json.Marshal(record)
+	if err != nil {
+		logger.Error("Failed to marshal cron job execution record", "error", err)
+		return
+	}
+
+	// Key: appName:startTimeRFC3339Nano:runID
+	// Using StartTime from the record, which is when the first attempt of this logical job run started.
+	// If it's a retry, StartTime would be from the first attempt.
+	// Using record.EndTime for sorting might be better if we want to prune based on completion time.
+	// Let's use RequestedTime for the key as it's fixed for all attempts of a scheduled run.
+	keyTimestamp := record.RequestedTime.Format(time.RFC3339Nano)
+	kvKey := fmt.Sprintf("%s:%s:%s", record.AppName, keyTimestamp, record.RunID)
+
+	putCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = kvStore.Put(putCtx, kvKey, recordData)
+	if err != nil {
+		logger.Error("Failed to store cron job execution record in KV", "key", kvKey, "error", err)
+		return
+	}
+	logger.Info("Cron job execution record stored successfully", "key", kvKey)
+
+	// Pruning logic
+	const maxHistoryRecords = 20 // Keep last 20 records per app
+	listCtx, listCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer listCancel()
+
+	keysLister, err := kvStore.ListKeys(listCtx, jetstream.ListKeysWithPrefix(record.AppName+":"))
+	if err != nil {
+		logger.Error("Failed to list keys for cron history pruning", "appName", record.AppName, "error", err)
+		return
+	}
+
+	var recordKeys []string
+	for keyEntry := range keysLister.Keys() {
+		if keyEntry == "" { // Should not happen with valid prefix
+			continue
+		}
+		recordKeys = append(recordKeys, keyEntry)
+	}
+	if keysLister.Error() != nil {
+		logger.Error("Error iterating cron history keys for pruning", "appName", record.AppName, "error", keysLister.Error())
+		return
+	}
+
+	if len(recordKeys) > maxHistoryRecords {
+		// Sort keys chronologically (oldest first). Keys are appName:timestamp:runID
+		// Default string sort should work if timestamps are RFC3339Nano.
+		slices.Sort(recordKeys) // Sorts lexicographically, which is chronological for RFC3339Nano
+
+		keysToDelete := recordKeys[:len(recordKeys)-maxHistoryRecords]
+		logger.Info("Pruning cron job history", "appName", record.AppName, "total_records", len(recordKeys), "to_delete_count", len(keysToDelete))
+
+		for _, keyToDel := range keysToDelete {
+			delCtx, delCan := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := kvStore.Delete(delCtx, keyToDel); err != nil {
+				logger.Warn("Failed to delete old cron job record during pruning", "key", keyToDel, "error", err)
+			} else {
+				logger.Debug("Successfully pruned old cron job record", "key", keyToDel)
+			}
+			delCan()
+		}
 	}
 }

@@ -41,6 +41,24 @@ type logEntry struct {
 	Timestamp  time.Time `json:"timestamp"`
 }
 
+// CronJobExecutionRecord is a local representation for unmarshalling cron job history from KV.
+// This should be kept in sync with internal/noderunner/process.go#CronJobExecutionRecord
+type CronJobExecutionRecord struct {
+	AppName           string    `json:"appName"`
+	RunID             string    `json:"runID"`
+	CronSchedule      string    `json:"cronSchedule"`
+	RequestedTime     time.Time `json:"requestedTime"`
+	StartTime         time.Time `json:"startTime"`
+	EndTime           time.Time `json:"endTime"`
+	Status            string    `json:"status"`
+	ExitCode          int       `json:"exitCode"`
+	JobMaxRetries     int       `json:"jobMaxRetries"`
+	RetriesAttempted  int       `json:"retriesAttempted"`
+	JobTimeoutSeconds int       `json:"jobTimeoutSeconds"`
+	ErrorMessage      string    `json:"errorMessage,omitempty"`
+	NodeID            string    `json:"nodeID"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -137,8 +155,12 @@ func printDeployUsage() {
 	deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	deployFlags.String("name", "", "Application name (required if -config is not used)")
 	deployFlags.String("tag", "", "Binary tag (required if -config is not used)")
-	deployFlags.String("node", "local", "Target node name (used if -config is not used)")
-	deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
+	deployFlags.String("node", "local", "Target node name (used if -config is not used, for service mode)")
+	deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used, for service mode)")
+	deployFlags.String("runMode", "service", "Run mode: 'service' or 'cron' (used if -config is not used)")
+	deployFlags.String("cronSchedule", "", "Cron schedule (e.g., '@every 5m', '0 * * * *') (used for cron mode if -config is not used)")
+	deployFlags.Int("jobMaxRetries", 0, "Max retries for a failed cron job (used for cron mode if -config is not used)")
+	deployFlags.Int("jobTimeoutSeconds", 0, "Timeout in seconds for a cron job execution (0 for no timeout) (used for cron mode if -config is not used)")
 	fmt.Fprintf(os.Stderr, `Usage: %s deploy [options] <binary_path> [<binary_path>...]
 
 Uploads application binaries and configuration.
@@ -149,7 +171,8 @@ Arguments:
 Options:
 `, os.Args[0])
 	deployFlags.PrintDefaults()
-	fmt.Fprintln(os.Stderr, "\nNote: If -config is provided, the -name, -tag, -node, and -replicas flags are ignored.")
+	fmt.Fprintln(os.Stderr, "\nNote: If -config is provided, flags other than -nats and -timeout are ignored.")
+	fmt.Fprintln(os.Stderr, "Cron-specific flags (-cronSchedule, -jobMaxRetries, -jobTimeoutSeconds) are used when -runMode=cron and -config is not provided.")
 }
 
 // --- Service Command Handling ---
@@ -200,7 +223,8 @@ Use "%s service <subcommand> -h" for subcommand-specific help.
 func printServiceListUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: %s service list [options]
 
-Lists deployed services and their status on nodes.
+Lists deployed services and their status on nodes. Shows whether a service is
+configured to run as a standard 'service' or as a 'cron' job.
 
 Options:
   -nats <url>     NATS server URL (default: %s)
@@ -212,6 +236,7 @@ func printServiceInfoUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: %s service info [options] <service_name>
 
 Displays detailed information and status for a specific service.
+If the service is a cron job, its recent execution history will also be displayed.
 
 Arguments:
   <service_name>  Name of the service to inspect (required).
@@ -245,9 +270,13 @@ func handleDeployCmd(args []string) {
 	configFile := deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional). If provided, overrides -name, -tag, -node, -replicas.")
 	timeout := deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	appNameFlag := deployFlags.String("name", "", "Application name (required if -config is not used)")
-	tagFlag := deployFlags.String("tag", "", "Binary tag tag (required if -config is not used)")
-	nodeFlag := deployFlags.String("node", "local", "Target node name (used if -config is not used)")
-	replicasFlag := deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used)")
+	tagFlag := deployFlags.String("tag", "", "Binary tag (required if -config is not used)")
+	nodeFlag := deployFlags.String("node", "local", "Target node name (used if -config is not used, for service mode)")
+	replicasFlag := deployFlags.Int("replicas", 1, "Number of replicas on the target node (used if -config is not used, for service mode)")
+	runModeFlag := deployFlags.String("runMode", "service", "Run mode: 'service' or 'cron' (used if -config is not used)")
+	cronScheduleFlag := deployFlags.String("cronSchedule", "", "Cron schedule (e.g., '@every 5m', '0 * * * *') (used for cron mode if -config is not used)")
+	jobMaxRetriesFlag := deployFlags.Int("jobMaxRetries", 0, "Max retries for a failed cron job (used for cron mode if -config is not used)")
+	jobTimeoutSecondsFlag := deployFlags.Int("jobTimeoutSeconds", 0, "Timeout in seconds for a cron job execution (0 for no timeout) (used for cron mode if -config is not used)")
 
 	deployFlags.Usage = printDeployUsage // Use the specific usage function
 
@@ -323,19 +352,51 @@ func handleDeployCmd(args []string) {
 			deployFlags.Usage()
 			os.Exit(1)
 		}
+		if *runModeFlag != "service" && *runModeFlag != "cron" {
+			slog.Error("Deploy Error: -runMode must be 'service' or 'cron'.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
+		if *runModeFlag == "cron" && *cronScheduleFlag == "" {
+			slog.Error("Deploy Error: -cronSchedule is required when -runMode=cron.")
+			deployFlags.Usage()
+			os.Exit(1)
+		}
 
 		spec = noderunner.ServiceSpec{
-			Name: *appNameFlag,
-			Tag:  *tagFlag,
-			Nodes: []noderunner.NodeSelectorSpec{
+			Name:    *appNameFlag,
+			Tag:     *tagFlag,
+			RunMode: *runModeFlag,
+		}
+
+		if *runModeFlag == "service" {
+			spec.Nodes = []noderunner.NodeSelectorSpec{
 				{
 					Name:     *nodeFlag,
 					Replicas: *replicasFlag,
 				},
-			},
+			}
+			slog.Info("Deploying Generated ServiceSpec (service mode)",
+				"app_name", spec.Name, "tag", spec.Tag, "run_mode", spec.RunMode,
+				"target_node", spec.Nodes[0].Name, "replicas", spec.Nodes[0].Replicas)
+		} else { // cron mode
+			spec.CronSchedule = *cronScheduleFlag
+			spec.JobMaxRetries = *jobMaxRetriesFlag
+			spec.JobTimeoutSeconds = *jobTimeoutSecondsFlag
+			// For cron jobs, spec.Nodes might be empty or less critical.
+			// If a node is specified, it could mean the cron job's tasks are restricted to that node.
+			// For now, if nodeFlag is default "local" and it's cron, don't add to spec.Nodes.
+			// If nodeFlag is explicitly set for cron, then add it.
+			if *nodeFlag != "local" || *replicasFlag != 1 { // If node/replicas were explicitly changed from defaults for cron
+				slog.Warn("For cron mode, -node and -replicas are typically not used to define where the cron *scheduler* runs, but can restrict where *triggered jobs* run if supported by the runner. Currently, cron jobs are node-agnostic in terms of scheduling by `narun` itself.")
+				// If we want to allow specifying target nodes for cron *tasks* (not the scheduler itself)
+				// spec.Nodes = []noderunner.NodeSelectorSpec{{Name: *nodeFlag, Replicas: 1}} // Replicas for cron task usually 1
+			}
+			slog.Info("Deploying Generated ServiceSpec (cron mode)",
+				"app_name", spec.Name, "tag", spec.Tag, "run_mode", spec.RunMode,
+				"cron_schedule", spec.CronSchedule, "max_retries", spec.JobMaxRetries, "timeout_sec", spec.JobTimeoutSeconds)
 		}
-		slog.Info("Deploying Generated ServiceSpec",
-			"app_name", spec.Name, "tag", spec.Tag, "target_node", spec.Nodes[0].Name, "replicas", spec.Nodes[0].Replicas)
+
 		configData, err = yaml.Marshal(spec)
 		if err != nil {
 			slog.Error("Deploy Error: failed to marshal generated ServiceSpec", "error", err)
@@ -729,9 +790,9 @@ func handleServiceListCmd(args []string) {
 		}
 	}
 
-	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 1, ' ', 0) // Adjusted padding
-	fmt.Fprintln(tw, "SERVICE\tTAG\tNODE\tNODE STATUS\tNODE PLATFORM\tDESIRED\tRUNNING\tINSTANCE IDS")
-	fmt.Fprintln(tw, "-------\t---\t----\t-----------\t-------------\t-------\t-------\t------------")
+	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 1, ' ', 0)
+	fmt.Fprintln(tw, "SERVICE\tTAG\tMODE\tCRON SCHEDULE\tNODE\tNODE STATUS\tNODE PLATFORM\tDESIRED\tRUNNING\tINSTANCE IDS")
+	fmt.Fprintln(tw, "-------\t---\t----\t-------------\t----\t-----------\t-------------\t-------\t-------\t------------")
 
 	appNames := make([]string, 0, len(appConfigs))
 	for name := range appConfigs {
@@ -744,76 +805,95 @@ func handleServiceListCmd(args []string) {
 	} else {
 		for _, appName := range appNames {
 			spec := appConfigs[appName]
-			nodesTargetedBySpec := make(map[string]noderunner.NodeSelectorSpec)
-			for _, ns := range spec.Nodes {
-				nodesTargetedBySpec[ns.Name] = ns
+			runMode := "Service"
+			if spec.RunMode == "cron" {
+				runMode = "Cron"
+			}
+			cronScheduleDisplay := "-"
+			if runMode == "Cron" {
+				cronScheduleDisplay = spec.CronSchedule
 			}
 
-			// Track nodes that have run this app to avoid listing them multiple times if app spec.Nodes is empty
-			nodesProcessedForApp := make(map[string]bool)
+			if runMode == "Cron" {
+				// For cron jobs, display a single summary line. Node-specific details are less relevant for the 'list' view.
+				// Actual job instances are transient and their history is in 'service info'.
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					appName, spec.Tag, runMode, cronScheduleDisplay, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A (see info)")
+			} else { // Service mode
+				nodesTargetedBySpec := make(map[string]noderunner.NodeSelectorSpec)
+				for _, ns := range spec.Nodes {
+					nodesTargetedBySpec[ns.Name] = ns
+				}
+				nodesProcessedForApp := make(map[string]bool)
 
-			// Iterate through nodes defined in the spec first
-			for _, nodeSpec := range spec.Nodes {
-				nodeID := nodeSpec.Name
-				desiredReplicas := nodeSpec.Replicas
-				nodeInfo, nodeFound := nodeStates[nodeID]
-				nodeStatus := "offline/unknown"
-				nodePlatform := "-/-"
-				runningInstanceIDs := make([]string, 0)
-				runningCount := 0
+				if len(spec.Nodes) > 0 {
+					for _, nodeSpec := range spec.Nodes {
+						nodeID := nodeSpec.Name
+						desiredReplicas := nodeSpec.Replicas
+						nodeInfo, nodeFound := nodeStates[nodeID]
+						nodeStatus := "offline/unknown"
+						nodePlatform := "-/-"
+						runningInstanceIDs := make([]string, 0)
+						runningCount := 0
 
-				if nodeFound {
-					nodeStatus = nodeInfo.Status
-					nodePlatform = fmt.Sprintf("%s/%s", nodeInfo.OS, nodeInfo.Arch)
+						if nodeFound {
+							nodeStatus = nodeInfo.Status
+							nodePlatform = fmt.Sprintf("%s/%s", nodeInfo.OS, nodeInfo.Arch)
+							for _, instanceID := range nodeInfo.ManagedInstances {
+								if noderunner.InstanceIDToAppName(instanceID) == appName {
+									runningInstanceIDs = append(runningInstanceIDs, instanceID)
+								}
+							}
+							runningCount = len(runningInstanceIDs)
+						}
+						instanceIDsStr := "[]"
+						if len(runningInstanceIDs) > 0 {
+							instanceIDsStr = strings.Join(runningInstanceIDs, ", ")
+						}
+						fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+							appName, spec.Tag, runMode, cronScheduleDisplay, nodeID, nodeStatus, nodePlatform, desiredReplicas, runningCount, instanceIDsStr)
+						nodesProcessedForApp[nodeID] = true
+					}
+				}
+
+				// Check for instances running on nodes NOT in the spec (orphaned state or spec updated) for service mode
+				for nodeID, nodeInfo := range nodeStates {
+					if nodesProcessedForApp[nodeID] {
+						continue
+					}
+					runningInstanceIDs := make([]string, 0)
 					for _, instanceID := range nodeInfo.ManagedInstances {
-						if noderunner.InstanceIDToAppName(instanceID) == appName {
+						// Only show if it's a service app instance (not a cron job's transient execution dir)
+						if noderunner.InstanceIDToAppName(instanceID) == appName && !strings.Contains(instanceID, "-cronjob-") {
 							runningInstanceIDs = append(runningInstanceIDs, instanceID)
 						}
 					}
-					runningCount = len(runningInstanceIDs)
-				}
-				instanceIDsStr := "[]"
-				if len(runningInstanceIDs) > 0 {
-					instanceIDsStr = strings.Join(runningInstanceIDs, ", ")
-				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
-					appName, spec.Tag, nodeID, nodeStatus, nodePlatform, desiredReplicas, runningCount, instanceIDsStr)
-				nodesProcessedForApp[nodeID] = true
-			}
-
-			// Check for instances running on nodes NOT in the spec (orphaned state or spec updated)
-			for nodeID, nodeInfo := range nodeStates {
-				if nodesProcessedForApp[nodeID] { // Already listed above
-					continue
-				}
-				runningInstanceIDs := make([]string, 0)
-				for _, instanceID := range nodeInfo.ManagedInstances {
-					if noderunner.InstanceIDToAppName(instanceID) == appName {
-						runningInstanceIDs = append(runningInstanceIDs, instanceID)
+					if len(runningInstanceIDs) > 0 {
+						nodeStatus := nodeInfo.Status
+						nodePlatform := fmt.Sprintf("%s/%s", nodeInfo.OS, nodeInfo.Arch)
+						instanceIDsStr := strings.Join(runningInstanceIDs, ", ")
+						fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+							appName, spec.Tag, runMode, cronScheduleDisplay, nodeID, nodeStatus, nodePlatform, "0 (not in spec)", len(runningInstanceIDs), instanceIDsStr)
 					}
 				}
-				if len(runningInstanceIDs) > 0 { // App is running on this node but node not in spec
-					nodeStatus := nodeInfo.Status
-					nodePlatform := fmt.Sprintf("%s/%s", nodeInfo.OS, nodeInfo.Arch)
-					instanceIDsStr := strings.Join(runningInstanceIDs, ", ")
-					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-						appName, spec.Tag, nodeID, nodeStatus, nodePlatform, "0 (not in spec)", len(runningInstanceIDs), instanceIDsStr)
+				if len(spec.Nodes) == 0 && !isAppRunningAnywhere(appName, nodeStates, "service") {
+					fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t-\t-\t-\t0\t0\t[]\n", appName, spec.Tag, runMode, cronScheduleDisplay)
 				}
-			}
-			if len(spec.Nodes) == 0 && !isAppRunningAnywhere(appName, nodeStates) {
-				// App is configured but targets no nodes and is not running anywhere
-				fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t0\t0\t[]\n", appName, spec.Tag)
 			}
 		}
 	}
 	tw.Flush()
 }
 
-func isAppRunningAnywhere(appName string, nodeStates map[string]noderunner.NodeState) bool {
+func isAppRunningAnywhere(appName string, nodeStates map[string]noderunner.NodeState, mode string) bool {
 	for _, state := range nodeStates {
 		for _, instanceID := range state.ManagedInstances {
 			if noderunner.InstanceIDToAppName(instanceID) == appName {
-				return true
+				if mode == "service" && !strings.Contains(instanceID, "-cronjob-") {
+					return true
+				}
+				// For cron, "running" means the config exists, not that a job is active.
+				// Active cron job instances are not tracked by this function's original intent for services.
 			}
 		}
 	}
@@ -980,6 +1060,91 @@ func handleServiceInfoCmd(args []string) {
 		fmt.Println("(No orphaned instances found)")
 	}
 	fmt.Println()
+
+	// Display Cron Job History if applicable
+	if spec.RunMode == "cron" {
+		fmt.Println("--- Cron Job Execution History (Last 10) ---")
+		kvCronHistory, err := js.KeyValue(ctx, noderunner.CronJobHistoryKVBucket)
+		if err != nil {
+			slog.Error("Could not access Cron Job History KV", "bucket", noderunner.CronJobHistoryKVBucket, "error", err)
+		} else {
+			keysLister, err := kvCronHistory.ListKeys(ctx, jetstream.ListKeysWithPrefix(appName+":"))
+			if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
+				slog.Error("Failed to list cron history keys", "appName", appName, "error", err)
+			} else if errors.Is(err, jetstream.ErrNoKeysFound) {
+				fmt.Println("(No execution history found)")
+			} else {
+				var historyKeys []string
+				for keyEntry := range keysLister.Keys() {
+					if keyEntry == "" {
+						continue
+					}
+					historyKeys = append(historyKeys, keyEntry)
+				}
+				if keysLister.Error() != nil {
+					slog.Error("Error iterating cron history keys", "appName", appName, "error", keysLister.Error())
+				}
+
+				// Sort keys: appName:requestedTimeRFC3339Nano:runID
+				// We want most recent first, so sort descending.
+				sort.Slice(historyKeys, func(i, j int) bool {
+					return historyKeys[i] > historyKeys[j] // Lexicographical sort on key works if timestamp is first after prefix
+				})
+
+				historyTw := tabwriter.NewWriter(os.Stdout, 0, 8, 1, ' ', 0)
+				fmt.Fprintln(historyTw, "RUN ID\tSCHEDULED AT\tSTARTED AT\tENDED AT\tSTATUS\tEXIT CODE\tATTEMPTS\tERROR")
+				fmt.Fprintln(historyTw, "------\t------------\t----------\t--------\t------\t---------\t--------\t-----")
+
+				displayCount := 0
+				const maxHistoryToDisplay = 10
+				for _, key := range historyKeys {
+					if displayCount >= maxHistoryToDisplay {
+						break
+					}
+					entryCtx, entryCancel := context.WithTimeout(ctx, 5*time.Second)
+					histEntry, err := kvCronHistory.Get(entryCtx, key)
+					entryCancel()
+					if err != nil {
+						slog.Warn("Failed to get cron history record", "key", key, "error", err)
+						continue
+					}
+					var record CronJobExecutionRecord
+					if err := json.Unmarshal(histEntry.Value(), &record); err != nil {
+						slog.Warn("Failed to unmarshal cron history record", "key", key, "error", err)
+						continue
+					}
+
+					errMsg := record.ErrorMessage
+					if len(errMsg) > 50 { // Truncate long errors
+						errMsg = errMsg[:47] + "..."
+					}
+					if errMsg == "" {
+						errMsg = "-"
+					}
+
+					fmt.Fprintf(historyTw, "%s\t%s\t%s\t%s\t%s\t%d\t%d/%d\t%s\n",
+						record.RunID,
+						record.RequestedTime.Format(time.RFC3339),
+						record.StartTime.Format(time.RFC3339),
+						record.EndTime.Format(time.RFC3339),
+						record.Status,
+						record.ExitCode,
+						record.RetriesAttempted, record.JobMaxRetries,
+						errMsg,
+					)
+					displayCount++
+				}
+				historyTw.Flush()
+				if len(historyKeys) > maxHistoryToDisplay {
+					fmt.Printf("(Showing last %d of %d records. Use NATS tools to view full history from bucket '%s'.)\n",
+						maxHistoryToDisplay, len(historyKeys), noderunner.CronJobHistoryKVBucket)
+				} else if len(historyKeys) == 0 {
+					fmt.Println("(No execution history found)")
+				}
+			}
+		}
+		fmt.Println()
+	}
 }
 
 // --- Renamed: handleServiceDeleteCmd (formerly handleAppDeleteCmd) ---

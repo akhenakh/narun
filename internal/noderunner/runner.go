@@ -21,6 +21,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/robfig/cron/v3"
 )
 
 var runnerVersion = "0.2.1-dev" // Incremented version
@@ -48,6 +49,10 @@ type NodeRunner struct {
 	shutdownWg    sync.WaitGroup
 	metricsAddr   string       // Address for Prometheus metrics endpoint
 	metricsServer *http.Server // HTTP server for metrics
+
+	// Cron scheduler
+	cronScheduler *cron.Cron
+	cronJobs      map[string]cron.EntryID // appName -> cron.EntryID
 }
 
 // NewNodeRunner creates and initializes a new NodeRunner.
@@ -177,29 +182,46 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr string
 	}
 	logger.Info("Bound to Object store", "bucket", AppBinariesOSBucket)
 
+	// Bind to Cron Job History KV Store
+	kvCronHistory, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
+		Bucket:      CronJobHistoryKVBucket,
+		Description: "Stores execution history of cron jobs.",
+		// TTL can be considered for very old history, but pruning is primary mechanism
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", CronJobHistoryKVBucket, err)
+	}
+	logger.Debug("Bound to Cron Job History KV store", "bucket", CronJobHistoryKVBucket)
+
 	gCtx, gCancel := context.WithCancel(context.Background())
 	runnerStartTime := time.Now()
 
 	runner := &NodeRunner{
-		nodeID:       nodeID,
-		nc:           nc,
-		js:           js,
-		kvAppConfigs: kvAppConfigs,
-		kvNodeStates: kvNodeStates,
-		kvSecrets:    kvSecrets, // Store handle
-		masterKey:    masterKey, // Store decoded key
-		fileStore:    fileStore, // Store handle for file store
-		appBinaries:  osBucket,
-		state:        NewAppStateManager(),
-		logger:       logger,
-		dataDir:      dataDirAbs,
-		version:      runnerVersion,
-		startTime:    runnerStartTime,
-		localOS:      localOS,   // Store detected OS
-		localArch:    localArch, //  Store detected Arch
-		metricsAddr:  metricsAddr,
-		globalCtx:    gCtx,
-		globalCancel: gCancel,
+		nodeID:        nodeID,
+		nc:            nc,
+		js:            js,
+		kvAppConfigs:  kvAppConfigs,
+		kvNodeStates:  kvNodeStates,
+		kvSecrets:     kvSecrets, // Store handle
+		kvCronHistory: kvCronHistory,
+		masterKey:     masterKey, // Store decoded key
+		fileStore:     fileStore, // Store handle for file store
+		appBinaries:   osBucket,
+		state:         NewAppStateManager(),
+		logger:        logger,
+		dataDir:       dataDirAbs,
+		version:       runnerVersion,
+		startTime:     runnerStartTime,
+		localOS:       localOS,   // Store detected OS
+		localArch:     localArch, //  Store detected Arch
+		metricsAddr:   metricsAddr,
+		globalCtx:     gCtx,
+		globalCancel:  gCancel,
+
+		// Initialize cron scheduler
+		cronScheduler: cron.New(cron.WithSeconds()),
+		cronJobs:      make(map[string]cron.EntryID),
 	}
 
 	return runner, nil
@@ -241,6 +263,10 @@ func (nr *NodeRunner) Run() error {
 	nr.shutdownWg.Add(1)
 	go nr.heartbeatLoop()
 	nr.logger.Info("Heartbeat loop started", "interval", NodeHeartbeatInterval)
+
+	// Start cron scheduler
+	nr.cronScheduler.Start()
+	nr.logger.Info("Cron scheduler started")
 
 	// Initial sync
 	syncCtx, syncCancel := context.WithTimeout(nr.globalCtx, 60*time.Second)
@@ -304,7 +330,18 @@ func (nr *NodeRunner) Run() error {
 		nr.logger.Warn("Failed to update node state to shutting_down", "error", err)
 	}
 
-	// Initiate shutdown of managed apps
+	// Stop the cron scheduler. This prevents new cron jobs from starting.
+	// Existing running cron jobs will continue until completion unless explicitly stopped.
+	nr.logger.Info("Stopping cron scheduler...")
+	cronStopCtx := nr.cronScheduler.Stop() // This returns a context that is done when the scheduler has stopped
+	select {
+	case <-cronStopCtx.Done():
+		nr.logger.Info("Cron scheduler stopped gracefully.")
+	case <-time.After(10 * time.Second): // Timeout for scheduler to stop
+		nr.logger.Warn("Cron scheduler stop timed out.")
+	}
+
+	// Initiate shutdown of managed apps (including any currently running cron job instances)
 	nr.shutdownAllAppInstances()
 
 	// Stop watcher (if not already stopped by goroutine exit)
@@ -594,111 +631,161 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		appInfo.spec = spec // Store the parsed spec
 		appInfo.configHash = newConfigHash
 
-		// Determine target replicas for *this* node
-		targetReplicas := spec.FindTargetReplicas(nr.nodeID)
-		currentReplicas := len(appInfo.instances)
-		logger.Info("Reconciling instances", "target", targetReplicas, "current", currentReplicas, "hash_changed", configHashChanged)
-
-		if configHashChanged {
-			logger.Info("Configuration hash changed, restarting all instances")
-			instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
-			nr.stopAllInstancesForApp(ctx, appInfo, logger) // This stops them
-			// Metrics are cleaned up by monitorAppInstance's defer logic after intentional stop or by explicit cleanup below
-			for _, inst := range instancesToCleanup {
-				// Explicitly cleanup metrics for instances stopped due to config change,
-				// as monitorAppInstance might not trigger full cleanup if intentionalStop is true.
-				nr.cleanupInstanceMetrics(inst)
+		if spec.RunMode == "cron" {
+			logger.Info("App configured to run as cron job", "schedule", spec.CronSchedule)
+			// Remove any existing cron job for this app
+			if oldEntryID, exists := nr.cronJobs[appName]; exists {
+				nr.cronScheduler.Remove(oldEntryID)
+				delete(nr.cronJobs, appName)
+				logger.Info("Removed existing cron entry for app")
 			}
-			appInfo.instances = make([]*ManagedApp, 0, targetReplicas)
-			currentReplicas = 0 // Reset current count
-		}
 
-		//  Adjust Replicas
-		if targetReplicas > currentReplicas {
-			needed := targetReplicas - currentReplicas
-			logger.Info("Scaling up instances", "needed", needed)
-			for i := 0; i < needed; i++ {
-				replicaIndex := findNextReplicaIndex(appInfo.instances, targetReplicas)
-				if replicaIndex == -1 {
-					logger.Error("Could not find available replica index slot", "target", targetReplicas, "current_count", len(appInfo.instances))
-					break
-				}
-				// Pass Tag implicitly via appInfo.spec to startAppInstance
-				if err := nr.startAppInstance(ctx, appInfo, replicaIndex); err != nil {
-					logger.Error("Failed to start new instance during scale up", "replica_index", replicaIndex, "error", err)
+			// Add new cron job if schedule is provided
+			if spec.CronSchedule != "" {
+				// Deep copy spec for the closure
+				specCopy := *spec // Shallow copy initially
+				// If spec contains slices/maps, they need to be deep copied too.
+				// For this example, assuming Env, Args, Nodes, Mounts, Landlock.Paths are relevant.
+				specCopy.Args = append([]string(nil), spec.Args...)
+				specCopy.Env = make([]EnvVar, len(spec.Env))
+				copy(specCopy.Env, spec.Env) // EnvVar itself is struct, direct copy is fine if no pointers
+				specCopy.Nodes = make([]NodeSelectorSpec, len(spec.Nodes))
+				copy(specCopy.Nodes, spec.Nodes) // NodeSelectorSpec is struct
+				specCopy.Mounts = make([]MountSpec, len(spec.Mounts))
+				copy(specCopy.Mounts, spec.Mounts) // MountSpec is struct
+				specCopy.Landlock.Paths = make([]LandlockPathSpec, len(spec.Landlock.Paths))
+				copy(specCopy.Landlock.Paths, spec.Landlock.Paths) // LandlockPathSpec is struct
+
+				entryID, err := nr.cronScheduler.AddFunc(spec.CronSchedule, func() { nr.triggerCronJobExecution(&specCopy) })
+				if err != nil {
+					logger.Error("Failed to add cron job", "error", err, "schedule", spec.CronSchedule)
 				} else {
-					time.Sleep(100 * time.Millisecond)
+					nr.cronJobs[appName] = entryID
+					logger.Info("Successfully added cron job", "entry_id", entryID, "schedule", spec.CronSchedule)
 				}
-			}
-		} else if targetReplicas < currentReplicas {
-			excess := currentReplicas - targetReplicas
-			logger.Info("Scaling down instances", "excess", excess)
-			sortedInstances := append([]*ManagedApp{}, appInfo.instances...)
-			sort.Slice(sortedInstances, func(i, j int) bool {
-				idxI := extractReplicaIndex(sortedInstances[i].InstanceID)
-				idxJ := extractReplicaIndex(sortedInstances[j].InstanceID)
-				return idxI > idxJ // Sort descending by index to stop higher indices first
-			})
-
-			instancesToStop := make([]*ManagedApp, 0, excess)
-			if excess <= len(sortedInstances) {
-				instancesToStop = sortedInstances[:excess]
 			} else {
-				logger.Warn("Excess count greater than sorted instances, stopping all.", "excess", excess, "count", len(sortedInstances))
-				instancesToStop = sortedInstances
+				logger.Info("Cron schedule is empty, no cron job added (effectively disabling cron)")
 			}
 
-			remainingInstancesMap := make(map[string]*ManagedApp)
-			for _, inst := range appInfo.instances {
-				remainingInstancesMap[inst.InstanceID] = inst
-			}
-
-			for _, instToStop := range instancesToStop {
-				logger.Info("Stopping excess instance", "instance_id", instToStop.InstanceID)
-				// Stop synchronously for scale down to ensure metrics are cleaned up properly after stop
-				if err := nr.stopAppInstance(instToStop, true); err != nil { // Intentional stop
-					logger.Error("Error stopping excess instance", "instance_id", instToStop.InstanceID, "error", err)
+			// If app was previously a service, stop its instances
+			if len(appInfo.instances) > 0 {
+				logger.Info("App switching from service to cron. Stopping existing service instances.")
+				instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+				nr.stopAllInstancesForApp(ctx, appInfo, logger)
+				for _, inst := range instancesToCleanup {
+					nr.cleanupInstanceMetrics(inst)
 				}
-				// The monitorAppInstance will run its defer block. If it's an intentional stop,
-				// it will set status to Stopped. We then explicitly clean up metrics.
-				nr.cleanupInstanceMetrics(instToStop)
-				delete(remainingInstancesMap, instToStop.InstanceID)
+				appInfo.instances = make([]*ManagedApp, 0)
 			}
-			// Rebuild appInfo.instances from remainingInstancesMap
-			newInstancesSlice := make([]*ManagedApp, 0, len(remainingInstancesMap))
-			for _, inst := range remainingInstancesMap {
-				newInstancesSlice = append(newInstancesSlice, inst)
+		} else { // "service" mode (default or explicit)
+			logger.Info("App configured to run as a service")
+			// If app was previously a cron job, remove it from scheduler
+			if oldEntryID, exists := nr.cronJobs[appName]; exists {
+				nr.cronScheduler.Remove(oldEntryID)
+				delete(nr.cronJobs, appName)
+				logger.Info("Removed cron entry for app (switched to service mode)")
 			}
-			appInfo.instances = newInstancesSlice // Update the main slice
-		} else {
-			// target == current AND hash didn't change
-			if targetReplicas == 0 {
-				logger.Info("Target replica count is 0. Ensuring no instances are running.")
-				if len(appInfo.instances) > 0 {
-					instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
-					nr.stopAllInstancesForApp(ctx, appInfo, logger)
-					for _, inst := range instancesToCleanup {
-						nr.cleanupInstanceMetrics(inst)
+
+			// Proceed with existing service logic
+			targetReplicas := spec.FindTargetReplicas(nr.nodeID)
+			currentReplicas := len(appInfo.instances)
+			logger.Info("Reconciling service instances", "target", targetReplicas, "current", currentReplicas, "hash_changed", configHashChanged)
+
+			if configHashChanged {
+				logger.Info("Configuration hash changed, restarting all service instances")
+				instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+				nr.stopAllInstancesForApp(ctx, appInfo, logger)
+				for _, inst := range instancesToCleanup {
+					nr.cleanupInstanceMetrics(inst)
+				}
+				appInfo.instances = make([]*ManagedApp, 0, targetReplicas)
+				currentReplicas = 0
+			}
+
+			// Adjust Replicas for service mode
+			if targetReplicas > currentReplicas {
+				needed := targetReplicas - currentReplicas
+				logger.Info("Scaling up service instances", "needed", needed)
+				for i := 0; i < needed; i++ {
+					replicaIndex := findNextReplicaIndex(appInfo.instances, targetReplicas)
+					if replicaIndex == -1 {
+						logger.Error("Could not find available replica index slot for service", "target", targetReplicas, "current_count", len(appInfo.instances))
+						break
 					}
-					appInfo.instances = make([]*ManagedApp, 0)
+					if err := nr.startAppInstance(ctx, appInfo, replicaIndex); err != nil {
+						logger.Error("Failed to start new service instance during scale up", "replica_index", replicaIndex, "error", err)
+					} else {
+						time.Sleep(100 * time.Millisecond)
+					}
 				}
-			} else {
-				logger.Info("Instance count matches target and config hash unchanged. No action needed.")
+			} else if targetReplicas < currentReplicas {
+				excess := currentReplicas - targetReplicas
+				logger.Info("Scaling down service instances", "excess", excess)
+				// ... (existing scale down logic copied here) ...
+				sortedInstances := append([]*ManagedApp{}, appInfo.instances...)
+				sort.Slice(sortedInstances, func(i, j int) bool {
+					idxI := extractReplicaIndex(sortedInstances[i].InstanceID)
+					idxJ := extractReplicaIndex(sortedInstances[j].InstanceID)
+					return idxI > idxJ
+				})
+				instancesToStop := make([]*ManagedApp, 0, excess)
+				if excess <= len(sortedInstances) {
+					instancesToStop = sortedInstances[:excess]
+				} else {
+					instancesToStop = sortedInstances
+				}
+				remainingInstancesMap := make(map[string]*ManagedApp)
+				for _, inst := range appInfo.instances {
+					remainingInstancesMap[inst.InstanceID] = inst
+				}
+				for _, instToStop := range instancesToStop {
+					logger.Info("Stopping excess service instance", "instance_id", instToStop.InstanceID)
+					if err := nr.stopAppInstance(instToStop, true); err != nil {
+						logger.Error("Error stopping excess service instance", "instance_id", instToStop.InstanceID, "error", err)
+					}
+					nr.cleanupInstanceMetrics(instToStop)
+					delete(remainingInstancesMap, instToStop.InstanceID)
+				}
+				newInstancesSlice := make([]*ManagedApp, 0, len(remainingInstancesMap))
+				for _, inst := range remainingInstancesMap {
+					newInstancesSlice = append(newInstancesSlice, inst)
+				}
+				appInfo.instances = newInstancesSlice
+			} else { // target == current AND hash didn't change
+				if targetReplicas == 0 {
+					logger.Info("Target service replica count is 0. Ensuring no instances are running.")
+					if len(appInfo.instances) > 0 {
+						instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+						nr.stopAllInstancesForApp(ctx, appInfo, logger)
+						for _, inst := range instancesToCleanup {
+							nr.cleanupInstanceMetrics(inst)
+						}
+						appInfo.instances = make([]*ManagedApp, 0)
+					}
+				} else {
+					logger.Info("Service instance count matches target and config hash unchanged. No action needed.")
+				}
 			}
 		}
 
 	case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
 		logger.Info("Processing configuration delete/purge request")
+		// Remove from cron scheduler if it's a cron job
+		if oldEntryID, exists := nr.cronJobs[appName]; exists {
+			nr.cronScheduler.Remove(oldEntryID)
+			delete(nr.cronJobs, appName)
+			logger.Info("Removed cron entry for app due to delete/purge event")
+		}
+		// Stop any running service instances
 		instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
-		nr.stopAllInstancesForApp(ctx, appInfo, logger) // Stop all instances
+		nr.stopAllInstancesForApp(ctx, appInfo, logger)
 		for _, inst := range instancesToCleanup {
 			nr.cleanupInstanceMetrics(inst)
 		}
-		appInfo.spec = nil // Clear spec
+		appInfo.spec = nil
 		appInfo.configHash = ""
-		appInfo.instances = make([]*ManagedApp, 0) // Clear instances slice
-		// Delete the app entry from the state manager itself upon delete/purge
-		nr.state.DeleteApp(appName) // Call this *after* lock is released by defer
+		appInfo.instances = make([]*ManagedApp, 0)
+		nr.state.DeleteApp(appName)
 
 	default:
 		logger.Warn("Ignoring unknown KV operation")
@@ -960,4 +1047,57 @@ func (nr *NodeRunner) cleanupInstanceMetrics(instance *ManagedApp) {
 	// No deletion of other metrics (Info, Memory, CPU, ExitCode for this runID)
 	// They remain as a historical record for this run.
 	nr.logger.Debug("Metrics finalized for instance run (no deletion)", "instance_id", instanceID, "run_id", runID)
+}
+
+// generateRunID creates a unique ID for a job run.
+// For now, using a simple UUID. This can be moved from process.go or made more sophisticated later.
+func generateRunID() string {
+	// return uuid.NewString() // Requires import "github.com/google/uuid"
+	// Simple alternative for now if UUID is not immediately available/desired as a direct import here:
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// triggerCronJobExecution is called by the cron scheduler when a job is due.
+func (nr *NodeRunner) triggerCronJobExecution(spec *ServiceSpec) {
+	runID := generateRunID()
+	scheduledTime := time.Now() // Record the time the job was actually triggered
+
+	logger := nr.logger.With("app", spec.Name, "run_id", runID, "schedule", spec.CronSchedule)
+	logger.Info("Cron job triggered by scheduler", "job_max_retries", spec.JobMaxRetries, "job_timeout_sec", spec.JobTimeoutSeconds)
+
+	// Run the job instance. This is non-blocking.
+	// The context passed (nr.globalCtx) ensures that if the runner is shutting down,
+	// the attempt to start a new job instance can be gracefully handled.
+	// Actual job timeout is handled within startJobInstance.
+	go func() {
+		// TODO: Add logic to check if an instance of this cron job (appName) is already running.
+		// If spec.AllowConcurrentRuns (new field, default false) is false, and a job is running, skip this trigger.
+		// This check might involve a new map in NodeRunner: `runningCronJobs map[string]string` (appName -> runID)
+		// This map would be updated in startJobInstance and monitorJobInstance.
+
+		_, err := nr.startJobInstance(nr.globalCtx, spec, runID, 0, scheduledTime)
+		if err != nil {
+			// This error is from the attempt to *start* the job (e.g., binary fetch failed).
+			// Actual job execution errors are handled by monitorJobInstance.
+			logger.Error("Failed to start cron job instance", "error", err)
+
+			// Create and store a failure record if starting itself fails.
+			record := &CronJobExecutionRecord{
+				AppName:           spec.Name,
+				RunID:             runID,
+				CronSchedule:      spec.CronSchedule,
+				RequestedTime:     scheduledTime, // Or the actual scheduled time from cron library if available
+				StartTime:         time.Now(),    // Approximate start time
+				EndTime:           time.Now(),
+				Status:            "failure_to_start",
+				ExitCode:          -1, // Indicate a start failure, not a process exit code
+				JobMaxRetries:     spec.JobMaxRetries,
+				RetriesAttempted:  0,
+				JobTimeoutSeconds: spec.JobTimeoutSeconds,
+				ErrorMessage:      fmt.Sprintf("Failed to start job instance: %v", err),
+				NodeID:            nr.nodeID,
+			}
+			nr.storeCronJobExecutionRecord(record)
+		}
+	}()
 }
