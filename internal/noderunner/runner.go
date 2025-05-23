@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -48,10 +49,12 @@ type NodeRunner struct {
 	shutdownWg    sync.WaitGroup
 	metricsAddr   string       // Address for Prometheus metrics endpoint
 	metricsServer *http.Server // HTTP server for metrics
+	adminAddr     string       // Address for admin UI HTTP endpoint
+	adminServer   *http.Server // HTTP server for admin UI
 }
 
 // NewNodeRunner creates and initializes a new NodeRunner.
-func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr string, logger *slog.Logger) (*NodeRunner, error) {
+func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, adminAddr string, logger *slog.Logger) (*NodeRunner, error) {
 	if nodeID == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -198,6 +201,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr string
 		localOS:      localOS,   // Store detected OS
 		localArch:    localArch, //  Store detected Arch
 		metricsAddr:  metricsAddr,
+		adminAddr:    adminAddr, // Store adminAddr
 		globalCtx:    gCtx,
 		globalCancel: gCancel,
 	}
@@ -228,6 +232,28 @@ func (nr *NodeRunner) Run() error {
 				nr.globalCancel() // Critical failure, stop the runner
 			} else {
 				nr.logger.Info("Prometheus metrics server shut down")
+			}
+		}()
+	}
+
+	// Start Admin UI Server if address is configured
+	if nr.adminAddr != "" {
+		adminMux := http.NewServeMux()
+		adminMux.HandleFunc("/", nr.handleAdminUI) // Root handler for admin UI
+		nr.adminServer = &http.Server{
+			Addr:              nr.adminAddr,
+			Handler:           adminMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		nr.shutdownWg.Add(1) // Add to wait group for admin server
+		go func() {
+			defer nr.shutdownWg.Done()
+			nr.logger.Info("Starting admin UI server", "address", nr.adminAddr)
+			if err := nr.adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				nr.logger.Error("Admin UI server failed", "error", err)
+				nr.globalCancel() // Critical failure, stop the runner
+			} else {
+				nr.logger.Info("Admin UI server shut down")
 			}
 		}()
 	}
@@ -327,7 +353,19 @@ func (nr *NodeRunner) Run() error {
 		}
 	}
 
-	// Wait for background goroutines (heartbeat, watcher, metrics server if running)
+	// Shutdown admin UI server
+	if nr.adminServer != nil {
+		nr.logger.Info("Shutting down admin UI server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := nr.adminServer.Shutdown(shutdownCtx); err != nil {
+			nr.logger.Error("Error shutting down admin UI server", "error", err)
+		} else {
+			nr.logger.Info("Admin UI server gracefully stopped.")
+		}
+	}
+
+	// Wait for background goroutines (heartbeat, watcher, metrics server, admin server if running)
 	nr.logger.Debug("Waiting for background goroutines to finish...")
 	nr.shutdownWg.Wait()
 	nr.logger.Debug("Background goroutines finished.")
@@ -368,7 +406,185 @@ func (nr *NodeRunner) Run() error {
 	return nil
 }
 
-// heartbeatLoop
+// handleAdminUI serves the admin interface HTML.
+func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Basic HTML structure and styling
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="10">
+    <title>Narun Node Runner Admin - %s</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; margin: 20px; background-color: #f8f9fa; color: #212529; line-height: 1.6; }
+        h1, h2 { color: #007bff; border-bottom: 2px solid #007bff; padding-bottom: 0.3em; }
+        table { width: 100%%; border-collapse: collapse; margin-bottom: 25px; background-color: #fff; box-shadow: 0 2px 15px rgba(0,0,0,0.05); border-radius: 5px; overflow: hidden; }
+        th, td { border: 1px solid #dee2e6; padding: 12px 15px; text-align: left; }
+        th { background-color: #007bff; color: white; font-weight: 600; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        tr:hover { background-color: #e9ecef; }
+        .status-running { color: #28a745; font-weight: bold; }
+        .status-starting { color: #ffc107; font-weight: bold; }
+        .status-stopping { color: #fd7e14; font-weight: bold; }
+        .status-stopped { color: #6c757d; }
+        .status-failed, .status-crashed { color: #dc3545; font-weight: bold; }
+        .container { max-width: 1400px; margin: auto; padding: 0 15px; }
+        .header-info { background-color: #e9ecef; padding: 20px; margin-bottom: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); }
+        .header-info p { margin: 0.5em 0; }
+        .footer { text-align: center; margin-top: 30px; font-size: 0.9em; color: #6c757d; }
+		.code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; background-color: #eef; padding: 2px 4px; border-radius: 3px; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Narun Node Runner Admin</h1>
+    <div class="header-info">
+        <p><strong>Node ID:</strong> <span class="code">%s</span></p>
+        <p><strong>Runner Version:</strong> <span class="code">%s</span></p>
+        <p><strong>Runner Started:</strong> %s (Uptime: %s)</p>
+        <p><strong>Current Time:</strong> %s</p>
+    </div>
+`, html.EscapeString(nr.nodeID), html.EscapeString(nr.nodeID), html.EscapeString(nr.version),
+		nr.startTime.Format(time.RFC1123), time.Since(nr.startTime).Truncate(time.Second).String(),
+		time.Now().Format(time.RFC1123))
+
+	allAppInfos := nr.state.GetAllAppInfos()
+	if len(allAppInfos) == 0 {
+		fmt.Fprintf(w, "<p>No applications are currently managed by this node.</p>")
+	}
+
+	appNames := make([]string, 0, len(allAppInfos))
+	for name := range allAppInfos {
+		appNames = append(appNames, name)
+	}
+	sort.Strings(appNames) // Sort app names for consistent display
+
+	// Temporary struct to hold a snapshot of instance data for safe rendering
+	type uiInstanceView struct {
+		InstanceID   string
+		RunID        string
+		Status       AppStatus
+		StatusClass  string
+		PID          string
+		StartTime    string
+		Uptime       string
+		RestartCount int
+		ExitCode     string
+		BinaryPath   string
+	}
+
+	for _, appName := range appNames {
+		appInfo := allAppInfos[appName]
+		appInfo.mu.RLock() // Read lock for accessing this app's info
+
+		fmt.Fprintf(w, "<h2>Application: <span class=\"code\">%s</span></h2>", html.EscapeString(appName))
+
+		if appInfo.spec == nil {
+			fmt.Fprintf(w, "<p><em>No specification loaded for this application (possibly deleted or in error state).</em></p>")
+			appInfo.mu.RUnlock()
+			continue
+		}
+
+		fmt.Fprintf(w, "<p><strong>Tag:</strong> <span class=\"code\">%s</span> | <strong>Mode:</strong> <span class=\"code\">%s</span> | <strong>Config Hash:</strong> <span class=\"code\">%s</span></p>",
+			html.EscapeString(appInfo.spec.Tag), html.EscapeString(appInfo.spec.Mode), html.EscapeString(appInfo.configHash))
+
+		instanceViews := make([]uiInstanceView, 0, len(appInfo.instances))
+		if len(appInfo.instances) == 0 {
+			fmt.Fprintf(w, "<p><em>No instances running for this application on this node.</em></p>")
+		} else {
+			// Create a snapshot of instance data under lock
+			tempSortedInstances := make([]*ManagedApp, len(appInfo.instances))
+			copy(tempSortedInstances, appInfo.instances)
+			// Sort the copy of instances by ID for consistent display
+			sort.Slice(tempSortedInstances, func(i, j int) bool {
+				return tempSortedInstances[i].InstanceID < tempSortedInstances[j].InstanceID
+			})
+
+			for _, instance := range tempSortedInstances {
+				pidStr := "-"
+				if instance.Pid > 0 {
+					pidStr = fmt.Sprintf("%d", instance.Pid)
+				}
+				startTimeStr := "-"
+				uptimeStr := "-"
+				if !instance.StartTime.IsZero() {
+					startTimeStr = instance.StartTime.Format(time.RFC1123)
+					if instance.Status == StatusRunning || instance.Status == StatusStarting {
+						uptimeStr = time.Since(instance.StartTime).Truncate(time.Second).String()
+					}
+				}
+				exitCodeStr := "-"
+				if instance.lastExitCode != nil {
+					exitCodeStr = fmt.Sprintf("%d", *instance.lastExitCode)
+				}
+				instanceViews = append(instanceViews, uiInstanceView{
+					InstanceID:   instance.InstanceID,
+					RunID:        instance.RunID,
+					Status:       instance.Status,
+					StatusClass:  "status-" + strings.ToLower(string(instance.Status)),
+					PID:          pidStr,
+					StartTime:    startTimeStr,
+					Uptime:       uptimeStr,
+					RestartCount: instance.restartCount,
+					ExitCode:     exitCodeStr,
+					BinaryPath:   instance.BinaryPath,
+				})
+			}
+		}
+		appInfo.mu.RUnlock() // Unlock after all data for this app is copied
+
+		// Render from the snapshot (instanceViews)
+		if len(instanceViews) > 0 {
+			fmt.Fprintf(w, `
+    <table>
+        <thead>
+            <tr>
+                <th>Instance ID</th>
+                <th>Run ID</th>
+                <th>Status</th>
+                <th>PID</th>
+                <th>Started</th>
+                <th>Uptime</th>
+                <th>Restarts</th>
+                <th>Exit Code</th>
+                <th>Binary Path</th>
+            </tr>
+        </thead>
+        <tbody>`)
+			for _, view := range instanceViews {
+				fmt.Fprintf(w, `
+            <tr>
+                <td><span class="code">%s</span></td>
+                <td><span class="code">%s</span></td>
+                <td class="%s">%s</td>
+                <td>%s</td>
+                <td>%s</td>
+                <td>%s</td>
+                <td>%d</td>
+                <td>%s</td>
+                <td><span class="code">%s</span></td>
+            </tr>`,
+					html.EscapeString(view.InstanceID), html.EscapeString(view.RunID),
+					view.StatusClass, html.EscapeString(string(view.Status)),
+					view.PID, view.StartTime, view.Uptime, view.RestartCount, view.ExitCode, html.EscapeString(view.BinaryPath))
+			}
+			fmt.Fprintf(w, `</tbody></table>`)
+		}
+	}
+
+	fmt.Fprintf(w, `
+    <div class="footer">
+        <p>Narun Node Runner Admin UI &copy; %d</p>
+    </div>
+</div>
+</body>
+</html>`, time.Now().Year())
+}
+
+// heartbeatLoop periodically updates the node's state in the KV store.
 func (nr *NodeRunner) heartbeatLoop() {
 	defer nr.shutdownWg.Done()
 	ticker := time.NewTicker(NodeHeartbeatInterval)

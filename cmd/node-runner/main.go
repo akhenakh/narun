@@ -54,6 +54,7 @@ func main() {
 	masterKey := flag.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key for secrets (or use NARUN_MASTER_KEY env var)")
 	masterKeyPath := flag.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "The path to the file containing the base64 encoded AES-256 master key for secrets")
 	metricsAddr := flag.String("metrics-addr", ":9100", "Address for Prometheus metrics HTTP endpoint (e.g., :9100). Set to empty to disable.")
+	adminAddr := flag.String("admin-addr", ":9101", "Address for admin UI HTTP endpoint (e.g., :9101). Set to empty to disable.")
 
 	flag.Parse()
 
@@ -85,7 +86,7 @@ func main() {
 	}
 
 	// Create Node Runner
-	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, *metricsAddr, logger)
+	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, *metricsAddr, *adminAddr, logger)
 	if err != nil {
 		logger.Error("Failed to initialize node runner", "error", err)
 		os.Exit(1)

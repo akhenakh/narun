@@ -14,12 +14,12 @@ WORK IN PROGRESS, do not use in production unless you want to suffer.
 
 Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive.
 Narun aims to provide a simpler and more lightweight alternative for edge devices.
-It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.  
+It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.
 So no need for stateful services, anything else is stateless and ephemeral.
 Modern developments ecosystem, Rust, Go, Zig or Deno, do not require full containerized operating systems, static binaries are good enough in many situations.
 No need to ship containers so no need for a full fledge registry.
 NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.
-No support for multi tenancy.  
+No support for multi tenancy.
 Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some options like firecracker.
 
 
@@ -59,6 +59,7 @@ Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some optio
     *   Starts, monitors, and restarts the application process based on the spec.
     *   Forwards application stdout/stderr to NATS subjects (e.g., `logs.<app-name>.<node-id>`).
     *   Publishes application instance status updates to NATS subjects (e.g., `status.<app-name>.<node-id>`).
+    *   The node runner expose a web UI on port 9101, showing running applications.
 *   **Configuration:** Primarily via command-line flags: `-nats-url`, `-node-id`, `-data-dir`.
 *   **Running:** `go run ./cmd/node-runner -nats-url <NATS_URL> -node-id <NODE_ID> -data-dir /var/lib/node-runner` (on each target node).
 
@@ -230,6 +231,9 @@ Use nconsumer.ListenAndServeGRPC: In your main function, create an instance of y
 nconsumer handles connecting to NATS, registering the service, receiving requests, identifying the target RPC method (using the X-Original-Grpc-Method header set by narun), decoding the protobuf request, calling your service method, encoding the protobuf response (or error), and sending the NATS reply.
 
 See `consumers/cmd/grpc-hello/main.go` for an example.
+
+## Admin UI
+A simple admin UI is available on each nodes: http://localhost:9101.
 
 ## Metrics
 
