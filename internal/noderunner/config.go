@@ -84,11 +84,13 @@ type ServiceSpec struct {
 	MemoryMaxMB          uint64  `yaml:"memoryMaxMB,omitempty"`          // Memory hard limit in MiB (0 means same as MemoryMB).
 	CPUCores             float64 `yaml:"cpuCores,omitempty"`             // CPU bandwidth in terms of cores (e.g., 0.5 for 50%, 1.0 for 1 core). 0 means no limit.
 	NetworkNamespacePath string  `yaml:"networkNamespacePath,omitempty"` // Optional: path to an existing network namespace to join.
-	// CgroupParent defines the cgroup parent directory under /sys/fs/cgroup where the instance's cgroup scope will be created.
-	// Example: "system.slice" or "user.slice/user-1000.slice".
-	// The node-runner process must have permission to create sub-cgroups here.
-	// If empty, cgroup-based resource limits will not be applied.
-	CgroupParent string `yaml:"cgroupParent,omitempty"`
+	CgroupParent         string  `yaml:"cgroupParent,omitempty"`
+
+	// Cron Job Scheduling Fields
+	CronSchedule        string `yaml:"cronSchedule,omitempty"`        // Standard cron schedule string (e.g., "* * * * *"). If empty, not a cron job.
+	CronMaxRetries      int    `yaml:"cronMaxRetries,omitempty"`      // Max number of retries for a failed cron job run (default: 0).
+	CronTimeoutSeconds  int    `yaml:"cronTimeoutSeconds,omitempty"`  // Max execution time for a single cron job run in seconds (default: 0, no timeout).
+	CronAllowConcurrent bool   `yaml:"cronAllowConcurrent,omitempty"` // Whether to allow concurrent runs of the cron job if previous one is still running (default: false).
 }
 
 // StoredSecret is the structure stored as JSON in the SecretKVBucket.
@@ -104,13 +106,14 @@ type StoredSecret struct {
 // NodeState represents the information stored about a node runner in the KV store.
 type NodeState struct {
 	NodeID           string    `json:"node_id"`
-	LastSeen         time.Time `json:"last_seen"`         // Timestamp of the last heartbeat
-	Version          string    `json:"version"`           // Version of the node-runner binary
-	StartTime        time.Time `json:"start_time"`        // When this runner instance started
-	ManagedInstances []string  `json:"managed_instances"` // List of instance IDs currently managed (e.g., "hello-0", "hello-1")
-	Status           string    `json:"status"`            // e.g., "running", "shutting_down"
-	OS               string    `json:"os"`                // OS the runner is on
-	Arch             string    `json:"arch"`              // Architecture the runner is on
+	LastSeen         time.Time `json:"last_seen"`              // Timestamp of the last heartbeat
+	Version          string    `json:"version"`                // Version of the node-runner binary
+	StartTime        time.Time `json:"start_time"`             // When this runner instance started
+	ManagedInstances []string  `json:"managed_instances"`      // List of instance IDs currently managed (e.g., "hello-0", "hello-1")
+	Status           string    `json:"status"`                 // e.g., "running", "shutting_down"
+	OS               string    `json:"os"`                     // OS the runner is on
+	Arch             string    `json:"arch"`                   // Architecture the runner is on
+	CronJobIDs       []string  `json:"cron_job_ids,omitempty"` // IDs of cron jobs registered by this node (appname + internal cron ID)
 }
 
 // ParseServiceSpec parses the YAML byte slice into a ServiceSpec struct.
@@ -127,27 +130,20 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		return nil, fmt.Errorf("service 'tag' is required (e.g., myapp-v1.0)")
 	}
 	if spec.Command == "" {
-		// Default command to the binary name if not specified
-		// Note: This default might be less useful now, as the actual binary filename
-		// will include OS/Arch. The path retrieved from fetchAndStoreBinary is more reliable.
-		spec.Command = spec.Name // Default command (will use local binary path later)
+		spec.Command = spec.Name
 	}
 
-	// Default and Validate Mode
 	if spec.Mode == "" {
-		spec.Mode = "exec" // Default mode
+		spec.Mode = "exec"
 	}
 	if spec.Mode != "exec" && spec.Mode != "landlock" {
 		return nil, fmt.Errorf("invalid mode '%s': must be 'exec' or 'landlock'", spec.Mode)
 	}
 
-	// Validate Landlock spec only if mode is landlock
 	if spec.Mode == "landlock" {
 		if runtime.GOOS != "linux" {
-			// Log warning during parse, but runtime check in runner is definitive
 			fmt.Printf("Warning: Landlock mode specified for app '%s' during parse, but current OS is not Linux (%s).\n", spec.Name, runtime.GOOS)
 		}
-		// Validate custom paths
 		for i, p := range spec.Landlock.Paths {
 			if strings.TrimSpace(p.Path) == "" {
 				return nil, fmt.Errorf("landlock path at index %d: 'path' cannot be empty", i)
@@ -170,14 +166,6 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 	if spec.MemoryMB > 0 && spec.MemoryMaxMB > 0 && spec.MemoryMaxMB < spec.MemoryMB {
 		return nil, fmt.Errorf("memoryMaxMB cannot be less than memoryMB")
 	}
-	if spec.CgroupParent != "" && !strings.HasPrefix(spec.CgroupParent, "/") {
-		// A simple check; more robust validation might involve checking /sys/fs/cgroup.
-		// For now, we assume if set, it's a path relative to /sys/fs/cgroup or absolute.
-		// The node-runner will prepend /sys/fs/cgroup if it's not absolute.
-		// Better: CgroupParent should be the path relative to /sys/fs/cgroup.
-		// e.g. "system.slice" or "mycompany.slice/services.slice"
-		// The runner will then form /sys/fs/cgroup/<CgroupParent>/narun-<app>-<id>.scope
-	}
 	if (spec.MemoryMB > 0 || spec.CPUCores > 0) && spec.CgroupParent == "" {
 		return nil, fmt.Errorf("cgroupParent must be specified when memoryMB or cpuCores limits are set")
 	}
@@ -185,7 +173,6 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		fmt.Printf("Warning: cgroupParent specified for app '%s', but current OS is not Linux (%s). Cgroup limits will be ignored.\n", spec.Name, runtime.GOOS)
 	}
 
-	// Validate Env Vars: only one of value or valueFromSecret should be set
 	for i, env := range spec.Env {
 		if env.Name == "" {
 			return nil, fmt.Errorf("env var at index %d: 'name' cannot be empty", i)
@@ -193,22 +180,15 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		if env.Value != "" && env.ValueFromSecret != "" {
 			return nil, fmt.Errorf("env var '%s': cannot specify both 'value' and 'valueFromSecret'", env.Name)
 		}
-		// Allow both to be empty? Maybe for system-provided vars later. For now, require one or the other if Env is defined.
-		// Let's relax this: allow neither to be set if desired (e.g. just inheriting).
-		// if env.Value == "" && env.ValueFromSecret == "" {
-		// 	return nil, fmt.Errorf("env var '%s': must specify either 'value' or 'valueFromSecret'", env.Name)
-		// }
 		if strings.ContainsAny(env.Name, " =") {
 			return nil, fmt.Errorf("env var name '%s' contains invalid characters", env.Name)
 		}
 	}
 
-	// Validate Mounts
 	for i, mount := range spec.Mounts {
 		if strings.TrimSpace(mount.Path) == "" {
 			return nil, fmt.Errorf("mount at index %d: 'path' cannot be empty", i)
 		}
-		// Basic validation: currently only objectStore source is supported
 		if strings.TrimSpace(mount.Source.ObjectStore) == "" {
 			return nil, fmt.Errorf("mount '%s': source.objectStore name cannot be empty", mount.Path)
 		}
@@ -219,13 +199,36 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		if strings.TrimSpace(nodeSpec.Name) == "" {
 			return nil, fmt.Errorf("node selector at index %d: 'name' cannot be empty", i)
 		}
-		if nodeSpec.Replicas <= 0 {
-			return nil, fmt.Errorf("node selector for '%s': 'replicas' must be positive, got %d", nodeSpec.Name, nodeSpec.Replicas)
+		if nodeSpec.Replicas < 0 { // Allow 0 replicas if it's only a cron job
+			return nil, fmt.Errorf("node selector for '%s': 'replicas' must be non-negative, got %d", nodeSpec.Name, nodeSpec.Replicas)
 		}
 		if nodeNames[nodeSpec.Name] {
 			return nil, fmt.Errorf("duplicate node selector for name '%s'", nodeSpec.Name)
 		}
 		nodeNames[nodeSpec.Name] = true
+	}
+
+	// Validate Cron Job Fields
+	if spec.CronSchedule != "" {
+		// Basic cron string validation could be added here, but robfig/cron will validate it better.
+		// For example, check for 5 or 6 fields.
+		parts := strings.Fields(spec.CronSchedule)
+		if len(parts) < 5 || len(parts) > 6 {
+			return nil, fmt.Errorf("invalid cronSchedule format for service '%s': expected 5 or 6 fields, got %d ('%s')", spec.Name, len(parts), spec.CronSchedule)
+		}
+		if spec.CronMaxRetries < 0 {
+			return nil, fmt.Errorf("cronMaxRetries cannot be negative for service '%s'", spec.Name)
+		}
+		if spec.CronTimeoutSeconds < 0 {
+			return nil, fmt.Errorf("cronTimeoutSeconds cannot be negative for service '%s'", spec.Name)
+		}
+		// If CronSchedule is set, but no nodes are targeted, it's ambiguous.
+		// The current runner logic will schedule it on any node that has the config if spec.Nodes is empty.
+		// Or only on targeted nodes if spec.Nodes is populated.
+		// This behavior seems reasonable, a warning is good.
+		if len(spec.Nodes) == 0 {
+			fmt.Printf("Warning: cronSchedule is set for app '%s', but no target nodes are defined. The cron job will be scheduled on any node runner that processes this config.\n", spec.Name)
+		}
 	}
 
 	return &spec, nil

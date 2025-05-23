@@ -24,7 +24,7 @@ const (
 
 // ManagedApp holds the runtime state for an application instance managed by the runner.
 type ManagedApp struct {
-	InstanceID    string             // Unique ID for this instance (e.g., "appName-0")
+	InstanceID    string             // Unique ID for this instance (e.g., "appName-0" or "appName-cron-XYZ")
 	RunID         string             // Unique ID for this specific run of the instance process
 	Spec          *ServiceSpec       // The configuration this instance is running with (pointer to shared spec)
 	Cmd           *exec.Cmd          // The running process command
@@ -39,21 +39,25 @@ type ManagedApp struct {
 	StopSignal    chan struct{}      // Signal channel to stop monitoring/restarting
 	processCtx    context.Context    // Context for the running process and its monitors
 	processCancel context.CancelFunc // Function to cancel the process context
-	restartCount  int                // Number of times restarted since last config change/start
+	restartCount  int                // Number of times restarted since last config change/start (for persistent services)
 	lastExitCode  *int               // Store the last exit code
 
 	// cgroups related
 	cgroupPath    string       // Absolute path to the instance's cgroup
 	cgroupFd      int          // File descriptor for the cgroup directory (for UseCgroupFD)
 	cgroupCleanup func() error // Function to clean up the cgroup
+
+	IsCronJobRun bool // True if this instance is an ephemeral cron job run
 }
 
 // appInfo holds the state for all instances of a single application on this node.
 type appInfo struct {
-	mu         sync.RWMutex
-	spec       *ServiceSpec  // Current desired spec for this app
-	instances  []*ManagedApp // Slice of currently managed instances
-	configHash string        // Hash of the spec currently applied
+	mu            sync.RWMutex
+	spec          *ServiceSpec  // Current desired spec for this app
+	instances     []*ManagedApp // Slice of currently managed instances (both replicas and cron runs)
+	configHash    string        // Hash of the spec currently applied
+	cronEntryID   int           // Store cron.EntryID to manage/remove scheduled job if spec changes. Using int as robfig/cron.EntryID is an alias for int.
+	cronScheduler *sync.Mutex   // Mutex specifically for operations on cronEntryID for this app
 }
 
 // AppStateManager manages the state of all applications on the node.
@@ -82,7 +86,8 @@ func (m *AppStateManager) GetAppInfo(appName string) *appInfo {
 		info, exists = m.apps[appName]
 		if !exists {
 			info = &appInfo{
-				instances: make([]*ManagedApp, 0),
+				instances:     make([]*ManagedApp, 0),
+				cronScheduler: &sync.Mutex{}, // Initialize mutex for cron scheduling
 			}
 			m.apps[appName] = info
 		}
@@ -112,6 +117,8 @@ func (m *AppStateManager) GetManagedInstance(instanceID string) (*ManagedApp, bo
 func (m *AppStateManager) DeleteApp(appName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Additional cleanup related to cron jobs might be needed here if cronEntryID is stored
+	// For now, the runner will handle removing from its cron scheduler
 	delete(m.apps, appName)
 }
 
@@ -127,16 +134,37 @@ func (m *AppStateManager) GetAllAppInfos() map[string]*appInfo {
 	return appsCopy
 }
 
-// Generates a unique instance ID.
+// Generates a unique instance ID for persistent replicas.
 func GenerateInstanceID(appName string, replicaIndex int) string {
 	return fmt.Sprintf("%s-%d", appName, replicaIndex)
 }
 
-// Extracts app name from instance ID (simple implementation).
+// Generates a unique instance ID for cron job runs.
+func GenerateCronInstanceID(appName string) string {
+	// Using a short UUID or timestamp to ensure uniqueness for concurrent cron runs or quick successions
+	return fmt.Sprintf("%s-cron-%s", appName, time.Now().UnixNano())
+}
+
+// Extracts app name from instance ID.
 func InstanceIDToAppName(instanceID string) string {
+	// Handle cron job instance IDs like "appName-cron-XXXX"
+	if strings.Contains(instanceID, "-cron-") {
+		parts := strings.SplitN(instanceID, "-cron-", 2)
+		if len(parts) > 0 {
+			return parts[0]
+		}
+		// Fallback if "-cron-" is at the beginning (should not happen with GenerateCronInstanceID)
+		return instanceID
+	}
+	// Handle regular replica instance IDs like "appName-0"
 	lastDash := strings.LastIndex(instanceID, "-")
 	if lastDash == -1 {
-		return instanceID // Or handle error? Assume format is correct.
+		return instanceID // No dash, assume full ID is app name
 	}
-	return instanceID[:lastDash]
+	// Check if the part after dash is numeric (replica index)
+	if _, err := fmt.Sscan(instanceID[lastDash+1:], new(int)); err == nil {
+		return instanceID[:lastDash]
+	}
+	// If not ending in "-<number>", assume full ID is app name (e.g. app name itself contains a dash)
+	return instanceID
 }
