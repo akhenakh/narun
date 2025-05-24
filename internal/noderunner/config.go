@@ -84,7 +84,11 @@ type ServiceSpec struct {
 	MemoryMaxMB          uint64  `yaml:"memoryMaxMB,omitempty"`          // Memory hard limit in MiB (0 means same as MemoryMB).
 	CPUCores             float64 `yaml:"cpuCores,omitempty"`             // CPU bandwidth in terms of cores (e.g., 0.5 for 50%, 1.0 for 1 core). 0 means no limit.
 	NetworkNamespacePath string  `yaml:"networkNamespacePath,omitempty"` // Optional: path to an existing network namespace to join.
-	CgroupParent         string  `yaml:"cgroupParent,omitempty"`
+	// CgroupParent defines the cgroup parent directory under /sys/fs/cgroup where the instance's cgroup scope will be created.
+	// Example: "system.slice" or "user.slice/user-1000.slice".
+	// The node-runner process must have permission to create sub-cgroups here.
+	// If empty, cgroup-based resource limits will not be applied.
+	CgroupParent string `yaml:"cgroupParent,omitempty"`
 
 	// Cron Job Scheduling Fields
 	CronSchedule        string `yaml:"cronSchedule,omitempty"`        // Standard cron schedule string (e.g., "* * * * *"). If empty, not a cron job.
@@ -130,7 +134,10 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		return nil, fmt.Errorf("service 'tag' is required (e.g., myapp-v1.0)")
 	}
 	if spec.Command == "" {
-		spec.Command = spec.Name
+		// Default command to the binary name if not specified
+		// Note: This default might be less useful now, as the actual binary filename
+		// will include OS/Arch. The path retrieved from fetchAndStoreBinary is more reliable.
+		spec.Command = spec.Name // Default command (will use local binary path later)
 	}
 
 	if spec.Mode == "" {
@@ -173,6 +180,7 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		fmt.Printf("Warning: cgroupParent specified for app '%s', but current OS is not Linux (%s). Cgroup limits will be ignored.\n", spec.Name, runtime.GOOS)
 	}
 
+	// Validate Env Vars: only one of value or valueFromSecret should be set
 	for i, env := range spec.Env {
 		if env.Name == "" {
 			return nil, fmt.Errorf("env var at index %d: 'name' cannot be empty", i)
@@ -180,15 +188,22 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		if env.Value != "" && env.ValueFromSecret != "" {
 			return nil, fmt.Errorf("env var '%s': cannot specify both 'value' and 'valueFromSecret'", env.Name)
 		}
+		// Allow both to be empty? Maybe for system-provided vars later. For now, require one or the other if Env is defined.
+		// Let's relax this: allow neither to be set if desired (e.g. just inheriting).
+		// if env.Value == "" && env.ValueFromSecret == "" {
+		// 	return nil, fmt.Errorf("env var '%s': must specify either 'value' or 'valueFromSecret'", env.Name)
+		// }
 		if strings.ContainsAny(env.Name, " =") {
 			return nil, fmt.Errorf("env var name '%s' contains invalid characters", env.Name)
 		}
 	}
 
+	// Validate Mounts
 	for i, mount := range spec.Mounts {
 		if strings.TrimSpace(mount.Path) == "" {
 			return nil, fmt.Errorf("mount at index %d: 'path' cannot be empty", i)
 		}
+		// Basic validation: currently only objectStore source is supported
 		if strings.TrimSpace(mount.Source.ObjectStore) == "" {
 			return nil, fmt.Errorf("mount '%s': source.objectStore name cannot be empty", mount.Path)
 		}
