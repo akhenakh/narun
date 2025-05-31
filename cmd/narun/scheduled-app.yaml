@@ -1,0 +1,11 @@
+name: hello-cron-app
+tag: hello-app-v1.4 # Base tag
+args: [ "--run-once" ] # Example argument for a job
+env:
+  - name: GREETING
+    value: "Hello from Scheduled NATS Task!"
+nodes: # Defines which nodes are ELIGIBLE to run this cron job
+  - name: node-amd64
+    replicas: 0 # 0 replicas indicates this is primarily a cron job on this node
+# Cron Job Specific Fields
+cronSchedule: "*/2 * * * *" # Run every 2
