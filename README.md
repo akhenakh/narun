@@ -6,6 +6,8 @@ It is built around an API gateway exposing backend HTTP/gRPC services (consumers
 
 It aims for simplicity and lightness targeting edge devices.
 
+![Narun logo](./img/narun_logo.png)
+
 ## Status
 
 WORK IN PROGRESS, do not use in production unless you want to suffer.
@@ -62,6 +64,8 @@ Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some optio
     *   The node runner expose a web UI on port 9101, showing running applications.
 *   **Configuration:** Primarily via command-line flags: `-nats-url`, `-node-id`, `-data-dir`.
 *   **Running:** `go run ./cmd/node-runner -nats-url <NATS_URL> -node-id <NODE_ID> -data-dir /var/lib/node-runner` (on each target node).
+
+![Narun admin ui](./img/narun_admin.png)
 
 ### 4. `narun` (Management CLI)
 
