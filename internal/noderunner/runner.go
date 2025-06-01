@@ -95,6 +95,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 		logger.Warn("No master key provided (-master-key flag or NARUN_MASTER_KEY env). Secret decryption will not be possible.")
 	}
 
+	// NATS connection
 	nc, err := nats.Connect(natsURL,
 		nats.Name(fmt.Sprintf("node-runner-%s", nodeID)),
 		nats.ReconnectWait(2*time.Second),
@@ -125,6 +126,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 	}
 	logger.Debug("JetStream context created")
 
+	// Bind to KV Stores
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer setupCancel()
 	kvAppConfigs, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
@@ -146,6 +148,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 	}
 	logger.Debug("Bound to Node State KV store", "bucket", NodeStateKVBucket, "ttl", NodeStateKVTTL)
 
+	// Bind to Secret KV Store
 	kvSecrets, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
 		Bucket:      SecretKVBucket,
 		Description: "Stores encrypted application secrets.",
@@ -157,6 +160,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 	}
 	logger.Debug("Bound to Secret KV store", "bucket", SecretKVBucket)
 
+	// Bind to File Object Store
 	fileStore, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
 		Bucket: FileOSBucket, Description: "Shared files for Narun applications",
 	})
@@ -166,6 +170,7 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 	}
 	logger.Info("Bound to File store", "bucket", FileOSBucket)
 
+	// Bind to Object Store
 	osBucket, err := js.CreateOrUpdateObjectStore(setupCtx, jetstream.ObjectStoreConfig{
 		Bucket: AppBinariesOSBucket, Description: "Stores application binaries.",
 	})
@@ -208,10 +213,12 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 	return runner, nil
 }
 
+// Run starts the node runner's main loop.
 func (nr *NodeRunner) Run() error {
 	nr.logger.Info("Starting node runner", "version", nr.version, "os", nr.localOS, "arch", nr.localArch)
 	defer nr.logger.Info("Node runner stopped")
 
+	// Start Metrics Server if address is configured
 	if nr.metricsAddr != "" {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
@@ -226,34 +233,36 @@ func (nr *NodeRunner) Run() error {
 			nr.logger.Info("Starting Prometheus metrics server", "address", nr.metricsAddr)
 			if err := nr.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				nr.logger.Error("Prometheus metrics server failed", "error", err)
-				nr.globalCancel()
+				nr.globalCancel() // Critical failure, stop the runner
 			} else {
 				nr.logger.Info("Prometheus metrics server shut down")
 			}
 		}()
 	}
 
+	// Start Admin UI Server if address is configured
 	if nr.adminAddr != "" {
 		adminMux := http.NewServeMux()
-		adminMux.HandleFunc("/", nr.handleAdminUI)
+		adminMux.HandleFunc("/", nr.handleAdminUI) // Root handler for admin UI
 		nr.adminServer = &http.Server{
 			Addr:              nr.adminAddr,
 			Handler:           adminMux,
 			ReadHeaderTimeout: 5 * time.Second,
 		}
-		nr.shutdownWg.Add(1)
+		nr.shutdownWg.Add(1) // Add to wait group for admin server
 		go func() {
 			defer nr.shutdownWg.Done()
 			nr.logger.Info("Starting admin UI server", "address", nr.adminAddr)
 			if err := nr.adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				nr.logger.Error("Admin UI server failed", "error", err)
-				nr.globalCancel()
+				nr.globalCancel() // Critical failure, stop the runner
 			} else {
 				nr.logger.Info("Admin UI server shut down")
 			}
 		}()
 	}
 
+	// Initial Registration and Heartbeat Loop
 	if err := nr.updateNodeState("running"); err != nil {
 		nr.logger.Error("Initial node state registration failed", "error", err)
 	} else {
@@ -263,6 +272,7 @@ func (nr *NodeRunner) Run() error {
 	go nr.heartbeatLoop()
 	nr.logger.Info("Heartbeat loop started", "interval", NodeHeartbeatInterval)
 
+	// Initial sync
 	nr.cronScheduler.Start()
 	nr.logger.Info("Cron scheduler started")
 	defer func() {
@@ -284,7 +294,8 @@ func (nr *NodeRunner) Run() error {
 	}
 	syncCancel()
 
-	watcher, err := nr.kvAppConfigs.WatchAll(nr.globalCtx)
+	// Watch for configuration changes
+	watcher, err := nr.kvAppConfigs.WatchAll(nr.globalCtx) // Watch all operations, including deletes
 	if err != nil {
 		if nr.globalCtx.Err() != nil {
 			nr.logger.Info("Failed to start KV watcher due to shutdown signal")
@@ -292,9 +303,10 @@ func (nr *NodeRunner) Run() error {
 		}
 		return fmt.Errorf("failed to start KV watcher on '%s': %w", AppConfigKVBucket, err)
 	}
-	defer watcher.Stop()
+	defer watcher.Stop() // Ensure watcher is stopped on exit from Run
 	nr.logger.Info("Started watching for app configuration changes", "bucket", AppConfigKVBucket)
 
+	// Watcher Loop
 	nr.shutdownWg.Add(1)
 	go func() {
 		defer nr.shutdownWg.Done()
@@ -309,9 +321,9 @@ func (nr *NodeRunner) Run() error {
 			case entry, ok := <-watcher.Updates():
 				if !ok {
 					nr.logger.Warn("KV Watcher updates channel closed.")
-					if nr.globalCtx.Err() == nil {
+					if nr.globalCtx.Err() == nil { // Only error if not already shutting down
 						nr.logger.Error("Watcher closed unexpectedly while runner context is still active.")
-						nr.globalCancel()
+						nr.globalCancel() // Trigger shutdown if watcher fails unexpectedly
 					} else {
 						nr.logger.Info("Watcher closed during shutdown.")
 					}
@@ -326,15 +338,19 @@ func (nr *NodeRunner) Run() error {
 		}
 	}()
 
+	// Wait for shutdown signal
 	<-nr.globalCtx.Done()
 	nr.logger.Info("Shutdown signal received, initiating shutdown...")
 
+	// Update node state
 	if err := nr.updateNodeState("shutting_down"); err != nil {
 		nr.logger.Warn("Failed to update node state to shutting_down", "error", err)
 	}
 
+	// Initiate shutdown of managed apps
 	nr.shutdownAllAppInstances()
 
+	// Shutdown metrics server
 	if nr.metricsServer != nil {
 		nr.logger.Info("Shutting down Prometheus metrics server...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -357,10 +373,12 @@ func (nr *NodeRunner) Run() error {
 		}
 	}
 
+	// Wait for background goroutines (heartbeat, watcher, metrics server, admin server if running)
 	nr.logger.Debug("Waiting for background goroutines to finish...")
 	nr.shutdownWg.Wait()
 	nr.logger.Debug("Background goroutines finished.")
 
+	// Delete node state
 	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer deleteCancel()
 	nr.logger.Info("Deleting node state from KV store", "key", nr.nodeID)
@@ -368,6 +386,7 @@ func (nr *NodeRunner) Run() error {
 		nr.logger.Error("Failed to delete node state from KV", "key", nr.nodeID, "error", err)
 	}
 
+	// Drain NATS connection
 	if nr.nc != nil && !nr.nc.IsClosed() {
 		nr.logger.Info("Draining NATS connection...")
 		drainTimeout := 10 * time.Second
@@ -388,15 +407,18 @@ func (nr *NodeRunner) Run() error {
 		nr.logger.Info("NATS connection closed.")
 	}
 
+	// Return context error if any
 	if err := nr.globalCtx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("runner stopped due to context error: %w", err)
 	}
 	return nil
 }
 
+// handleAdminUI serves the admin interface HTML.
 func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
+	// Basic HTML structure and styling
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -447,7 +469,7 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 	for name := range allAppInfos {
 		appNames = append(appNames, name)
 	}
-	sort.Strings(appNames)
+	sort.Strings(appNames) // Sort app names for consistent display
 
 	type uiInstanceView struct {
 		InstanceID   string
@@ -465,7 +487,7 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 
 	for _, appName := range appNames {
 		appInfo := allAppInfos[appName]
-		appInfo.mu.RLock()
+		appInfo.mu.RLock() // Read lock for accessing this app's info
 
 		fmt.Fprintf(w, "<h2>Application: <span class=\"code\">%s</span></h2>", html.EscapeString(appName))
 
@@ -487,8 +509,10 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 		if len(appInfo.instances) == 0 {
 			fmt.Fprintf(w, "<p><em>No instances running for this application on this node.</em></p>")
 		} else {
+			// Create a snapshot of instance data under lock
 			tempSortedInstances := make([]*ManagedApp, len(appInfo.instances))
 			copy(tempSortedInstances, appInfo.instances)
+			// Sort the copy of instances by ID for consistent display
 			sort.Slice(tempSortedInstances, func(i, j int) bool {
 				return tempSortedInstances[i].InstanceID < tempSortedInstances[j].InstanceID
 			})
@@ -525,8 +549,9 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		}
-		appInfo.mu.RUnlock()
+		appInfo.mu.RUnlock() // Unlock after all data for this app is copied
 
+		// Render from the snapshot (instanceViews)
 		if len(instanceViews) > 0 {
 			fmt.Fprintf(w, `
     <table>
@@ -642,6 +667,7 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 </html>`, time.Now().Year())
 }
 
+// heartbeatLoop periodically updates the node's state in the KV store.
 func (nr *NodeRunner) heartbeatLoop() {
 	defer nr.shutdownWg.Done()
 	ticker := time.NewTicker(NodeHeartbeatInterval)
@@ -662,6 +688,7 @@ func (nr *NodeRunner) heartbeatLoop() {
 	}
 }
 
+// updateNodeState constructs the current node state and puts it into the KV store.
 func (nr *NodeRunner) updateNodeState(status string) error {
 	allAppInfos := nr.state.GetAllAppInfos()
 	managedInstanceIDs := make([]string, 0)
@@ -716,6 +743,7 @@ func (nr *NodeRunner) updateNodeState(status string) error {
 	return nil
 }
 
+// syncAllApps gets all current configurations and ensures apps are running.
 func (nr *NodeRunner) syncAllApps(ctx context.Context) error {
 	nr.logger.Info("Performing initial synchronization of all applications...")
 	keysLister, err := nr.kvAppConfigs.ListKeys(ctx)
@@ -730,7 +758,7 @@ func (nr *NodeRunner) syncAllApps(ctx context.Context) error {
 
 	keysSeen := make(map[string]bool)
 	syncWg := sync.WaitGroup{}
-	errChan := make(chan error, 1)
+	errChan := make(chan error, 1) // Buffer of 1 to catch first error
 
 	keysChan := keysLister.Keys()
 
@@ -739,9 +767,11 @@ syncLoop:
 		select {
 		case <-ctx.Done():
 			nr.logger.Warn("Initial synchronization canceled or timed out.", "error", ctx.Err())
-			keysLister.Stop()
+			keysLister.Stop() // Ensure lister is stopped on timeout/cancel
+			// Wait for any already running goroutines before returning
 			syncWg.Wait()
-			close(errChan)
+			close(errChan) // Close errChan after all goroutines are done
+			// Drain errChan to prevent goroutine leak if error was sent
 			for range errChan {
 			}
 			return ctx.Err()
@@ -752,7 +782,7 @@ syncLoop:
 			if key == "" {
 				continue
 			}
-			keysSeen[key] = true
+			keysSeen[key] = true // Mark key as present in KV
 
 			syncWg.Add(1)
 			go func(k string) {
@@ -763,6 +793,7 @@ syncLoop:
 				entry, getErr := nr.kvAppConfigs.Get(entryCtx, k)
 				if getErr != nil {
 					if errors.Is(getErr, jetstream.ErrKeyNotFound) {
+						// This case should be rare if ListKeys is consistent, but handle defensively
 						nr.logger.Warn("App config key disappeared during sync, treating as deleted", "key", k)
 						nr.handleAppConfigUpdate(entryCtx, &simulatedDeleteEntry{key: k, bucket: AppConfigKVBucket})
 					} else {
@@ -774,26 +805,29 @@ syncLoop:
 					}
 					return
 				}
-				nr.handleAppConfigUpdate(entryCtx, entry)
+				nr.handleAppConfigUpdate(entryCtx, entry) // Process the update
 			}(key)
 		}
 	}
 
 	syncWg.Wait()
-	close(errChan)
+	close(errChan) // Close errChan after all processing goroutines are done
 
-	if firstErr := <-errChan; firstErr != nil {
-		return firstErr
+	if firstErr := <-errChan; firstErr != nil { // Read the first error if any
+		return firstErr // Return the first processing error encountered
 	}
 
+	// Pruning Phase
 	nr.logger.Info("Pruning locally managed apps not found in KV store...")
 	allLocalApps := nr.state.GetAllAppInfos()
 	for appName, appInfo := range allLocalApps {
-		if !keysSeen[appName] {
+		if !keysSeen[appName] { // If this app wasn't in the KV keys list...
 			nr.logger.Info("Pruning app no longer in KV config", "app", appName)
+			// Lock the appInfo for stopping and deleting
 			appInfo.mu.Lock()
 			nr.cleanupAppInstancesAndCron(ctx, appInfo, nr.logger.With("app", appName))
 			appInfo.mu.Unlock()
+			// Remove the app entry from the state manager entirely
 			nr.state.DeleteApp(appName)
 		}
 	}
@@ -802,6 +836,7 @@ syncLoop:
 	return nil
 }
 
+// handleAppConfigUpdate processes a single KV entry update (PUT or DELETE).
 func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream.KeyValueEntry) {
 	if entry.Bucket() != AppConfigKVBucket {
 		nr.logger.Warn("Received KV update from unexpected bucket", "bucket", entry.Bucket())
@@ -814,8 +849,8 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 	}
 	logger = logger.With("kv_operation", entry.Operation().String())
 
-	appInfo := nr.state.GetAppInfo(appName)
-	appInfo.mu.Lock()
+	appInfo := nr.state.GetAppInfo(appName) // Gets or creates appInfo struct
+	appInfo.mu.Lock()                       // Lock the specific app's state for processing
 
 	switch entry.Operation() {
 	case jetstream.KeyValuePut:
@@ -842,10 +877,12 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 			return
 		}
 
+		// Update spec and hash in appInfo
 		configHashChanged := appInfo.configHash != newConfigHash
-		appInfo.spec = spec
+		appInfo.spec = spec // Store the parsed spec
 		appInfo.configHash = newConfigHash
 
+		// Determine target replicas for this node
 		appInfo.cronScheduler.Lock()
 		if appInfo.cronEntryID != 0 {
 			nr.cronScheduler.Remove(cron.EntryID(appInfo.cronEntryID))
@@ -1220,6 +1257,7 @@ func (nr *NodeRunner) stopAllInstancesForApp(ctx context.Context, appInfo *appIn
 	logger.Info("Finished stopping all instances for app")
 }
 
+// shutdownAllAppInstances iterates through all apps and stops their instances.
 func (nr *NodeRunner) shutdownAllAppInstances() {
 	nr.logger.Info("Stopping all managed application instances...")
 	allAppInfos := nr.state.GetAllAppInfos() // Get snapshot of all app states
