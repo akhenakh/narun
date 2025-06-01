@@ -218,13 +218,21 @@ func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger 
 	subtreeControlPath := filepath.Join(parentPath, "cgroup.subtree_control")
 	controllersToEnable := "+cpu +memory" // Add others like +io if needed
 	if writeErr := os.WriteFile(subtreeControlPath, []byte(controllersToEnable), 0644); writeErr != nil {
+		// If EACCES, it's a permission issue.
+		// If EINVAL, controllers might already be enabled or not available.
+		// This part is tricky; robust error handling or pre-flight checks are ideal.
+		// For now, log warning and proceed, applyCgroupConstraints will fail if controllers not active
 		logger.Warn("Potentially failed to enable controllers in parent cgroup. This might be okay if already enabled.",
 			"path", subtreeControlPath, "error", writeErr)
 	}
 
+	// Create the cgroup directory
 	if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
+		// Check if it already exists from a previous unclean shutdown
 		if os.IsExist(err) {
 			logger.Warn("Cgroup directory already exists, attempting to reuse.", "path", finalCgroupPath)
+			// Try to remove it first, in case it's in a bad state
+			// unix.Rmdir might fail if it has processes, but that's okay if we're about to put a new one in.
 			_ = unix.Rmdir(finalCgroupPath)
 			if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
 				return "", -1, nil, fmt.Errorf("failed to create cgroup directory '%s' even after attempting cleanup: %w", finalCgroupPath, err)
@@ -234,6 +242,7 @@ func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger 
 		}
 	}
 
+	// Open the cgroup directory to get a file descriptor
 	fd, openErr := unix.Open(finalCgroupPath, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if openErr != nil {
 		_ = unix.Rmdir(finalCgroupPath)
@@ -242,7 +251,7 @@ func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger 
 
 	cleanupFunc := func() error {
 		closeErr := unix.Close(fd)
-		rmErr := unix.Rmdir(finalCgroupPath)
+		rmErr := unix.Rmdir(finalCgroupPath) // This will fail if processes are still in it
 		if closeErr != nil && rmErr != nil {
 			return fmt.Errorf("cgroup cleanup: failed to close fd (%v) AND rmdir (%v)", closeErr, rmErr)
 		}
@@ -250,8 +259,12 @@ func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger 
 			return fmt.Errorf("cgroup cleanup: failed to close fd: %w", closeErr)
 		}
 		if rmErr != nil {
+			// Log this, as it might indicate an issue, but don't always fail the cleanup.
+			// Cgroup might be cleaned up by system eventually if it has no tasks.
 			logger.Warn("Failed to rmdir cgroup during cleanup (might have tasks or sub-cgroups)", "path", finalCgroupPath, "error", rmErr)
+			// Attempt to kill remaining processes in the cgroup
 			_ = nr.writeCgroupFile(finalCgroupPath, "cgroup.kill", "1")
+			// Retry rmdir after a short delay
 			time.Sleep(100 * time.Millisecond)
 			_ = unix.Rmdir(finalCgroupPath)
 		}
@@ -263,6 +276,7 @@ func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger 
 }
 
 func (nr *NodeRunner) writeCgroupFile(cgroupPath, file, content string) error {
+	// Open with O_WRONLY | O_TRUNC. Some cgroup files require specific modes.
 	fullPath := filepath.Join(cgroupPath, file)
 	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -278,17 +292,22 @@ func (nr *NodeRunner) writeCgroupFile(cgroupPath, file, content string) error {
 
 func (nr *NodeRunner) applyCgroupConstraints(spec *ServiceSpec, cgroupPath string, logger *slog.Logger) error {
 	logger.Info("Applying cgroup constraints", "path", cgroupPath)
+	// CPU Limit (cpu.max: quota period)
+	// Period is typically 100000 (100ms). Quota is how much of that period the cgroup can use.
+	// If CPUCores = 1.5, quota = 1.5 * 100000 = 150000.
 	if spec.CPUCores > 0 {
-		cpuPeriod := 100000
+		cpuPeriod := 100000 // Default CFS period in microseconds
 		cpuQuota := int(spec.CPUCores * float64(cpuPeriod))
 		cpuMaxContent := fmt.Sprintf("%d %d", cpuQuota, cpuPeriod)
 		if err := nr.writeCgroupFile(cgroupPath, "cpu.max", cpuMaxContent); err != nil {
 			logger.Warn("Failed to set cpu.max, CPU limits may not apply", "error", err)
+			// Don't fail entirely, but log. CPU controller might not be available/enabled.
 		} else {
 			logger.Debug("Set cpu.max", "value", cpuMaxContent)
 		}
 	}
 
+	// Memory Limits (in bytes)
 	if spec.MemoryMB > 0 {
 		memBytes := spec.MemoryMB * 1024 * 1024
 		memMaxBytes := memBytes
@@ -296,17 +315,24 @@ func (nr *NodeRunner) applyCgroupConstraints(spec *ServiceSpec, cgroupPath strin
 			memMaxBytes = spec.MemoryMaxMB * 1024 * 1024
 		}
 
+		// memory.low (soft limit)
 		if err := nr.writeCgroupFile(cgroupPath, "memory.low", strconv.FormatUint(memBytes, 10)); err != nil {
 			logger.Warn("Failed to set memory.low, memory reclaim might not be prioritized", "error", err)
 		} else {
 			logger.Debug("Set memory.low", "bytes", memBytes)
 		}
 
+		// memory.max (hard limit)
 		if err := nr.writeCgroupFile(cgroupPath, "memory.max", strconv.FormatUint(memMaxBytes, 10)); err != nil {
+			// This is more critical. If it fails, hard memory limit won't apply.
 			return fmt.Errorf("failed to set memory.max: %w. Ensure memory controller is enabled for parent cgroup.", err)
 		} else {
 			logger.Debug("Set memory.max", "bytes", memMaxBytes)
 		}
+		// Could also set memory.swap.max = 0 to disable swap for the cgroup
+		// if err := nr.writeCgroupFile(cgroupPath, "memory.swap.max", "0"); err != nil {
+		//    logger.Warn("Failed to disable swap (set memory.swap.max=0)", "error", err)
+		// }
 	}
 	return nil
 }
@@ -316,6 +342,8 @@ func (nr *NodeRunner) killCgroup(cgroupPath string, logger *slog.Logger) error {
 		return nil
 	}
 	logger.Info("Attempting to kill all processes in cgroup", "path", cgroupPath)
+	// Writing "1" to cgroup.kill sends SIGKILL to all processes in the cgroup and its descendants.
+	// This requires the cgroup.kill file to be present (unified hierarchy / cgroup v2).
 	err := nr.writeCgroupFile(cgroupPath, "cgroup.kill", "1")
 	if err != nil {
 		logger.Error("Failed to write to cgroup.kill", "path", cgroupPath, "error", err)
@@ -346,28 +374,30 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 	logger := nr.logger.With("app", appName, "instance_id", instanceID, "run_id", currentRunID, "tag", tag, "mode", currentSpec.Mode, "is_cron_job", isCronJobRun)
 	logger.Info("Attempting to start application instance")
 
+	// Fetch Binary First
 	binaryPath, fetchErr := nr.fetchAndStoreBinary(ctx, currentSpec.Tag, appName, configHashForThisRun)
 	if fetchErr != nil {
 		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
 		logger.Error(errMsg, "error", fetchErr)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
 		return fmt.Errorf("failed to fetch binary for %s: %w", instanceID, fetchErr)
 	}
 	logger.Info("Binary downloaded/verified", "path", binaryPath)
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		logger.Error("Failed to make binary executable", "path", binaryPath, "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Binary not executable: %v", err))
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
 		return fmt.Errorf("failed making binary executable %s: %w", binaryPath, err)
 	}
 
+	// Prepare Instance Directory and Working Directory
 	instanceDir := filepath.Join(nr.dataDir, "instances", instanceID)
 	workDir := filepath.Join(instanceDir, "work")
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		logger.Error("Failed to create instance working directory", "dir", workDir, "error", err)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, fmt.Sprintf("Failed work dir: %v", err))
-		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
 		return fmt.Errorf("failed to create work dir %s for instance %s: %w", workDir, instanceID, err)
 	}
 	logger.Debug("Instance directory prepared", "path", workDir)
@@ -380,7 +410,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 				errMsg := fmt.Sprintf("Failed to process mount %s: %v", mount.Path, err)
 				logger.Error(errMsg, "source_object", mount.Source.ObjectStore)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
-				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
 				return fmt.Errorf("failed to process mount %s: %w", mount.Path, err)
 			}
 			absMountPath := filepath.Join(workDir, filepath.Clean(mount.Path))
@@ -413,6 +443,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 		logger.Debug("Using node-runner's user for process", "uid", targetUID, "gid", targetGID)
 	}
 
+	// Prepare Environment Variables (including resolved secrets) for the *target application*
 	resolvedAppEnv := make([]EnvVar, len(currentSpec.Env))
 	for i, envVar := range currentSpec.Env {
 		resolvedAppEnv[i] = envVar
@@ -459,7 +490,11 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 	targetArgsJSON, _ := json.Marshal(currentSpec.Args)
 	mountInfosJSON, _ := json.Marshal(mountInfosForEnv)
 
-	envForLauncher := slices.Clone(launcherTargetEnv)
+	// Environment for the landlock launcher process itself
+	// It needs these to configure landlock and then exec the target.
+	// The launcher itself will run as the node-runner user initially, then landlock execs target.
+	// If unshare is used, unshare drops privs *before* landlock launcher.
+	envForLauncher := slices.Clone(launcherTargetEnv) // Start with target env, then add launcher specifics
 	envForLauncher = append(envForLauncher,
 		fmt.Sprintf("%s=%s", envLandlockConfigJSON, string(landlockConfigJSON)),
 		fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath),
@@ -482,6 +517,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 			return fmt.Errorf(errMsg)
 		}
+
+		// Defer cleanup only if cgroup was successfully created and we might fail later in start
 		defer func() {
 			if returnedErr != nil && cgroupCleanupFunc != nil {
 				logger.Warn("Cleaning up cgroup due to start failure", "error", returnedErr)
@@ -490,8 +527,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 				}
 			}
 		}()
+
 		if err := nr.applyCgroupConstraints(&currentSpec, cgroupPath, logger); err != nil {
 			errMsg := fmt.Sprintf("Failed to apply cgroup constraints: %v", err)
+			// cgroupCleanupFunc will be called by the defer above
 			return fmt.Errorf(errMsg)
 		}
 	}
@@ -523,9 +562,12 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 		unshareCmd := "unshare"
 		unshareArgsList := []string{
 			"--ipc", "--pid", "--mount-proc", "--fork", "--kill-child=SIGKILL",
+			// User/Group. If spec.User is empty, targetUID/GID is node-runner's user.
 			"--setuid", strconv.Itoa(int(targetUID)),
 			"--setgid", strconv.Itoa(int(targetGID)),
-			"--",
+			// TODO: Add --map-root-user if needed for some scenarios (e.g. user namespaces for rootless containers)
+			// This requires more complex UID/GID mapping setup. For now, assume target user exists on host.
+			"--", // Separator for the command unshare will run
 		}
 		commandBuilder = append(commandBuilder, unshareCmd)
 		commandBuilder = append(commandBuilder, unshareArgsList...)
@@ -533,6 +575,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 		commandBuilder = append(commandBuilder, landlockLauncherArgs...)
 		finalExecCommandParts = commandBuilder
 	} else {
+		// Standard landlock launcher path (or direct exec if mode != "landlock")
+		// If on non-Linux, cgroups/namespacing are skipped.
 		if currentSpec.Mode == "landlock" {
 			finalExecCommandParts = append([]string{landlockLauncherCmd}, landlockLauncherArgs...)
 		} else {
@@ -543,6 +587,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 
 	logger.Info("Final command to execute", "parts", finalExecCommandParts)
 	cmd = exec.CommandContext(processCtx, finalExecCommandParts[0], finalExecCommandParts[1:]...)
+	// This env is for the landlock launcher, or direct exec
 	cmd.Env = envForLauncher
 	cmd.Dir = workDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -566,10 +611,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 		InstanceID:    instanceID,
 		RunID:         currentRunID,
 		Spec:          &currentSpec, // Store pointer to the copied spec for this run
-		Cmd:           cmd,
+		Cmd:           cmd,          // Store the top-level command (nsenter/unshare/launcher)
 		Status:        StatusStarting,
 		ConfigHash:    configHashForThisRun,
-		BinaryPath:    binaryPath,
+		BinaryPath:    binaryPath, // Path to the actual application binary
 		StdoutPipe:    stdoutPipe,
 		StderrPipe:    stderrPipe,
 		StopSignal:    make(chan struct{}),
@@ -622,6 +667,16 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 		return returnedErr
 	}
 
+	// If cgroupFd was used by cmd.Start(), it's consumed. We can close our copy if we still have it.
+	// However, the cgroupFd in ManagedApp (appInstance.cgroupFd) is the one unix.Open'd.
+	// The cgroupCleanupFunc is responsible for closing this original fd.
+	// The kernel duplicates the fd for the child process.
+	// Let's ensure the original descriptor passed to createCgroup is closed if distinct from what SysProcAttr needs,
+	// but unix.Open with O_CLOEXEC should handle this for non-child processes.
+	// For UseCgroupFD, the child inherits it. The pledge example closes fd *after* cmd.Start().
+	// This means our cgroupCleanup (which includes unix.Close(fd)) should be called when the instance *stops*, not immediately after start.
+	// The `defer` handling `returnedErr` already covers failure *during* start.
+	appInstance.Pid = cmd.Process.Pid // Get the PID of the started process
 	appInstance.Pid = cmd.Process.Pid
 	appInstance.StartTime = time.Now()
 	appInstance.Status = StatusRunning
@@ -635,6 +690,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfoToUse *appInf
 	metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 	metrics.NarunNodeRunnerInstanceLastExitCode.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 
+	// Start log forwarding and monitoring goroutines
 	appInstance.LogWg.Add(2)
 	go nr.forwardLogs(appInstance, appInstance.StdoutPipe, "stdout", logger)
 	go nr.forwardLogs(appInstance, appInstance.StderrPipe, "stderr", logger)
@@ -766,6 +822,8 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		// Log entry also does not need run_id as it is part of the NATS message,
+		// and consumers of these logs might correlate by instance_id.
 		logMsg := logEntry{InstanceID: appInstance.InstanceID, AppName: appName, NodeID: nr.nodeID, Stream: streamName, Message: line, Timestamp: time.Now()}
 		logData, err := json.Marshal(logMsg)
 		if err != nil {
@@ -791,14 +849,17 @@ func (nr *NodeRunner) forwardLogs(appInstance *ManagedApp, pipe io.ReadCloser, s
 // monitorAppInstance waits for an app instance to exit and handles restarts or cleanup.
 func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.Logger) {
 	instanceID := appInstance.InstanceID
-	runID := appInstance.RunID
+	runID := appInstance.RunID // Capture RunID for this specific monitored run
 	appName := InstanceIDToAppName(instanceID)
 	spec := appInstance.Spec
 
-	logger = logger.With("run_id", runID)
+	logger = logger.With("run_id", runID) // Add RunID to monitor's logger context
 
+	// Start periodic memory polling goroutine if on Linux
 	if runtime.GOOS == "linux" {
-		appInstance.LogWg.Add(1)
+		// This goroutine will periodically update the memory metric.
+		// It's managed by the appInstance.processCtx.
+		appInstance.LogWg.Add(1) // Add to a wait group to ensure it exits cleanly
 		go func() {
 			defer appInstance.LogWg.Done()
 			pollTicker := time.NewTicker(5 * time.Second)
@@ -806,6 +867,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 			logger.Debug("Starting periodic memory metric poller for process")
 			for {
 				select {
+				// Check if process is still considered running before polling
 				case <-pollTicker.C:
 					if appInstance.Status == StatusRunning && appInstance.Pid > 0 {
 						nr.doPollMemoryAndUpdateMetric(appInstance, logger)
@@ -819,8 +881,8 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	}
 
 	defer func() {
-		appInstance.processCancel()
-		appInstance.LogWg.Wait()
+		appInstance.processCancel() // This will also stop the memory poller goroutine
+		appInstance.LogWg.Wait()    // Wait for log forwarders AND memory poller
 		logger.Debug("Monitor finished and auxiliary goroutines (logs, memory poller) completed")
 
 		if appInstance.cgroupCleanup != nil {
@@ -828,7 +890,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 			if err := appInstance.cgroupCleanup(); err != nil {
 				logger.Error("Error during cgroup cleanup", "cgroup_path", appInstance.cgroupPath, "error", err)
 			}
-			appInstance.cgroupCleanup = nil
+			appInstance.cgroupCleanup = nil // Prevent double cleanup
 		}
 
 		// For cron jobs, always remove their state and disk after they complete (success or fail).
@@ -864,6 +926,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 			}
 			// Always remove instance state from manager, regardless of disk cleanup success
 			nr.removeInstanceState(appName, instanceID, logger)
+			// With RunID, we don't delete metrics. cleanupInstanceMetrics ensures _up=0 for this run.
 			nr.cleanupInstanceMetrics(appInstance)
 		} else {
 			// For persistent services that stopped cleanly and aren't being pruned,

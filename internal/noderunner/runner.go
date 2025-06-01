@@ -1076,6 +1076,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 	logger = logger.With("mount_object", objectName, "mount_path", targetRelativePath)
 	logger.Info("Fetching and placing file mount")
 
+	// Get Object Info
 	objInfo, getInfoErr := nr.fileStore.GetInfo(ctx, objectName)
 	if getInfoErr != nil {
 		if errors.Is(getInfoErr, jetstream.ErrObjectNotFound) {
@@ -1089,6 +1090,8 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 		return fmt.Errorf("file object '%s' info is missing digest", objectName)
 	}
 
+	// Determine Local Path
+	// Ensure targetRelativePath is clean and doesn't escape instanceWorkDir
 	cleanRelativePath := filepath.Clean(targetRelativePath)
 	if strings.HasPrefix(cleanRelativePath, "..") || filepath.IsAbs(cleanRelativePath) {
 		return fmt.Errorf("invalid target mount path '%s': must be relative and within the work directory", targetRelativePath)
@@ -1096,8 +1099,10 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 	localPath := filepath.Join(instanceWorkDir, cleanRelativePath)
 	localDir := filepath.Dir(localPath)
 
+	// Check Local File and Hash
 	_, statErr := os.Stat(localPath)
 	if statErr == nil {
+		// File exists, verify hash
 		hashMatches, verifyErr := verifyLocalFileHash(localPath, expectedDigest)
 		if verifyErr == nil && hashMatches {
 			logger.Info("Local file mount exists and hash verified.", "path", localPath)
@@ -1110,11 +1115,13 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 		logger.Info("Local file mount not found.", "path", localPath)
 	}
 
+	// Download Needed
 	logger.Info("Downloading file mount object", "object", objectName, "local_path", localPath)
 	if err := os.MkdirAll(localDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory for mount path %s: %w", localDir, err)
 	}
 
+	// Use unique temp file name within the target directory
 	tempLocalPath := localPath + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
 	outFile, err := os.Create(tempLocalPath)
 	if err != nil {
@@ -1126,6 +1133,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 		if outFile != nil {
 			outFile.Close()
 		}
+		// Remove temp file if an error occurred during download/verify/rename
 		if finalErr != nil {
 			logger.Warn("Removing temporary mount file due to error", "path", tempLocalPath, "error", finalErr)
 			if remErr := os.Remove(tempLocalPath); remErr != nil && !errors.Is(remErr, os.ErrNotExist) {
@@ -1134,6 +1142,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 		}
 	}()
 
+	// Get object reader
 	objResult, err := nr.fileStore.Get(ctx, objectName)
 	if err != nil {
 		finalErr = fmt.Errorf("failed to get object reader for %s: %w", objectName, err)
@@ -1141,6 +1150,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 	}
 	defer objResult.Close()
 
+	// Copy data
 	bytesCopied, err := io.Copy(outFile, objResult)
 	if err != nil {
 		finalErr = fmt.Errorf("failed to copy object data to %s: %w", tempLocalPath, err)
@@ -1148,16 +1158,18 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 	}
 	logger.Debug("File mount data copied", "temp_path", tempLocalPath, "bytes_copied", bytesCopied)
 
+	// Sync and close file before verification/rename
 	if syncErr := outFile.Sync(); syncErr != nil {
 		logger.Error("Failed to sync temporary file", "path", tempLocalPath, "error", syncErr)
 	}
 	if closeErr := outFile.Close(); closeErr != nil {
-		outFile = nil
+		outFile = nil // Prevent double close in defer
 		finalErr = fmt.Errorf("failed to close temporary file %s: %w", tempLocalPath, closeErr)
 		return finalErr
 	}
-	outFile = nil
+	outFile = nil // Mark as closed for defer
 
+	// Verify Checksum
 	hashMatches, verifyErr := verifyLocalFileHash(tempLocalPath, expectedDigest)
 	if verifyErr != nil || !hashMatches {
 		errMsg := fmt.Sprintf("hash verification failed (err: %v, match: %v)", verifyErr, hashMatches)
@@ -1166,6 +1178,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 		return finalErr
 	}
 
+	// Atomic Rename
 	logger.Debug("Verification successful, renaming mount file", "from", tempLocalPath, "to", localPath)
 	if err = os.Rename(tempLocalPath, localPath); err != nil {
 		finalErr = fmt.Errorf("failed to finalize file mount %s: %w", localPath, err)
@@ -1177,6 +1190,7 @@ func (nr *NodeRunner) fetchAndPlaceFile(ctx context.Context, objectName, instanc
 	return nil
 }
 
+// Helper to stop all running/starting instances for a specific app
 func (nr *NodeRunner) stopAllInstancesForApp(ctx context.Context, appInfo *appInfo, logger *slog.Logger) {
 	if len(appInfo.instances) == 0 {
 		logger.Debug("No instances in appInfo to stop.")
@@ -1208,14 +1222,14 @@ func (nr *NodeRunner) stopAllInstancesForApp(ctx context.Context, appInfo *appIn
 
 func (nr *NodeRunner) shutdownAllAppInstances() {
 	nr.logger.Info("Stopping all managed application instances...")
-	allAppInfos := nr.state.GetAllAppInfos()
+	allAppInfos := nr.state.GetAllAppInfos() // Get snapshot of all app states
 
 	var wg sync.WaitGroup
 	for appName, info := range allAppInfos {
-		info.mu.Lock()
+		info.mu.Lock() // Lock specific appInfo for modification
 		instancesToStop := append([]*ManagedApp{}, info.instances...)
-		info.instances = make([]*ManagedApp, 0)
-		info.mu.Unlock()
+		info.instances = make([]*ManagedApp, 0) // Clear instances from state *before* stopping
+		info.mu.Unlock()                        // Unlock after copying and clearing
 
 		for _, instance := range instancesToStop {
 			wg.Add(1)
@@ -1228,13 +1242,16 @@ func (nr *NodeRunner) shutdownAllAppInstances() {
 				} else {
 					logger.Info("Instance shutdown completed")
 				}
-			}(appName, instance)
+				// Metrics cleanup will be handled by monitorAppInstance's defer logic
+				// when it exits due to intentional stop (runner shutting down implies shouldCleanupDisk=true).
+			}(appName, instance) // Pass instance pointer
 		}
 	}
 	wg.Wait()
 	nr.logger.Info("Finished stopping all managed application instances.")
 }
 
+// Stop signals the NodeRunner to shut down gracefully.
 func (nr *NodeRunner) Stop() {
 	nr.logger.Info("Received external stop signal")
 	select {
@@ -1291,6 +1308,9 @@ func (s *simulatedDeleteEntry) Delta() uint64                   { return 0 }
 func (s *simulatedDeleteEntry) Operation() jetstream.KeyValueOp { return jetstream.KeyValueDelete }
 func (s *simulatedDeleteEntry) Bucket() string                  { return s.bucket }
 
+// cleanupInstanceMetrics ensures metrics for a specific run are finalized.
+// With RunID, this no longer deletes metrics but ensures 'up' is 0.
+// This is likely redundant as monitorAppInstance already handles setting 'up' to 0.
 func (nr *NodeRunner) cleanupInstanceMetrics(instance *ManagedApp) {
 	if instance == nil {
 		nr.logger.Warn("cleanupInstanceMetrics called with nil instance")
@@ -1301,7 +1321,11 @@ func (nr *NodeRunner) cleanupInstanceMetrics(instance *ManagedApp) {
 	runID := instance.RunID
 	nodeID := nr.nodeID
 
+	// Ensure the 'up' metric for this specific run is 0.
+	// This should be handled by monitorAppInstance on termination.
 	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nodeID, runID).Set(0)
+	// No deletion of other metrics (Info, Memory, CPU, ExitCode for this runID)
+	// They remain as a historical record for this run.
 	nr.logger.Debug("Metrics finalized for instance run (no deletion)", "instance_id", instanceID, "run_id", runID)
 }
 
