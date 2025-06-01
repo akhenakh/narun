@@ -141,16 +141,19 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 	}
 
 	if spec.Mode == "" {
-		spec.Mode = "exec"
+		spec.Mode = "exec" // Default mode
 	}
 	if spec.Mode != "exec" && spec.Mode != "landlock" {
 		return nil, fmt.Errorf("invalid mode '%s': must be 'exec' or 'landlock'", spec.Mode)
 	}
 
+	// Validate Landlock spec only if mode is landlock
 	if spec.Mode == "landlock" {
 		if runtime.GOOS != "linux" {
+			// Log warning during parse, but runtime check in runner is definitive
 			fmt.Printf("Warning: Landlock mode specified for app '%s' during parse, but current OS is not Linux (%s).\n", spec.Name, runtime.GOOS)
 		}
+		// Validate custom paths
 		for i, p := range spec.Landlock.Paths {
 			if strings.TrimSpace(p.Path) == "" {
 				return nil, fmt.Errorf("landlock path at index %d: 'path' cannot be empty", i)
