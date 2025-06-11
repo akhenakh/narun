@@ -383,7 +383,7 @@ func handleDeployCmd(args []string) {
 		}
 		slog.Info("Detected Platform", "os", operSys, "arch", goarch)
 
-		objectName := fmt.Sprintf("%s-%s-%s", tag, operSys, goarch)
+		objectName := fmt.Sprintf("%s-%s-%s-%s", appName, tag, operSys, goarch)
 		slog.Info("--> NATS Object Store Name", "name", objectName)
 
 		binaryBaseName := filepath.Base(binaryPath)
@@ -401,6 +401,7 @@ func handleDeployCmd(args []string) {
 			Name:        objectName,
 			Description: fmt.Sprintf("Binary for %s (%s/%s) tag %s", appName, operSys, goarch, tag),
 			Metadata: map[string]string{
+				"narun-app-name":      appName,
 				"narun-goos":          operSys,
 				"narun-goarch":        goarch,
 				"narun-version-tag":   tag,
@@ -418,6 +419,7 @@ func handleDeployCmd(args []string) {
 		slog.Info("Binary uploaded", "name", objInfo.Name, "size", objInfo.Size, "digest", objInfo.Digest)
 		slog.Info(" --> Metadata", "goos", objInfo.Metadata["narun-goos"], "goarch", objInfo.Metadata["narun-goarch"], "tag", objInfo.Metadata["narun-version-tag"])
 		slog.Info("--- Finished processing binary ---", "path", binaryPath)
+
 	}
 
 	if uploadErrors {
@@ -595,8 +597,8 @@ Options:
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "OBJECT NAME\tSIZE\tMODIFIED\tTAG\tOS\tARCH\tDIGEST")
-	fmt.Fprintln(tw, "-----------\t----\t--------\t---\t--\t----\t------")
+	fmt.Fprintln(tw, "OBJECT NAME\tSIZE\tMODIFIED\tAPP NAME\tTAG\tOS\tARCH\tDIGEST")
+	fmt.Fprintln(tw, "-----------\t----\t--------\t--------\t---\t--\t----\t------")
 
 	count := 0
 	for _, objInfo := range objects {
@@ -604,9 +606,13 @@ Options:
 			continue
 		}
 		count++
+		appName := objInfo.Metadata["narun-app-name"]
 		tag := objInfo.Metadata["narun-version-tag"]
 		goos := objInfo.Metadata["narun-goos"]
 		goarch := objInfo.Metadata["narun-goarch"]
+		if appName == "" {
+			appName = "-"
+		}
 		if tag == "" {
 			tag = "-"
 		}
@@ -617,8 +623,8 @@ Options:
 			goarch = "-"
 		}
 		modTime := objInfo.ModTime.Local().Format(time.RFC3339)
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			objInfo.Name, objInfo.Size, modTime, tag, goos, goarch, objInfo.Digest)
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			objInfo.Name, objInfo.Size, modTime, appName, tag, goos, goarch, objInfo.Digest)
 	}
 	tw.Flush()
 	slog.Info(fmt.Sprintf("Found %d image(s).", count))

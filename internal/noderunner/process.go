@@ -1140,7 +1140,7 @@ func (nr *NodeRunner) publishStatusUpdate(instanceID string, status AppStatus, p
 // fetchAndStoreBinary downloads the binary from NATS Object Store for the node's platform.
 // It uses the object's digest to version the local storage path.
 func (nr *NodeRunner) fetchAndStoreBinary(ctx context.Context, tag, appName, configHash string) (string, error) {
-	targetObjectName := fmt.Sprintf("%s-%s-%s", tag, nr.localOS, nr.localArch)
+	targetObjectName := fmt.Sprintf("%s-%s-%s-%s", appName, tag, nr.localOS, nr.localArch)
 	logger := nr.logger.With("app", appName, "tag", tag, "object", targetObjectName)
 
 	objInfo, getInfoErr := nr.appBinaries.GetInfo(ctx, targetObjectName)
