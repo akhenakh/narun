@@ -1,11 +1,11 @@
 package caddynarun
 
 import (
+	"bytes"
 	"errors" // Import errors package
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +15,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap" // Caddy uses Zap logger
 )
@@ -222,39 +223,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// Directly use the configured Service name as the target NATS subject
 	natsSubject := h.Service
 	startTime := time.Now()
-
-	h.logger.Debug("Matched Caddy route, proxying via NATS Micro",
-		zap.String("method", r.Method),
-		zap.String("path", r.URL.Path),
-		zap.String("target_service", h.Service),
-		zap.String("nats_subject", natsSubject),
-	)
-
-	// Read request body
-	body, err := io.ReadAll(r.Body)
+	encoder := &bhttp.RequestEncoder{}
+	bhttpMsg, err := encoder.EncodeRequest(r)
 	if err != nil {
-		h.logger.Error("Error reading request body", zap.Error(err), zap.String("path", r.URL.Path), zap.String("service", h.Service))
-		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to read request body: %w", err))
+		h.logger.Error("Error encoding request to BHTTP", zap.Error(err), zap.String("path", r.URL.Path), zap.String("service", h.Service))
+		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to encode request: %w", err))
 	}
-	defer r.Body.Close()
 
-	// Prepare NATS Request Message with Headers
+	bhttpPayload, err := io.ReadAll(bhttpMsg)
+	if err != nil {
+		h.logger.Error("Error reading encoded BHTTP message", zap.Error(err), zap.String("path", r.URL.Path), zap.String("service", h.Service))
+		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("failed to read encoded request: %w", err))
+	}
+
+	// Prepare NATS Request Message with BHTTP payload
 	natsRequest := nats.NewMsg(natsSubject)
-	natsRequest.Data = body
+	natsRequest.Data = bhttpPayload
 	natsRequest.Header = make(nats.Header)
-
-	// Copy original HTTP headers
-	for key, values := range r.Header {
-		for _, value := range values {
-			natsRequest.Header.Add(key, value)
-		}
-	}
-	// Add custom X-Original-* headers
-	natsRequest.Header.Set("X-Original-Method", r.Method)
-	natsRequest.Header.Set("X-Original-Path", r.URL.Path)
-	natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery)
-	natsRequest.Header.Set("X-Original-Host", r.Host)
-	natsRequest.Header.Set("X-Original-RemoteAddr", r.RemoteAddr)
+	// Add a header to indicate the payload format
+	natsRequest.Header.Set("Content-Type", "application/bhttp")
 
 	// Send NATS Request using RequestMsg
 	natsReply, err := h.nc.RequestMsg(natsRequest, h.timeout)
@@ -276,7 +263,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			natsStatus = metrics.StatusError
 			h.logger.Warn("NATS no responders", zap.String("subject", natsSubject), zap.String("service", h.Service))
 		} else {
-			// For other errors (e.g., connection broken mid-request after IsConnected check passed)
 			natsStatus = metrics.StatusError
 			h.logger.Error("NATS request error", zap.String("subject", natsSubject), zap.Error(err), zap.String("service", h.Service))
 		}
@@ -290,44 +276,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	h.logger.Debug("Received NATS reply",
 		zap.String("reply_subject", natsReply.Subject),
 		zap.Int("reply_size", len(natsReply.Data)),
-		zap.Any("reply_headers", natsReply.Header),
 		zap.String("service", h.Service),
 	)
 
-	// Determine HTTP status code from response header
-	statusCode := http.StatusOK
-	statusStr := natsReply.Header.Get("X-Response-Status-Code")
-	if statusStr != "" {
-		if code, errConv := strconv.Atoi(statusStr); errConv == nil && code >= 100 && code < 600 {
-			statusCode = code
-		} else {
-			h.logger.Warn("Invalid or missing X-Response-Status-Code header in NATS reply",
-				zap.String("value", statusStr), zap.Error(errConv), zap.String("service", h.Service))
-		}
+	// --- BHTTP Response Decoding ---
+	decoder := &bhttp.ResponseDecoder{}
+	bhttpResp, err := decoder.DecodeResponse(r.Context(), bytes.NewReader(natsReply.Data))
+	if err != nil {
+		h.logger.Error("Error decoding BHTTP response from NATS reply", zap.Error(err), zap.String("service", h.Service))
+		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("failed to decode backend response: %w", err))
 	}
+	defer bhttpResp.Body.Close()
 
-	// Copy headers from NATS reply to HTTP response writer
+	// Copy headers from decoded BHTTP response to HTTP response writer
 	respHeader := w.Header()
-	for key, values := range natsReply.Header {
-		if key == "X-Response-Status-Code" || key == "Nats-Service-Error-Code" || key == "Nats-Service-Error" {
-			continue
-		}
+	for key, values := range bhttpResp.Header {
+		respHeader[key] = values
+	}
+	// Copy trailers if any
+	for key, values := range bhttpResp.Trailer {
 		respHeader[key] = values
 	}
 
 	// Write HTTP status and body
-	w.WriteHeader(statusCode)
-	if len(natsReply.Data) > 0 {
-		_, writeErr := w.Write(natsReply.Data)
+	w.WriteHeader(bhttpResp.StatusCode)
+	if bhttpResp.ContentLength != 0 {
+		_, writeErr := io.Copy(w, bhttpResp.Body)
 		if writeErr != nil {
-			h.logger.Error("Error writing response body", zap.Error(writeErr), zap.Int("status", statusCode), zap.String("service", h.Service))
+			h.logger.Error("Error writing response body", zap.Error(writeErr), zap.Int("status", bhttpResp.StatusCode), zap.String("service", h.Service))
 		}
 	}
 
-	h.logger.Debug("Finished proxying request via NATS Micro",
+	h.logger.Debug("Finished proxying request via BHTTP over NATS Micro",
 		zap.String("method", r.Method),
 		zap.String("path", r.URL.Path),
-		zap.Int("status", statusCode),
+		zap.Int("status", bhttpResp.StatusCode),
 		zap.Duration("duration", time.Since(startTime)),
 		zap.String("service", h.Service),
 	)
