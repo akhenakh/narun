@@ -285,6 +285,7 @@ This model aims to provide strong isolation and apply the principle of least pri
 - [X] add shared files just like secrets
 - [X] rename narun delete-app to narun app delete/list/deploy
 - [X] taskfiles
+- [X] use BHTTP to serialize requests
 - add a backgroup loop to monitor memory and cpu and update the metrics
 - consistent naming of the KV/ObjectStore
 - [] Mount a directory from the host (wait until isolation or chroot)
@@ -311,8 +312,13 @@ This model aims to provide strong isolation and apply the principle of least pri
 - [X] the gateway does not handle subpath
 - [X] the NATS disconnecting is terminating caddy
 - in a deploy config if the path is not ending with / the route is not working
+- the cron branch does not start properly, narun ui is not even responding
+- [X] the object store path of a binary needs to be prefixed by the service name
+- the logs output from the apps are not working anymore with cgroups
+- one nats service app registering the same name as another can hijack it
 
 ## Ideas
+- add a node status command
 - enforce semver
 - if the app is a nats consumer:
   - in the deploy file add a section `nats` to describe what subject the app is allowed to consume, then auto provision nkeys and subscribe the application only for its own subject.

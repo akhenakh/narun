@@ -194,7 +194,6 @@ func (h *Handler) Cleanup() error {
 
 // ServeHTTP handles the incoming HTTP request, routing it via NATS Micro.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Check NATS connection object initialization
 	if h.nc == nil {
 		h.logger.Error("NATS connection object is nil, cannot handle request",
 			zap.String("path", r.URL.Path),
@@ -203,10 +202,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("NATS service '%s' misconfigured or NATS client failed to initialize", h.Service))
 	}
 
-	// Check NATS connection status
 	if !h.nc.IsConnected() {
 		statusStr := "unknown"
-		if h.nc != nil { // Safe to call Status() if nc is not nil
+		if h.nc != nil {
 			statusStr = h.nc.Status().String()
 		}
 		h.logger.Warn("NATS connection not currently active for request handling",
@@ -214,15 +212,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			zap.String("method", r.Method),
 			zap.String("service", h.Service),
 			zap.String("nats_client_status", statusStr),
-			// ConnectedUrl() returns last known connected URL, or "" if never connected.
 			zap.String("nats_server_url_last_connected", h.nc.ConnectedUrl()),
 		)
 		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("NATS service '%s' temporarily unavailable", h.Service))
 	}
 
-	// Directly use the configured Service name as the target NATS subject
 	natsSubject := h.Service
 	startTime := time.Now()
+
+	h.logger.Debug("Matched Caddy route, proxying via BHTTP over NATS Micro",
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.String("target_service", h.Service),
+		zap.String("nats_subject", natsSubject),
+	)
+
+	// BHTTP encoder expects a client-side request, where RequestURI is not set.
+	// The incoming server-side request has it set, so we clear it.
+	r.RequestURI = ""
+
+	//  BHTTP Request Encoding
 	encoder := &bhttp.RequestEncoder{}
 	bhttpMsg, err := encoder.EncodeRequest(r)
 	if err != nil {
@@ -240,7 +249,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	natsRequest := nats.NewMsg(natsSubject)
 	natsRequest.Data = bhttpPayload
 	natsRequest.Header = make(nats.Header)
-	// Add a header to indicate the payload format
 	natsRequest.Header.Set("Content-Type", "application/bhttp")
 
 	// Send NATS Request using RequestMsg
@@ -279,7 +287,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		zap.String("service", h.Service),
 	)
 
-	// --- BHTTP Response Decoding ---
+	//  BHTTP Response Decoding
 	decoder := &bhttp.ResponseDecoder{}
 	bhttpResp, err := decoder.DecodeResponse(r.Context(), bytes.NewReader(natsReply.Data))
 	if err != nil {

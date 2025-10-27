@@ -367,7 +367,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	logger.Info("Attempting to start application instance")
 
 	// Fetch Binary First
-	binaryPath, fetchErr := nr.fetchAndStoreBinary(ctx, spec.Tag, appName, appInfo.configHash)
+	binaryPath, fetchErr := nr.fetchAndStoreBinary(ctx, tag, appName, appInfo.configHash)
 	if fetchErr != nil {
 		errMsg := fmt.Sprintf("Binary fetch failed: %v", fetchErr)
 		logger.Error(errMsg, "error", fetchErr)

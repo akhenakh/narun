@@ -12,7 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync" // Import sync package
+	"sync"
 	"syscall"
 	"time"
 
@@ -86,9 +86,8 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	}
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = runtime.NumCPU() * 2
-	} // Default concurrency
+	}
 
-	//  Concurrency Control Semaphore
 	concurrencySem := make(chan struct{}, opts.MaxConcurrent)
 	logger.Debug("Concurrency limit set", "max", opts.MaxConcurrent)
 
@@ -125,7 +124,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 		startTime := time.Now()
 		logger.Debug("Processing request", "subject", req.Subject())
 
-		// --- BHTTP Request Decoding ---
+		// BHTTP Request Decoding
 		decoder := &bhttp.RequestDecoder{}
 		httpReq, err := decoder.DecodeRequest(context.Background(), bytes.NewReader(req.Data()))
 		if err != nil {
@@ -160,7 +159,7 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 			handler.ServeHTTP(responseShim, httpReq)
 		}()
 
-		// --- BHTTP Response Encoding ---
+		// BHTTP Response Encoding
 		var finalResponse *http.Response
 		if handlerPanicErr != nil {
 			finalResponse = &http.Response{
@@ -172,9 +171,9 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 			finalResponse = &http.Response{
 				StatusCode: responseShim.statusCode,
 				Header:     responseShim.header,
-				Body:       io.NopCloser(responseShim.body),
+				// Create a new reader from the buffer's bytes to "rewind" it.
+				Body: io.NopCloser(bytes.NewReader(responseShim.body.Bytes())),
 			}
-			// BHTTP encoder handles Content-Length automatically based on body.
 		}
 
 		encoder := &bhttp.ResponseEncoder{}

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/metrics"
+	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
 )
 
@@ -57,16 +59,17 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *HttpHandler) makeRouteHandler(routeCfg *gwconfig.RouteConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
-		path := r.URL.Path // Path matched by ServeMux
+		path := r.URL.Path
 		method := r.Method
+		subject := routeCfg.Service
 
-		logger := h.Logger.With("path", path, "method", method, "nats_service", routeCfg.Service)
+		logger := h.Logger.With("path", path, "method", method, "nats_service", subject)
 
-		// Method Check (still useful even after mux routing)
+		// Method Check
 		methodAllowed := false
 		upperMethod := strings.ToUpper(method)
 		for _, allowedMethod := range routeCfg.Methods {
-			if upperMethod == allowedMethod { // Methods in config are already uppercase
+			if upperMethod == allowedMethod {
 				methodAllowed = true
 				break
 			}
@@ -79,43 +82,40 @@ func (h *HttpHandler) makeRouteHandler(routeCfg *gwconfig.RouteConfig) http.Hand
 			return
 		}
 
-		// --- NATS Request Logic (Moved from original ServeHTTP) ---
+		// BHTTP Request Encoding
+		logger.Debug("Encoding request to BHTTP format")
 
-		// Read request body
-		body, err := io.ReadAll(r.Body)
+		// BHTTP encoder expects a client-side request, where RequestURI is not set.
+		// The incoming server-side request has it set, so we clear it.
+		// The URL field is already parsed and is what the encoder will use.
+		r.RequestURI = ""
+
+		encoder := &bhttp.RequestEncoder{}
+		bhttpMsg, err := encoder.EncodeRequest(r)
 		if err != nil {
-			logger.Error("Error reading request body", "error", err)
-			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+			logger.Error("Error encoding request to BHTTP", "error", err)
+			http.Error(w, "Failed to encode request", http.StatusInternalServerError)
 			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
 			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 			return
 		}
-		defer r.Body.Close()
 
-		// Create NATS Request Message with Headers
-		subject := routeCfg.Service // Directly use the service from the captured route config
-		natsRequest := nats.NewMsg(subject)
-		natsRequest.Data = body
-		natsRequest.Header = make(nats.Header)
-
-		// Copy original HTTP headers to NATS headers
-		for key, values := range r.Header {
-			for _, value := range values {
-				natsRequest.Header.Add(key, value)
-			}
+		bhttpPayload, err := io.ReadAll(bhttpMsg)
+		if err != nil {
+			logger.Error("Error reading encoded BHTTP message", "error", err)
+			http.Error(w, "Failed to read encoded request", http.StatusInternalServerError)
+			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusInternalServerError)).Inc()
+			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+			return
 		}
 
-		// Add custom headers needed for reconstruction on the consumer side
-		natsRequest.Header.Set("X-Original-Method", method)
-		natsRequest.Header.Set("X-Original-Path", path)            // Use the actual request path
-		natsRequest.Header.Set("X-Original-Query", r.URL.RawQuery) // Pass query params
-		natsRequest.Header.Set("X-Original-Host", r.Host)
-		natsRequest.Header.Set("X-Original-RemoteAddr", r.RemoteAddr)
+		// Create NATS Request Message with BHTTP payload
+		natsRequest := nats.NewMsg(subject)
+		natsRequest.Data = bhttpPayload
+		natsRequest.Header = make(nats.Header)
+		natsRequest.Header.Set("Content-Type", "application/bhttp")
 
-		logger.Debug("Sending NATS request",
-			"subject", natsRequest.Subject,
-			"headers", natsRequest.Header,
-			"body_len", len(natsRequest.Data))
+		logger.Debug("Sending NATS request", "subject", subject, "body_len", len(natsRequest.Data))
 
 		// Send request using standard NATS RequestMsg
 		natsReply, err := h.NatsConn.RequestMsg(natsRequest, h.Config.RequestTimeout)
@@ -132,62 +132,58 @@ func (h *HttpHandler) makeRouteHandler(routeCfg *gwconfig.RouteConfig) http.Hand
 				logger.Warn("NATS request timeout", "subject", subject, "timeout", h.Config.RequestTimeout)
 				natsStatus = metrics.StatusTimeout
 			} else if errors.Is(err, nats.ErrNoResponders) {
-				// Added check for NoResponders
 				statusCode = http.StatusServiceUnavailable
 				respBody = "No backend service available"
 				logger.Warn("NATS no responders", "subject", subject)
-				natsStatus = metrics.StatusError // Treat as error for gateway metric
+				natsStatus = metrics.StatusError
 			} else {
 				logger.Error("NATS request error", "subject", subject, "error", err)
 			}
 
 			metrics.NatsRequestsTotal.WithLabelValues(subject, natsStatus).Inc()
-			http.Error(w, respBody, statusCode) // Use http.Error for simplicity
+			http.Error(w, respBody, statusCode)
 			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
 			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 			return
 		}
 
 		// Process Successful NATS Reply
-		logger.Debug("Received NATS reply",
-			"subject", natsReply.Subject,
-			"headers", natsReply.Header,
-			"body_len", len(natsReply.Data))
-
+		logger.Debug("Received NATS reply", "reply_subject", natsReply.Subject, "body_len", len(natsReply.Data))
 		metrics.NatsRequestsTotal.WithLabelValues(subject, metrics.StatusSuccess).Inc()
 
-		// Determine HTTP status code from response header
-		statusCode := http.StatusOK
-		statusStr := natsReply.Header.Get("X-Response-Status-Code")
-		if statusStr != "" {
-			if code, err := strconv.Atoi(statusStr); err == nil && code >= 100 && code < 600 {
-				statusCode = code
-			} else {
-				logger.Warn("Invalid or missing X-Response-Status-Code header in NATS reply", "value", statusStr, "error", err)
-			}
+		// BHTTP Response Decoding
+		logger.Debug("Decoding BHTTP response from NATS reply")
+		decoder := &bhttp.ResponseDecoder{}
+		bhttpResp, err := decoder.DecodeResponse(r.Context(), bytes.NewReader(natsReply.Data))
+		if err != nil {
+			logger.Error("Error decoding BHTTP response from NATS reply", "error", err)
+			http.Error(w, "Failed to decode backend response", http.StatusBadGateway)
+			metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(http.StatusBadGateway)).Inc()
+			metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
+			return
 		}
+		defer bhttpResp.Body.Close()
 
-		// Copy headers from NATS reply header to HTTP response writer
-		respHeader := w.Header() // Get header map before writing status
-		for key, values := range natsReply.Header {
-			if key == "X-Response-Status-Code" || key == "Nats-Service-Error-Code" || key == "Nats-Service-Error" {
-				continue
-			}
-			// Assign the slice directly is more efficient for http.Header
+		// Copy headers from decoded BHTTP response to HTTP response writer
+		respHeader := w.Header()
+		for key, values := range bhttpResp.Header {
+			respHeader[key] = values
+		}
+		// Copy trailers if any
+		for key, values := range bhttpResp.Trailer {
 			respHeader[key] = values
 		}
 
 		// Write HTTP response status and body
-		w.WriteHeader(statusCode)
-		if len(natsReply.Data) > 0 {
-			_, writeErr := w.Write(natsReply.Data)
+		w.WriteHeader(bhttpResp.StatusCode)
+		if bhttpResp.ContentLength != 0 {
+			_, writeErr := io.Copy(w, bhttpResp.Body)
 			if writeErr != nil {
-				logger.Error("Error writing HTTP response body", "error", writeErr, "status", statusCode)
-				// Cannot change status code now, but log it
+				logger.Error("Error writing HTTP response body", "error", writeErr, "status", bhttpResp.StatusCode)
 			}
 		}
 
-		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(statusCode)).Inc()
+		metrics.HttpRequestsTotal.WithLabelValues(method, path, strconv.Itoa(bhttpResp.StatusCode)).Inc()
 		metrics.HttpRequestDuration.WithLabelValues(method, path).Observe(time.Since(startTime).Seconds())
 	}
 }
