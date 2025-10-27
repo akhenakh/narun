@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,13 +12,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync" // Import sync package
+	"sync"
 	"syscall"
 	"time"
 
-	"maps"
-
 	"github.com/akhenakh/narun/internal/metrics"
+	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/grpc"
@@ -86,9 +86,8 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	}
 	if opts.MaxConcurrent <= 0 {
 		opts.MaxConcurrent = runtime.NumCPU() * 2
-	} // Default concurrency
+	}
 
-	//  Concurrency Control Semaphore
 	concurrencySem := make(chan struct{}, opts.MaxConcurrent)
 	logger.Debug("Concurrency limit set", "max", opts.MaxConcurrent)
 
@@ -115,66 +114,40 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 	}
 
 	httpHandlerAdapter := func(req micro.Request) {
-		// Acquire Concurrency Semaphore
 		concurrencySem <- struct{}{}
-		metrics.WorkerCount.WithLabelValues(opts.ServiceName, "default").Inc() // Increment active worker gauge
+		metrics.WorkerCount.WithLabelValues(opts.ServiceName, "default").Inc()
 		defer func() {
-			<-concurrencySem                                                       // Release semaphore when done
-			metrics.WorkerCount.WithLabelValues(opts.ServiceName, "default").Dec() // Decrement active worker gauge
+			<-concurrencySem
+			metrics.WorkerCount.WithLabelValues(opts.ServiceName, "default").Dec()
 		}()
 
 		startTime := time.Now()
-		logger.Debug("Processing request", "subject", req.Subject()) // Simplified log
+		logger.Debug("Processing request", "subject", req.Subject())
 
-		// Get Pooled Objects
-		responseShim := shimPool.Get().(*responseWriterShim)
-		// Ensure the shim gets a buffer from the pool upon retrieval/reset
-		responseShim.body = bufferPool.Get().(*bytes.Buffer)
-		// Reset shim state *before* use (alternative to resetting before Put)
-		responseShim.Reset()
-		// Get the body buffer again after reset cleared it
-		responseShim.body = bufferPool.Get().(*bytes.Buffer)
-
-		// Ensure shim is returned to pool even on panic, and reset state
-		defer func() {
-			responseShim.Reset() // Calls Put on the internal buffer
-			shimPool.Put(responseShim)
-		}()
-
-		// Extract HTTP info
-		incomingHeaders := req.Headers()
-		method := incomingHeaders.Get("X-Original-Method")
-		if method == "" {
-			method = "POST"
-		}
-		path := incomingHeaders.Get("X-Original-Path")
-		if path == "" {
-			path = "/"
-		}
-		query := incomingHeaders.Get("X-Original-Query")
-		host := incomingHeaders.Get("X-Original-Host")
-		remoteAddr := incomingHeaders.Get("X-Original-RemoteAddr")
-
-		// Reconstruct HTTP request
-		httpReq, err := reconstructHttpRequest(context.Background(), method, path, query, host, remoteAddr, incomingHeaders, req.Data())
+		// BHTTP Request Decoding
+		decoder := &bhttp.RequestDecoder{}
+		httpReq, err := decoder.DecodeRequest(context.Background(), bytes.NewReader(req.Data()))
 		if err != nil {
-			logger.Error("Failed to reconstruct HTTP request", "error", err)
-			// Error Handling using Pooled Headers
-			errorHeaders := headerPool.Get().(nats.Header)
-			defer headerPool.Put(errorHeaders) // Return headers to pool
-			clearHeader(errorHeaders)          // Clear before reuse/return
-
-			errorHeaders.Set("Nats-Service-Error-Code", strconv.Itoa(http.StatusInternalServerError))
-			errorHeaders.Set("Nats-Service-Error", "Failed to reconstruct HTTP request")
-			respondErr := req.Respond(nil, micro.WithHeaders(micro.Headers(errorHeaders))) // Cast needed
+			logger.Error("Failed to decode BHTTP request", "error", err)
+			respondErr := req.Error(strconv.Itoa(http.StatusBadRequest), "Failed to decode BHTTP request", nil)
 			if respondErr != nil {
 				logger.Error("Failed to send error response", "error", respondErr)
 			}
-			return // Return after handling error
+			return
 		}
+		defer httpReq.Body.Close()
 
-		// Process with http.Handler
-		// Catch panics from user handler to prevent crashing the consumer instance
+		// Get Pooled Objects
+		responseShim := shimPool.Get().(*responseWriterShim)
+		responseShim.body = bufferPool.Get().(*bytes.Buffer)
+		responseShim.Reset()
+		responseShim.body = bufferPool.Get().(*bytes.Buffer)
+
+		defer func() {
+			responseShim.Reset()
+			shimPool.Put(responseShim)
+		}()
+
 		var handlerPanicErr error
 		func() {
 			defer func() {
@@ -186,43 +159,60 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 			handler.ServeHTTP(responseShim, httpReq)
 		}()
 
-		// Success/Error Response Handling using Pooled Headers
-		replyHeaders := headerPool.Get().(nats.Header)
-		defer headerPool.Put(replyHeaders) // Return headers to pool
-		clearHeader(replyHeaders)          // Clear before reuse/return
-
-		// Check if handler panicked
+		// BHTTP Response Encoding
+		var finalResponse *http.Response
 		if handlerPanicErr != nil {
-			// Send a 500 error if the handler panicked
-			responseShim.statusCode = http.StatusInternalServerError // Ensure status is 500
-			replyHeaders.Set("Nats-Service-Error-Code", strconv.Itoa(http.StatusInternalServerError))
-			replyHeaders.Set("Nats-Service-Error", "Internal Server Error")
-			// Don't copy headers from shim in case of panic
-			err = req.Respond(nil, micro.WithHeaders(micro.Headers(replyHeaders))) // Send empty body
+			finalResponse = &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("Internal Server Error")),
+			}
 		} else {
-			// Normal response: Copy headers from shim
-			maps.Copy(replyHeaders, responseShim.Header())
-			replyHeaders.Set("X-Response-Status-Code", fmt.Sprintf("%d", responseShim.statusCode))
-			// Send response
-			err = req.Respond(responseShim.body.Bytes(), micro.WithHeaders(micro.Headers(replyHeaders))) // Cast needed
+			finalResponse = &http.Response{
+				StatusCode: responseShim.statusCode,
+				Header:     responseShim.header,
+				// Create a new reader from the buffer's bytes to "rewind" it.
+				Body: io.NopCloser(bytes.NewReader(responseShim.body.Bytes())),
+			}
 		}
 
+		encoder := &bhttp.ResponseEncoder{}
+		bhttpMsg, err := encoder.EncodeResponse(finalResponse)
+		if err != nil {
+			logger.Error("Failed to encode response to BHTTP", "error", err)
+			err = req.Error(strconv.Itoa(http.StatusInternalServerError), "Failed to encode response", nil)
+			if err != nil {
+				logger.Error("Failed to send encoding error response", "error", err)
+			}
+			return
+		}
+
+		bhttpPayload, err := io.ReadAll(bhttpMsg)
+		if err != nil {
+			logger.Error("Failed to read encoded BHTTP response", "error", err)
+			err = req.Error(strconv.Itoa(http.StatusInternalServerError), "Failed to read encoded response", nil)
+			if err != nil {
+				logger.Error("Failed to send encoding error response", "error", err)
+			}
+			return
+		}
+
+		err = req.Respond(bhttpPayload)
 		if err != nil {
 			logger.Error("Failed to send NATS response", "error", err)
 		}
 
-		// Record metrics (status code might be 500 due to panic)
 		duration := time.Since(startTime).Seconds()
-		statusStr := fmt.Sprintf("%d", responseShim.statusCode) // Use status code captured (or set to 500)
+		statusStr := fmt.Sprintf("%d", finalResponse.StatusCode)
 		metrics.RequestProcessingTime.WithLabelValues(
 			opts.ServiceName,
-			"default", // Endpoint name or label
+			"default",
 			statusStr,
 		).Observe(duration)
 
 		logger.Debug("Request processed",
 			"subject", req.Subject(),
-			"status", responseShim.statusCode,
+			"status", finalResponse.StatusCode,
 			"duration_ms", duration*1000)
 	}
 
