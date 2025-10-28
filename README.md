@@ -129,6 +129,7 @@ go build -o hello-consumer ./consumers/cmd/hello
 # Build Caddy with Plugin
 # Assumes xcaddy is installed (go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest)
 xcaddy build --with github.com/akhenakh/narun/caddynarun@latest
+```
 
 ## Why NATS Micro (and narun)?
 
