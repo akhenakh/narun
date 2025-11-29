@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"slices"
@@ -27,6 +28,7 @@ const (
 	envLandlockTargetArgsJSON       = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
 	envLandlockInstanceRoot         = "NARUN_INTERNAL_INSTANCE_ROOT"
 	envLandlockMountInfosJSON       = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
+	envLandlockLocalPorts           = "NARUN_INTERNAL_LOCAL_PORTS"
 	landlockLauncherErrCode         = 120 // Specific exit code for launcher errors
 	landlockUnsupportedErrCode      = 121 // Specific exit code if landlock unsupported
 	landlockLockFailedErrCode       = 122 // Specific exit code if l.Lock fails
@@ -133,6 +135,7 @@ func runLandlockLauncher() {
 	targetArgsJSON := os.Getenv(envLandlockTargetArgsJSON)
 	instanceRoot := os.Getenv(envLandlockInstanceRoot) // Get instance root from env
 	mountInfosJSON := os.Getenv(envLandlockMountInfosJSON)
+	localPortsJSON := os.Getenv(envLandlockLocalPorts)
 
 	if configJSON == "" || targetCmdPath == "" || targetArgsJSON == "" {
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Missing required environment variables for basic operation (%s, %s, %s).\n",
@@ -160,6 +163,44 @@ func runLandlockLauncher() {
 
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Target application path: %s\n", targetCmdPath)
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Target args: %v\n", targetArgs)
+
+	// Start Guest-Side Socat Proxies (if configured)
+	if localPortsJSON != "" {
+		var localPorts []noderunner.PortForward // Decode into struct slice
+		if err := json.Unmarshal([]byte(localPortsJSON), &localPorts); err != nil {
+			fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Failed to parse local ports JSON: %v\n", err)
+		} else {
+			for _, pf := range localPorts {
+				port := pf.Port
+				proto := pf.Protocol
+
+				// Must match naming convention in process.go
+				socketPath := fmt.Sprintf("/.narun/sockets/%d_%s.sock", port, proto)
+
+				// Determine Listen Type
+				listenAddr := fmt.Sprintf("TCP-LISTEN:%d,fork,bind=127.0.0.1", port)
+				if proto == "udp" {
+					listenAddr = fmt.Sprintf("UDP-LISTEN:%d,fork,bind=127.0.0.1", port)
+				}
+
+				// Guest Side: Listen on Localhost Port -> Connect to Unix Socket
+				args := []string{
+					listenAddr,
+					fmt.Sprintf("UNIX-CONNECT:%s", socketPath),
+				}
+
+				cmd := exec.Command("socat", args...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+
+				if err := cmd.Start(); err != nil {
+					fmt.Fprintf(os.Stderr, "[narun-launcher] Failed to start guest socat for %s/%d: %v\n", proto, port, err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[narun-launcher] Started guest socat for %s/%d (pid %d)\n", proto, port, cmd.Process.Pid)
+				}
+			}
+		}
+	}
 
 	// Build Landlock Paths from Spec
 	var landlockPaths []*ll.Path
@@ -201,8 +242,15 @@ func runLandlockLauncher() {
 		}
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying rules for %d mounted file(s)...\n", len(mountInfos))
 		for _, mount := range mountInfos {
-			landlockPaths = append(landlockPaths, ll.File(mount.ResolvedAbs, "r"))
-			fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock mount rule: Path=%s Modes=r\n", mount.ResolvedAbs)
+			// If it's a socket directory mount (for localPorts), we need RW access
+			if mount.Source == "local-sockets" {
+				landlockPaths = append(landlockPaths, ll.Dir(mount.Path, "rwc"))
+				fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock socket dir rule: Path=%s Modes=rwc\n", mount.Path)
+			} else {
+				// Standard mounts are read-only for now
+				landlockPaths = append(landlockPaths, ll.File(mount.ResolvedAbs, "r"))
+				fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock mount rule: Path=%s Modes=r\n", mount.ResolvedAbs)
+			}
 		}
 	}
 

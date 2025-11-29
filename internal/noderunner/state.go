@@ -28,6 +28,7 @@ type ManagedApp struct {
 	RunID         string             // Unique ID for this specific run of the instance process
 	Spec          *ServiceSpec       // The configuration this instance is running with (pointer to shared spec)
 	Cmd           *exec.Cmd          // The running process command
+	AuxCmds       []*exec.Cmd        // Auxiliary commands (e.g., host-side socat processes)
 	Status        AppStatus          // Current status of the app instance
 	Pid           int                // Process ID
 	StartTime     time.Time          // When the process was last started

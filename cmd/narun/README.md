@@ -107,6 +107,17 @@ You can either provide a full `ServiceSpec` configuration file (`-config`) or sp
 *   Uploads binary to `app-binaries` OS bucket.
 *   Generates a simple `ServiceSpec` in memory and uploads it to `app-configs` KV store under the key `simple-app`.
 
+## Network  
+The guest application can reached some ports of the host node, by using localPorts:
+```yaml
+network:
+  localPorts:
+    - port: 4222 # Implicit TCP
+    - port: 53   # Explicit UDP
+      protocol: udp
+```
+
+
 ---
 
 ### `narun service list`

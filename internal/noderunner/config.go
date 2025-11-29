@@ -60,6 +60,17 @@ type LandlockSpec struct {
 	Paths  []LandlockPathSpec `yaml:"paths,omitempty"`  // Custom paths to allow access to
 }
 
+// PortForward defines a port to forward from the host to the guest.
+type PortForward struct {
+	Port     int    `yaml:"port"`
+	Protocol string `yaml:"protocol,omitempty"` // "tcp" (default) or "udp"
+}
+
+// NetworkSpec defines the network configuration for a service.
+type NetworkSpec struct {
+	LocalPorts []PortForward `yaml:"localPorts,omitempty"` // Updated to struct
+}
+
 // NodeSelectorSpec defines which node should run the service and how many replicas.
 type NodeSelectorSpec struct {
 	Name     string `yaml:"name"`     // Node ID (matches node-runner's ID)
@@ -78,6 +89,7 @@ type ServiceSpec struct {
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
+	Network  NetworkSpec        `yaml:"network,omitempty"`  // Network configuration
 
 	User                 string  `yaml:"user,omitempty"`                 // User to run the process as. If empty, runs as node-runner's user.
 	MemoryMB             uint64  `yaml:"memoryMB,omitempty"`             // Memory soft limit in MiB.
@@ -211,6 +223,21 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		// Basic validation: currently only objectStore source is supported
 		if strings.TrimSpace(mount.Source.ObjectStore) == "" {
 			return nil, fmt.Errorf("mount '%s': source.objectStore name cannot be empty", mount.Path)
+		}
+	}
+
+	// Validate Network
+	for i, pf := range spec.Network.LocalPorts {
+		if pf.Port <= 0 || pf.Port > 65535 {
+			return nil, fmt.Errorf("network.localPorts at index %d: invalid port number %d", i, pf.Port)
+		}
+		// Normalize protocol
+		spec.Network.LocalPorts[i].Protocol = strings.ToLower(strings.TrimSpace(pf.Protocol))
+		if spec.Network.LocalPorts[i].Protocol == "" {
+			spec.Network.LocalPorts[i].Protocol = "tcp"
+		}
+		if spec.Network.LocalPorts[i].Protocol != "tcp" && spec.Network.LocalPorts[i].Protocol != "udp" {
+			return nil, fmt.Errorf("network.localPorts at index %d: unsupported protocol '%s' (must be tcp or udp)", i, pf.Protocol)
 		}
 	}
 
