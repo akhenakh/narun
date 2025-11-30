@@ -228,7 +228,7 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 
 	// Validate Network
 	for i, pf := range spec.NoNet.LocalPorts {
-		if pf.Port <= 0 || pf.Port > 65535 {
+		if pf.Port <= 1024 || pf.Port > 65535 {
 			return nil, fmt.Errorf("network.localPorts at index %d: invalid port number %d", i, pf.Port)
 		}
 		// Normalize protocol

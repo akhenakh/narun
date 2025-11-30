@@ -1036,6 +1036,13 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		}
 	}
 
+	//Wait for logs to fully drain before processing exit status.
+	// Since Cmd.Wait() has returned, the process is dead and its pipes are closed (EOF).
+	// forwardLogs will exit, and LogWg will decrement.
+	// We wait here to ensure all error logs (like Landlock failures printed to stderr)
+	// are published to NATS before we publish the 'Crashed' status update.
+	appInstance.LogWg.Wait()
+
 	exitCode := -1
 	intentionalStop := false
 	errMsg := ""

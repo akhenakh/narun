@@ -1,4 +1,3 @@
-// narun/internal/noderunner/process_test.go
 package noderunner
 
 import (

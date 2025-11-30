@@ -276,7 +276,6 @@ func runLandlockLauncher() {
 		landlockPaths = append(landlockPaths, ll.Shared())
 		fmt.Fprintf(os.Stderr, "[narun-launcher] Applying Landlock group: Shared\n")
 	}
-	// ... (keep existing logic for Stdio, TTY, Tmp, VMInfo, DNS, Certs)
 	if landlockSpec.Stdio {
 		landlockPaths = append(landlockPaths, ll.Stdio())
 	}
