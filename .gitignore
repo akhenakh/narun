@@ -24,3 +24,5 @@ narun-data
 master.key
 chat/
 bin/
+cmd/narun/narun
+cmd/node-runner/node-runner

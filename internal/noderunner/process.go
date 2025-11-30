@@ -47,10 +47,11 @@ const (
 	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
 	envLandlockInstanceRoot      = "NARUN_INTERNAL_INSTANCE_ROOT"
 	envLandlockMountInfosJSON    = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
-	landlockLauncherErrCode      = 120 // Generic launcher setup error
-	landlockUnsupportedErrCode   = 121 // Landlock not supported on OS/Kernel
-	landlockLockFailedErrCode    = 122 // l.Lock() failed
-	landlockTargetExecFailedCode = 123 // syscall.Exec() failed
+	envLandlockLocalPorts        = "NARUN_INTERNAL_LOCAL_PORTS" // Added for network ports
+	landlockLauncherErrCode      = 120                          // Generic launcher setup error
+	landlockUnsupportedErrCode   = 121                          // Landlock not supported on OS/Kernel
+	landlockLockFailedErrCode    = 122                          // l.Lock() failed
+	landlockTargetExecFailedCode = 123                          // syscall.Exec() failed
 )
 
 type statusUpdate struct {
@@ -177,7 +178,7 @@ func flattenEnv(baseEnv []string, username, homeDir string, appEnv []EnvVar) []s
 	return result
 }
 
-// --- Cgroup Helper Functions ---
+// Cgroup Helper Functions
 const cgroupfsBase = "/sys/fs/cgroup"
 
 func (nr *NodeRunner) getFullCgroupParentPath(specCgroupParent string) string {
@@ -412,6 +413,76 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	}
 	logger.Info("File mounts processed successfully", "count", len(spec.Mounts))
 
+	processCtx, processCancel := context.WithCancel(nr.globalCtx)
+
+	// Handle Network - Start Host-side socat for LocalPorts
+	var auxCmds []*exec.Cmd
+	// Change list to hold structs, not just strings, for passing to launcher
+	var localPortsList []PortForward
+
+	if len(spec.NoNet.LocalPorts) > 0 {
+		socketsDir := filepath.Join(instanceDir, "sockets")
+		if err := os.MkdirAll(socketsDir, 0755); err != nil {
+			processCancel()
+			return fmt.Errorf("failed to create sockets dir: %w", err)
+		}
+		// Ensure everyone can write to these sockets so guest can connect
+		if err := os.Chmod(socketsDir, 0777); err != nil {
+			processCancel()
+			return fmt.Errorf("failed to chmod sockets dir: %w", err)
+		}
+
+		// Inject the socket dir as a mount visible to the guest.
+		// NOTE: Since we are not using mount namespaces with bind mounts inside the launcher yet,
+		// we use the actual socketsDir path for the "guest" view as well.
+		guestSocketDir := socketsDir // Use absolute path
+		mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{
+			Path:        guestSocketDir, // Guest sees this path (absolute path on host)
+			ResolvedAbs: socketsDir,     // Host actual path
+			Source:      "local-sockets",
+		})
+
+		for _, pf := range spec.NoNet.LocalPorts {
+			port := pf.Port
+			proto := pf.Protocol // "tcp" or "udp" verified in config
+
+			// Socket naming convention: port_proto.sock
+			socketPath := filepath.Join(socketsDir, fmt.Sprintf("%d_%s.sock", port, proto))
+			_ = os.Remove(socketPath)
+
+			// Determine Socat Address Type
+			targetAddr := fmt.Sprintf("TCP:127.0.0.1:%d", port)
+			if proto == "udp" {
+				targetAddr = fmt.Sprintf("UDP:127.0.0.1:%d", port)
+			}
+
+			// Host-side: Listen on Unix Socket -> Forward to Host Port
+			hostSocatArgs := []string{
+				fmt.Sprintf("UNIX-LISTEN:%s,fork,mode=777", socketPath),
+				targetAddr,
+			}
+
+			socatCmd := exec.CommandContext(processCtx, "socat", hostSocatArgs...)
+			// We don't need to capture socat I/O usually, but logging errors might be good
+			// socatCmd.Stdout = os.Stdout
+			// socatCmd.Stderr = os.Stderr
+
+			if err := socatCmd.Start(); err != nil {
+				logger.Error("Failed to start host-side socat", "port", port, "error", err)
+				// Clean up any started socats
+				for _, c := range auxCmds {
+					_ = c.Process.Kill()
+				}
+				processCancel()
+				return fmt.Errorf("failed to start host proxy for port %d: %w", port, err)
+			}
+			auxCmds = append(auxCmds, socatCmd)
+			// Append the full struct to the list we send to the launcher
+			localPortsList = append(localPortsList, pf)
+			logger.Info("Started host-side proxy", "port", port, "proto", proto, "socket", socketPath)
+		}
+	}
+
 	// User and Group ID resolution
 	var targetUID, targetGID uint32
 	var targetHomeDir string
@@ -425,6 +496,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+			processCancel()
 			return fmt.Errorf(errMsg)
 		}
 		logger.Info("Target user resolved", "user", spec.User, "uid", targetUID, "gid", targetGID)
@@ -448,6 +520,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 				errMsg := fmt.Sprintf("Failed to resolve secret '%s': %v", envVar.ValueFromSecret, err)
 				nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 				metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
+				processCancel()
 				return fmt.Errorf("failed to resolve secret '%s': %w", envVar.ValueFromSecret, err)
 			}
 			resolvedAppEnv[i].Value = val
@@ -477,6 +550,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		logger.Error(errMsg)
 		nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0) // Mark as down for this run
+		processCancel()
 		return fmt.Errorf("failed to get node-runner exec path: %w", err)
 	}
 	landlockConfigJSON, _ := json.Marshal(spec.Landlock)
@@ -494,7 +568,14 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)),
 		fmt.Sprintf("%s=%s", envLandlockMountInfosJSON, string(mountInfosJSON)),
 		fmt.Sprintf("%s=%s", envLandlockInstanceRoot, workDir),
+		fmt.Sprintf("NARUN_TARGET_UID=%d", targetUID), // Pass Target UID/GID to Launcher via Environment
+		fmt.Sprintf("NARUN_TARGET_GID=%d", targetGID),
 	)
+	// Pass network config to launcher as JSON
+	if len(localPortsList) > 0 {
+		portsJSON, _ := json.Marshal(localPortsList)
+		envForLauncher = append(envForLauncher, fmt.Sprintf("%s=%s", envLandlockLocalPorts, string(portsJSON)))
+	}
 
 	// Cgroup Setup
 	var cgroupPath string
@@ -509,6 +590,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
+			processCancel()
 			return fmt.Errorf(errMsg)
 		}
 		// Defer cleanup only if cgroup was successfully created and we might fail later in start
@@ -522,12 +604,11 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		}()
 		if err := nr.applyCgroupConstraints(spec, cgroupPath, logger); err != nil {
 			errMsg := fmt.Sprintf("Failed to apply cgroup constraints: %v", err)
+			processCancel()
 			// cgroupCleanupFunc will be called by the defer above
 			return fmt.Errorf(errMsg)
 		}
 	}
-
-	processCtx, processCancel := context.WithCancel(nr.globalCtx)
 
 	// Command Assembly
 	var cmd *exec.Cmd
@@ -550,13 +631,11 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		unshareCmd := "unshare"
 		unshareArgsList := []string{
 			"--ipc",
+			"--net",
 			"--pid",
 			"--mount-proc",
 			"--fork",
 			"--kill-child=SIGKILL", // Kill child if unshare dies
-			// User/Group. If spec.User is empty, targetUID/GID is node-runner's user.
-			"--setuid", strconv.Itoa(int(targetUID)),
-			"--setgid", strconv.Itoa(int(targetGID)),
 			// TODO: Add --map-root-user if needed for some scenarios (e.g. user namespaces for rootless containers)
 			// This requires more complex UID/GID mapping setup. For now, assume target user exists on host.
 			"--", // Separator for the command unshare will run
@@ -595,10 +674,12 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	// Pipes
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+		processCancel()
 		return err
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+		processCancel()
 		return err
 	}
 
@@ -609,6 +690,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		RunID:         currentRunID,
 		Spec:          spec,
 		Cmd:           cmd, // Store the top-level command (nsenter/unshare/launcher)
+		AuxCmds:       auxCmds,
 		Status:        StatusStarting,
 		ConfigHash:    appInfo.configHash,
 		BinaryPath:    binaryPath, // Path to the *actual application binary*
@@ -709,6 +791,12 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 		if appInstance.Status != StatusStopping { // Only set if not already in stopping phase
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
 		}
+		// Even if stopped, ensure aux commands are killed
+		for _, c := range appInstance.AuxCmds {
+			if c.Process != nil {
+				_ = c.Process.Kill()
+			}
+		}
 		return nil
 	}
 	if appInstance.Cmd == nil || appInstance.Cmd.Process == nil {
@@ -727,6 +815,14 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	appInstance.Status = StatusStopping
 	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
 	nr.publishStatusUpdate(instanceID, StatusStopping, &pid, nil, "")
+
+	// Stop Aux Commands first
+	for _, c := range appInstance.AuxCmds {
+		if c.Process != nil {
+			logger.Debug("Killing auxiliary command", "pid", c.Process.Pid)
+			_ = c.Process.Kill()
+		}
+	}
 
 	// Close stop signal channel if not already closed
 	select {
@@ -932,6 +1028,20 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
 	waitErr := appInstance.Cmd.Wait()
+
+	// Ensure any remaining AuxCmds are killed when main process exits
+	for _, c := range appInstance.AuxCmds {
+		if c.Process != nil {
+			_ = c.Process.Kill()
+		}
+	}
+
+	//Wait for logs to fully drain before processing exit status.
+	// Since Cmd.Wait() has returned, the process is dead and its pipes are closed (EOF).
+	// forwardLogs will exit, and LogWg will decrement.
+	// We wait here to ensure all error logs (like Landlock failures printed to stderr)
+	// are published to NATS before we publish the 'Crashed' status update.
+	appInstance.LogWg.Wait()
 
 	exitCode := -1
 	intentionalStop := false
