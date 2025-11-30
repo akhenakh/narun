@@ -178,7 +178,7 @@ func flattenEnv(baseEnv []string, username, homeDir string, appEnv []EnvVar) []s
 	return result
 }
 
-// --- Cgroup Helper Functions ---
+// Cgroup Helper Functions
 const cgroupfsBase = "/sys/fs/cgroup"
 
 func (nr *NodeRunner) getFullCgroupParentPath(specCgroupParent string) string {
@@ -420,7 +420,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	// Change list to hold structs, not just strings, for passing to launcher
 	var localPortsList []PortForward
 
-	if len(spec.Network.LocalPorts) > 0 {
+	if len(spec.NoNet.LocalPorts) > 0 {
 		socketsDir := filepath.Join(instanceDir, "sockets")
 		if err := os.MkdirAll(socketsDir, 0755); err != nil {
 			processCancel()
@@ -432,15 +432,17 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			return fmt.Errorf("failed to chmod sockets dir: %w", err)
 		}
 
-		// Inject the socket dir as a mount visible to the guest
-		guestSocketDir := "/.narun/sockets"
+		// Inject the socket dir as a mount visible to the guest.
+		// NOTE: Since we are not using mount namespaces with bind mounts inside the launcher yet,
+		// we use the actual socketsDir path for the "guest" view as well.
+		guestSocketDir := socketsDir // Use absolute path
 		mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{
-			Path:        guestSocketDir, // Guest sees this path
+			Path:        guestSocketDir, // Guest sees this path (absolute path on host)
 			ResolvedAbs: socketsDir,     // Host actual path
 			Source:      "local-sockets",
 		})
 
-		for _, pf := range spec.Network.LocalPorts {
+		for _, pf := range spec.NoNet.LocalPorts {
 			port := pf.Port
 			proto := pf.Protocol // "tcp" or "udp" verified in config
 
@@ -566,6 +568,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)),
 		fmt.Sprintf("%s=%s", envLandlockMountInfosJSON, string(mountInfosJSON)),
 		fmt.Sprintf("%s=%s", envLandlockInstanceRoot, workDir),
+		fmt.Sprintf("NARUN_TARGET_UID=%d", targetUID), // Pass Target UID/GID to Launcher via Environment
+		fmt.Sprintf("NARUN_TARGET_GID=%d", targetGID),
 	)
 	// Pass network config to launcher as JSON
 	if len(localPortsList) > 0 {
@@ -627,13 +631,11 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		unshareCmd := "unshare"
 		unshareArgsList := []string{
 			"--ipc",
+			"--net",
 			"--pid",
 			"--mount-proc",
 			"--fork",
 			"--kill-child=SIGKILL", // Kill child if unshare dies
-			// User/Group. If spec.User is empty, targetUID/GID is node-runner's user.
-			"--setuid", strconv.Itoa(int(targetUID)),
-			"--setgid", strconv.Itoa(int(targetGID)),
 			// TODO: Add --map-root-user if needed for some scenarios (e.g. user namespaces for rootless containers)
 			// This requires more complex UID/GID mapping setup. For now, assume target user exists on host.
 			"--", // Separator for the command unshare will run

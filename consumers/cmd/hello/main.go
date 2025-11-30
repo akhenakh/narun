@@ -10,16 +10,15 @@ import (
 	"os"
 	"runtime"
 	"strings"
-
-	// "time" // No longer needed for default stream name constant
+	"time"
 
 	"github.com/akhenakh/narun/nconsumer"
+	"github.com/nats-io/nats.go"
 )
 
 // Default values for flags
 const (
 	DefaultNatsURL = "nats://localhost:4222"
-	// DefaultStreamName = "TASK" // REMOVED
 )
 
 // helloHandler implements the business logic as an http.Handler.
@@ -174,6 +173,16 @@ func main() {
 		logger.Error("failed to read /", "error", err)
 	} else {
 		logger.Info("listed /", "files", files)
+	}
+
+	// Test Connectivity to Localhost NATS (Testing Landlock Network Rules)
+	logger.Info("Attempting to connect to localhost:4222 to test network permissions")
+	testNc, err := nats.Connect("nats://localhost:4222", nats.Timeout(2*time.Second))
+	if err != nil {
+		logger.Error("Failed to connect to localhost nats", "error", err)
+	} else {
+		logger.Info("Successfully connected to localhost nats")
+		testNc.Close()
 	}
 
 	// Create handler
