@@ -1,21 +1,24 @@
-name: hello # This will be the KV key
-tag: v12
+name: hello
+tag: v13
 nodes:
     - name: clot # Target node runner with ID 'node1'
-      replicas: 1 # Run 2 instances on node1
+      replicas: 1 # Run 1 instances on node1
 mode: landlock # exec or landlock
 mounts:
     - path: mydata # Relative path inside instance work dir
       source:
           objectStore: myfile # Reference the file name in the object store, it will be auto added to the landlock rules
+metrics:
+    port: 8888 # The port the app listens on internally
+    path: /metrics
 landlock:
-    shared: true # common shared object files
+    shared: true # common shared object files, not needed if compiled with static linking, (in Go CGO_ENABLED=0)
     dns: true # DNS resolution
     tmp: true # temporary files
     paths:
         - path: /etc/issue
           modes: "r"
-nonet: # disable the network access to the host, only a looopback is provided, some ports can be forwarded
+nonet: # disable the network access to the host, only a looopback is provided, ports >1024 can be forwarded
     localPorts:
         - port: 4222 # Implicit TCP
         - port: 5053 # Explicit UDP

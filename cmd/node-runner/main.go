@@ -222,7 +222,7 @@ func runLandlockLauncher() {
 
 	// Start Guest-Side Socat Proxies (if configured)
 	if localPortsJSON != "" {
-		var localPorts []noderunner.PortForward // Decode into struct slice
+		var localPorts []noderunner.PortForward
 		if err := json.Unmarshal([]byte(localPortsJSON), &localPorts); err != nil {
 			fmt.Fprintf(os.Stderr, "[narun-launcher] Error: Failed to parse local ports JSON: %v\n", err)
 		} else {
@@ -230,7 +230,6 @@ func runLandlockLauncher() {
 			var socketsDir string
 			for _, m := range mountInfos {
 				if m.Source == "local-sockets" {
-					// Use Path as the guest-visible path (which is now absolute)
 					socketsDir = m.Path
 					break
 				}
@@ -240,6 +239,7 @@ func runLandlockLauncher() {
 				fmt.Fprintf(os.Stderr, "[narun-launcher] Warning: Local ports configured but no 'local-sockets' mount found.\n")
 			} else {
 				for _, pf := range localPorts {
+					// Guest Side: Listen on Localhost Port -> Connect to Unix Socket
 					port := pf.Port
 					proto := pf.Protocol
 
@@ -252,15 +252,15 @@ func runLandlockLauncher() {
 						listenAddr = fmt.Sprintf("UDP-LISTEN:%d,fork,bind=127.0.0.1", port)
 					}
 
-					// Guest Side: Listen on Localhost Port -> Connect to Unix Socket
 					args := []string{
 						listenAddr,
 						fmt.Sprintf("UNIX-CONNECT:%s", socketPath),
 					}
 
 					cmd := exec.Command("socat", args...)
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
+					//  Do NOT attach Stdout/Stderr to avoid holding pipes open
+					// Ensure socat dies when parent (launcher/app) dies
+					cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 
 					if err := cmd.Start(); err != nil {
 						fmt.Fprintf(os.Stderr, "[narun-launcher] Failed to start guest socat for %s/%d: %v\n", proto, port, err)
@@ -272,6 +272,7 @@ func runLandlockLauncher() {
 		}
 	}
 
+	// Start Guest-Side Metrics Proxy (Host -> Guest / Inbound)
 	// Start Guest-Side Metrics Proxy (Host -> Guest / Inbound)
 	if metricsConfigJSON != "" {
 		var mc struct {
@@ -288,8 +289,10 @@ func runLandlockLauncher() {
 			}
 
 			cmd := exec.Command("socat", args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			// Do NOT attach Stdout/Stderr to avoid holding pipes open
+			// Ensure socat dies when parent (launcher/app) dies
+			cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+
 			if err := cmd.Start(); err != nil {
 				fmt.Fprintf(os.Stderr, "[narun-launcher] Failed to start metrics proxy: %v\n", err)
 			} else {

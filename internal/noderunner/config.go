@@ -95,7 +95,7 @@ type ServiceSpec struct {
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
-	NoNet    NoNetSpec          `yaml:"network,omitempty"`  // Disable guest network access, only localPorts
+	NoNet    NoNetSpec          `yaml:"nonet,omitempty"`    // Disable guest network access, only localPorts
 	Metrics  MetricsSpec        `yaml:"metrics,omitempty"`  // Configuration for metrics scraping
 
 	User                 string  `yaml:"user,omitempty"`                 // User to run the process as. If empty, runs as node-runner's user.

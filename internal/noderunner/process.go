@@ -458,7 +458,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			Source:      "local-sockets",
 		})
 
-		// 1. Handle Outbound (Guest -> Host) Ports
+		// Handle Outbound (Guest -> Host) Ports
 		for _, pf := range spec.NoNet.LocalPorts {
 			port := pf.Port
 			proto := pf.Protocol // "tcp" or "udp" verified in config
@@ -476,6 +476,9 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			// Host-side: Listen on Unix Socket -> Forward to Host Port
 			hostSocatArgs := []string{fmt.Sprintf("UNIX-LISTEN:%s,fork,mode=777", socketPath), targetAddr}
 			socatCmd := exec.CommandContext(processCtx, "socat", hostSocatArgs...)
+
+			socatCmd.Stderr = nr.newLogWriter(logger.With("component", "socat-outbound", "port", port))
+
 			if err := socatCmd.Start(); err != nil {
 				logger.Error("Failed to start host-side socat", "port", port, "error", err)
 				processCancel()
@@ -485,7 +488,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			localPortsList = append(localPortsList, pf)
 		}
 
-		// 2. Handle Inbound Metrics (Host -> Guest)
+		// Handle Inbound Metrics (Host -> Guest)
 		if spec.Metrics.Port > 0 {
 			// Pick ephemeral port on host
 			freePort, err := getFreePort()
@@ -527,9 +530,9 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			}
 
 			socatCmd := exec.CommandContext(processCtx, "socat", hostSocatArgs...)
-			// We don't need to capture socat I/O usually, but logging errors might be good
-			// socatCmd.Stdout = os.Stdout
-			// socatCmd.Stderr = os.Stderr
+
+			// Capture stderr for debugging
+			socatCmd.Stderr = nr.newLogWriter(logger.With("component", "socat-metrics"))
 
 			if err := socatCmd.Start(); err != nil {
 				logger.Error("Failed to start host-side metrics socat", "error", err)
@@ -1590,4 +1593,23 @@ func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *
 		// VmHWM not found, or not Linux. Log less verbosely or not at all.
 		// logger.Debug("VmHWM not found in proc status or not on Linux, memory metric not updated this cycle", "pid", pid)
 	}
+}
+
+// Helper to pipe exec.Cmd output to slog (add this to process.go or a utils file)
+type logWriter struct {
+	logger *slog.Logger
+}
+
+func (nr *NodeRunner) newLogWriter(logger *slog.Logger) *logWriter {
+	return &logWriter{logger: logger}
+}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	lines := strings.Split(string(p), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			w.logger.Warn(line) // Log as Warn or Info
+		}
+	}
+	return len(p), nil
 }

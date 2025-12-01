@@ -7,11 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"time"
 )
@@ -38,6 +42,17 @@ import (
 func main() {
 	results := make(map[string]string)
 	results["status"] = "failed"
+
+	// Start Metrics Server
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprintln(w, "workload_test_metric 1.0")
+		})
+		// Listen on all interfaces (inside the namespace/landlock env)
+		http.ListenAndServe(":8888", mux)
+	}()
 
 	// Read Secret Env
 	secret := os.Getenv("SECRET")
@@ -94,8 +109,8 @@ func main() {
 	jsonBytes, _ := json.Marshal(results)
 	fmt.Println(string(jsonBytes))
 
-	// Keep running briefly to ensure logs flush
-	time.Sleep(2 * time.Second)
+	// Keep running to allow metrics scraping verification
+	select {}
 }
 `
 
@@ -256,6 +271,15 @@ func TestEndToEnd(t *testing.T) {
 		}
 	}()
 
+	// Allocate a random port for metrics server
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen on random port for metrics: %v", err)
+	}
+	metricsPort := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	metricsAddr := fmt.Sprintf("127.0.0.1:%d", metricsPort)
+
 	// Start Node Runner
 	runnerDataDir := filepath.Join(tempDir, "runner-data")
 	runnerCmd := exec.Command(runnerBinPath,
@@ -264,7 +288,7 @@ func TestEndToEnd(t *testing.T) {
 		"-data-dir", runnerDataDir,
 		"-master-key", masterKeyB64,
 		"-log-level", "debug",
-		"-metrics-addr", ":0",
+		"-metrics-addr", metricsAddr, // Use known port
 		"-admin-addr", ":0",
 	)
 	runnerCmd.Env = append(os.Environ(), "PATH="+os.Getenv("PATH"))
@@ -279,7 +303,7 @@ func TestEndToEnd(t *testing.T) {
 		runnerCmd.Wait()
 	}()
 
-	t.Log("Node Runner started...")
+	t.Logf("Node Runner started with metrics on %s...", metricsAddr)
 	time.Sleep(2 * time.Second) // Give it a moment to connect
 
 	// Deploy App Config
@@ -312,6 +336,10 @@ func TestEndToEnd(t *testing.T) {
 			LocalPorts: []noderunner.PortForward{
 				{Port: 9999, Protocol: "tcp"},
 			},
+		},
+		Metrics: noderunner.MetricsSpec{
+			Port: 8888, // Matches workload source
+			Path: "/metrics",
 		},
 		User: os.Getenv("USER"),
 	}
@@ -409,5 +437,67 @@ loop:
 	if !success {
 		t.Fatal("Did not receive success status from app")
 	}
+
+	// Verify Metrics
+	t.Log("Verifying Metrics Discovery...")
+	discoveryURL := fmt.Sprintf("http://127.0.0.1:%d/discovery", metricsPort)
+	resp, err := http.Get(discoveryURL)
+	if err != nil {
+		t.Fatalf("Failed to query discovery endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("Discovery endpoint returned status %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	t.Logf("Discovery Response: %s", string(body))
+
+	var targets []noderunner.PrometheusTarget
+	if err := json.Unmarshal(body, &targets); err != nil {
+		t.Fatalf("Failed to parse discovery JSON: %v", err)
+	}
+
+	if len(targets) == 0 {
+		t.Fatalf("Discovery returned no targets, expected 1")
+	}
+
+	target := targets[0]
+	if len(target.Targets) == 0 {
+		t.Fatalf("Target has no address")
+	}
+	proxyAddr := target.Targets[0]
+	// Ensure we can reach it (it might report 127.0.0.1 or an IP, assume HTTP)
+	if !strings.HasPrefix(proxyAddr, "http") {
+		proxyAddr = "http://" + proxyAddr
+	}
+
+	t.Logf("Verifying Metrics Proxy at %s%s...", proxyAddr, target.Labels["__metrics_path__"])
+	metricsURL := fmt.Sprintf("%s%s", proxyAddr, target.Labels["__metrics_path__"])
+
+	// Retry loop for proxy connection (socat might take a moment)
+	metricsOK := false
+	for i := 0; i < 5; i++ {
+		resp, err = http.Get(metricsURL)
+		if err == nil && resp.StatusCode == 200 {
+			metricsOK = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !metricsOK {
+		t.Fatalf("Failed to scrape metrics from proxy %s after retries", metricsURL)
+	}
+	defer resp.Body.Close()
+	metricsBody, _ := io.ReadAll(resp.Body)
+	metricsContent := string(metricsBody)
+
+	if !strings.Contains(metricsContent, "workload_test_metric 1.0") {
+		t.Errorf("Metrics response did not contain expected metric. Got:\n%s", metricsContent)
+	} else {
+		t.Log("Metrics verification successful!")
+	}
+
 	t.Log("E2E Test Passed Successfully!")
 }
