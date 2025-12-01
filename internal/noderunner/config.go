@@ -77,6 +77,12 @@ type NodeSelectorSpec struct {
 	Replicas int    `yaml:"replicas"` // Number of instances on this node
 }
 
+// MetricsSpec defines configuration for scraping metrics from the application.
+type MetricsSpec struct {
+	Port int    `yaml:"port,omitempty"` // The port the application exposes metrics on (Guest side)
+	Path string `yaml:"path,omitempty"` // The HTTP path for metrics (default: /metrics)
+}
+
 // ServiceSpec defines the desired configuration for an application managed by the node runner.
 // This structure is stored as YAML in the NATS KV store.
 type ServiceSpec struct {
@@ -90,6 +96,7 @@ type ServiceSpec struct {
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
 	NoNet    NoNetSpec          `yaml:"network,omitempty"`  // Disable guest network access, only localPorts
+	Metrics  MetricsSpec        `yaml:"metrics,omitempty"`  // Configuration for metrics scraping
 
 	User                 string  `yaml:"user,omitempty"`                 // User to run the process as. If empty, runs as node-runner's user.
 	MemoryMB             uint64  `yaml:"memoryMB,omitempty"`             // Memory soft limit in MiB.
@@ -238,6 +245,16 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		}
 		if spec.NoNet.LocalPorts[i].Protocol != "tcp" && spec.NoNet.LocalPorts[i].Protocol != "udp" {
 			return nil, fmt.Errorf("network.localPorts at index %d: unsupported protocol '%s' (must be tcp or udp)", i, pf.Protocol)
+		}
+	}
+
+	// Validate Metrics
+	if spec.Metrics.Port != 0 {
+		if spec.Metrics.Port <= 0 || spec.Metrics.Port > 65535 {
+			return nil, fmt.Errorf("metrics.port must be between 1 and 65535")
+		}
+		if spec.Metrics.Path == "" {
+			spec.Metrics.Path = "/metrics"
 		}
 	}
 

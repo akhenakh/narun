@@ -31,6 +31,7 @@ const (
 	envLandlockInstanceRoot         = "NARUN_INTERNAL_INSTANCE_ROOT"
 	envLandlockMountInfosJSON       = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
 	envLandlockLocalPorts           = "NARUN_INTERNAL_LOCAL_PORTS"
+	envLandlockMetricsConfig        = "NARUN_INTERNAL_METRICS_CONFIG" // New Env var for metrics
 	envTargetUID                    = "NARUN_TARGET_UID"
 	envTargetGID                    = "NARUN_TARGET_GID"
 	landlockLauncherErrCode         = 120 // Specific exit code for launcher errors
@@ -150,6 +151,7 @@ func runLandlockLauncher() {
 	instanceRoot := os.Getenv(envLandlockInstanceRoot) // Get instance root from env
 	mountInfosJSON := os.Getenv(envLandlockMountInfosJSON)
 	localPortsJSON := os.Getenv(envLandlockLocalPorts)
+	metricsConfigJSON := os.Getenv(envLandlockMetricsConfig)
 
 	//  DROP PRIVILEGES
 	targetUIDStr := os.Getenv(envTargetUID)
@@ -266,6 +268,32 @@ func runLandlockLauncher() {
 						fmt.Fprintf(os.Stderr, "[narun-launcher] Started guest socat for %s/%d (pid %d)\n", proto, port, cmd.Process.Pid)
 					}
 				}
+			}
+		}
+	}
+
+	// Start Guest-Side Metrics Proxy (Host -> Guest / Inbound)
+	if metricsConfigJSON != "" {
+		var mc struct {
+			Socket     string `json:"socket"`
+			TargetPort int    `json:"targetPort"`
+		}
+		if err := json.Unmarshal([]byte(metricsConfigJSON), &mc); err != nil {
+			fmt.Fprintf(os.Stderr, "[narun-launcher] Error parsing metrics config: %v\n", err)
+		} else {
+			// Guest Side: Listen on Socket -> Forward to App
+			args := []string{
+				fmt.Sprintf("UNIX-LISTEN:%s,fork,reuseaddr,mode=777", mc.Socket),
+				fmt.Sprintf("TCP:127.0.0.1:%d", mc.TargetPort),
+			}
+
+			cmd := exec.Command("socat", args...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				fmt.Fprintf(os.Stderr, "[narun-launcher] Failed to start metrics proxy: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[narun-launcher] Started metrics proxy (pid %d) -> :%d\n", cmd.Process.Pid, mc.TargetPort)
 			}
 		}
 	}

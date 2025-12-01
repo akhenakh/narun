@@ -43,6 +43,9 @@ type ManagedApp struct {
 	restartCount  int                // Number of times restarted since last config change/start
 	lastExitCode  *int               // Store the last exit code
 
+	// Metrics info
+	HostMetricsPort int // The ephemeral port on the host mapped to the guest metrics port
+
 	// cgroups related
 	cgroupPath    string       // Absolute path to the instance's cgroup
 	cgroupFd      int          // File descriptor for the cgroup directory (for UseCgroupFD)

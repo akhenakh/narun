@@ -14,6 +14,7 @@ import (
 
 	"github.com/akhenakh/narun/nconsumer"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Default values for flags
@@ -132,14 +133,6 @@ func main() {
 		logger.Debug("read /etc/lsb-release", "content", string(b))
 	}
 
-	// to validate filesystem restriction using landlock try to read /etc/lsb-release
-	b, err = os.ReadFile("/etc/lsb-release")
-	if err != nil {
-		logger.Error("failed to read /etc/lsb-release", "error", err)
-	} else {
-		logger.Debug("read /etc/lsb-release", "content", string(b))
-	}
-
 	// to validate filesystem restriction using landlock try to read NARUN_INSTANCE_ROOT
 	instanceRoot := os.Getenv("NARUN_INSTANCE_ROOT")
 	if instanceRoot != "" {
@@ -184,6 +177,17 @@ func main() {
 		logger.Info("Successfully connected to localhost nats")
 		testNc.Close()
 	}
+
+	// Start Metrics Server
+	go func() {
+		metricsAddr := ":8888"
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		logger.Info("Starting internal metrics server", "addr", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			logger.Error("Metrics server failed", "error", err)
+		}
+	}()
 
 	// Create handler
 	handler := &helloHandler{}
