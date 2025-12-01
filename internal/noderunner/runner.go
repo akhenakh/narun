@@ -8,6 +8,7 @@ import (
 	"html"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,6 +26,12 @@ import (
 )
 
 var runnerVersion = "0.2.1-dev" // Incremented version
+
+// PrometheusTarget represents the JSON structure for HTTP SD.
+type PrometheusTarget struct {
+	Targets []string          `json:"targets"`
+	Labels  map[string]string `json:"labels"`
+}
 
 // NodeRunner manages application processes on a single node.
 type NodeRunner struct {
@@ -218,6 +225,7 @@ func (nr *NodeRunner) Run() error {
 	if nr.metricsAddr != "" {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
+		metricsMux.HandleFunc("/discovery", nr.handleDiscovery)
 		nr.metricsServer = &http.Server{
 			Addr:              nr.metricsAddr,
 			Handler:           metricsMux,
@@ -603,6 +611,54 @@ func (nr *NodeRunner) heartbeatLoop() {
 			return
 		}
 	}
+}
+
+// handleDiscovery serves the targets list for Prometheus HTTP SD
+func (nr *NodeRunner) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+	targets := []PrometheusTarget{}
+
+	// Get snapshot of apps
+	allAppInfos := nr.state.GetAllAppInfos()
+
+	// Attempt to get Host IP (simple approach, might need config if multi-homed)
+	hostIP := "127.0.0.1"
+	if conn, err := net.Dial("udp", "8.8.8.8:80"); err == nil {
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		hostIP = localAddr.IP.String()
+		conn.Close()
+	}
+
+	for appName, info := range allAppInfos {
+		info.mu.RLock()
+		spec := info.spec
+
+		// Skip if spec missing or metrics disabled
+		if spec == nil || spec.Metrics.Port == 0 {
+			info.mu.RUnlock()
+			continue
+		}
+
+		for _, inst := range info.instances {
+			if inst.Status == StatusRunning && inst.HostMetricsPort > 0 {
+				target := PrometheusTarget{
+					Targets: []string{fmt.Sprintf("%s:%d", hostIP, inst.HostMetricsPort)},
+					Labels: map[string]string{
+						"job":               "narun-workload",
+						"narun_app":         appName,
+						"narun_instance_id": inst.InstanceID,
+						"narun_node_id":     nr.nodeID,
+						"narun_tag":         spec.Tag,
+						"__metrics_path__":  spec.Metrics.Path, // Prometheus uses this to scrape specific path
+					},
+				}
+				targets = append(targets, target)
+			}
+		}
+		info.mu.RUnlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(targets)
 }
 
 // updateNodeState constructs the current node state and puts it into the KV store.

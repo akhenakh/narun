@@ -11,6 +11,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -47,11 +48,12 @@ const (
 	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
 	envLandlockInstanceRoot      = "NARUN_INTERNAL_INSTANCE_ROOT"
 	envLandlockMountInfosJSON    = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
-	envLandlockLocalPorts        = "NARUN_INTERNAL_LOCAL_PORTS" // Added for network ports
-	landlockLauncherErrCode      = 120                          // Generic launcher setup error
-	landlockUnsupportedErrCode   = 121                          // Landlock not supported on OS/Kernel
-	landlockLockFailedErrCode    = 122                          // l.Lock() failed
-	landlockTargetExecFailedCode = 123                          // syscall.Exec() failed
+	envLandlockLocalPorts        = "NARUN_INTERNAL_LOCAL_PORTS"    // network ports
+	envLandlockMetricsConfig     = "NARUN_INTERNAL_METRICS_CONFIG" // for metrics
+	landlockLauncherErrCode      = 120                             // Generic launcher setup error
+	landlockUnsupportedErrCode   = 121                             // Landlock not supported on OS/Kernel
+	landlockLockFailedErrCode    = 122                             // l.Lock() failed
+	landlockTargetExecFailedCode = 123                             // syscall.Exec() failed
 )
 
 type statusUpdate struct {
@@ -353,6 +355,20 @@ func (nr *NodeRunner) killCgroup(cgroupPath string, logger *slog.Logger) error {
 	return nil
 }
 
+// Helper to find a free port on the host
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
 // startAppInstance attempts to download the binary, configure, and start a single instance.
 // It assumes the calling code (handleAppConfigUpdate) holds the lock on appInfo.
 func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, replicaIndex int) (returnedErr error) {
@@ -415,33 +431,34 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 
 	processCtx, processCancel := context.WithCancel(nr.globalCtx)
 
-	// Handle Network - Start Host-side socat for LocalPorts
+	// Handle Network (LocalPorts & Metrics)
 	var auxCmds []*exec.Cmd
-	// Change list to hold structs, not just strings, for passing to launcher
-	var localPortsList []PortForward
+	var localPortsList []PortForward // Guest -> Host traffic
+	var hostMetricsPort int          // Host -> Guest traffic
 
-	if len(spec.NoNet.LocalPorts) > 0 {
+	// Check if we need the sockets directory (either for NoNet ports OR Metrics)
+	needsSocketDir := len(spec.NoNet.LocalPorts) > 0 || spec.Metrics.Port > 0
+
+	if needsSocketDir {
 		socketsDir := filepath.Join(instanceDir, "sockets")
 		if err := os.MkdirAll(socketsDir, 0755); err != nil {
 			processCancel()
 			return fmt.Errorf("failed to create sockets dir: %w", err)
 		}
-		// Ensure everyone can write to these sockets so guest can connect
 		if err := os.Chmod(socketsDir, 0777); err != nil {
 			processCancel()
 			return fmt.Errorf("failed to chmod sockets dir: %w", err)
 		}
 
-		// Inject the socket dir as a mount visible to the guest.
-		// NOTE: Since we are not using mount namespaces with bind mounts inside the launcher yet,
-		// we use the actual socketsDir path for the "guest" view as well.
-		guestSocketDir := socketsDir // Use absolute path
+		// Mount socket dir (Common for both)
+		guestSocketDir := socketsDir
 		mountInfosForEnv = append(mountInfosForEnv, MountInfoForEnv{
 			Path:        guestSocketDir, // Guest sees this path (absolute path on host)
 			ResolvedAbs: socketsDir,     // Host actual path
 			Source:      "local-sockets",
 		})
 
+		// Handle Outbound (Guest -> Host) Ports
 		for _, pf := range spec.NoNet.LocalPorts {
 			port := pf.Port
 			proto := pf.Protocol // "tcp" or "udp" verified in config
@@ -457,29 +474,73 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			}
 
 			// Host-side: Listen on Unix Socket -> Forward to Host Port
-			hostSocatArgs := []string{
-				fmt.Sprintf("UNIX-LISTEN:%s,fork,mode=777", socketPath),
-				targetAddr,
-			}
-
+			hostSocatArgs := []string{fmt.Sprintf("UNIX-LISTEN:%s,fork,mode=777", socketPath), targetAddr}
 			socatCmd := exec.CommandContext(processCtx, "socat", hostSocatArgs...)
-			// We don't need to capture socat I/O usually, but logging errors might be good
-			// socatCmd.Stdout = os.Stdout
-			// socatCmd.Stderr = os.Stderr
+
+			socatCmd.Stderr = nr.newLogWriter(logger.With("component", "socat-outbound", "port", port))
 
 			if err := socatCmd.Start(); err != nil {
 				logger.Error("Failed to start host-side socat", "port", port, "error", err)
-				// Clean up any started socats
-				for _, c := range auxCmds {
-					_ = c.Process.Kill()
-				}
 				processCancel()
 				return fmt.Errorf("failed to start host proxy for port %d: %w", port, err)
 			}
 			auxCmds = append(auxCmds, socatCmd)
-			// Append the full struct to the list we send to the launcher
 			localPortsList = append(localPortsList, pf)
-			logger.Info("Started host-side proxy", "port", port, "proto", proto, "socket", socketPath)
+		}
+
+		// Handle Inbound Metrics (Host -> Guest)
+		if spec.Metrics.Port > 0 {
+			// Pick ephemeral port on host
+			freePort, err := getFreePort()
+			if err != nil {
+				processCancel()
+				return fmt.Errorf("failed to get free port for metrics: %w", err)
+			}
+			hostMetricsPort = freePort
+
+			// Socket path: metrics.sock
+			socketPath := filepath.Join(socketsDir, "metrics.sock")
+			_ = os.Remove(socketPath)
+
+			// Host Side: Listen TCP (Public/Localhost), Connect to Unix Socket
+			// Host acts as the "Client" to the socket
+			// Note: We use UNIX-CONNECT here. The Guest must UNIX-LISTEN.
+			// Wait: Socat UNIX-CONNECT requires the socket to exist (created by listener).
+			// It is safer if Host Listens on Socket (file creator) and Guest Connects?
+			// No, strictly relying on connection direction: Scraper -> HostPort -> Socket -> GuestPort -> App.
+			// Traffic flows INTO guest.
+
+			// Reversal for stability:
+			// Host: TCP-LISTEN:HostPort -> UNIX-CONNECT:metrics.sock
+			// Guest: UNIX-LISTEN:metrics.sock -> TCP:127.0.0.1:AppPort
+			// PROBLEM: If Guest crashes/restarts, socket might linger or host socat might die if connection drops.
+			// Better approach for persistent tunnel:
+			// Host: TCP-LISTEN:HostPort,fork -> UNIX-LISTEN:metrics.sock,fork
+			// Guest: UNIX-CONNECT:metrics.sock -> TCP:127.0.0.1:AppPort
+			// This way Host owns the socket file.
+
+			socketPathHost := filepath.Join(socketsDir, "metrics_host.sock")
+			// Ensure clean state, though Guest will recreate
+			_ = os.Remove(socketPathHost)
+
+			// Host side: Expose TCP, write to Unix Socket
+			hostSocatArgs := []string{
+				fmt.Sprintf("TCP-LISTEN:%d,fork,bind=0.0.0.0,reuseaddr", hostMetricsPort),
+				fmt.Sprintf("UNIX-CONNECT:%s,retry=10,interval=1", socketPathHost),
+			}
+
+			socatCmd := exec.CommandContext(processCtx, "socat", hostSocatArgs...)
+
+			// Capture stderr for debugging
+			socatCmd.Stderr = nr.newLogWriter(logger.With("component", "socat-metrics"))
+
+			if err := socatCmd.Start(); err != nil {
+				logger.Error("Failed to start host-side metrics socat", "error", err)
+				processCancel()
+				return fmt.Errorf("failed to start host proxy for metrics port %d: %w", spec.Metrics.Port, err)
+			}
+			auxCmds = append(auxCmds, socatCmd)
+			logger.Info("Started host-side metrics proxy", "host_port", hostMetricsPort, "socket", socketPathHost)
 		}
 	}
 
@@ -575,6 +636,18 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	if len(localPortsList) > 0 {
 		portsJSON, _ := json.Marshal(localPortsList)
 		envForLauncher = append(envForLauncher, fmt.Sprintf("%s=%s", envLandlockLocalPorts, string(portsJSON)))
+	}
+
+	if hostMetricsPort > 0 {
+		// We assume the socket directory is already mounted at same path
+		socketPathHost := filepath.Join(filepath.Join(instanceDir, "sockets"), "metrics_host.sock")
+
+		metricsConfig := map[string]interface{}{
+			"socket":     socketPathHost,
+			"targetPort": spec.Metrics.Port,
+		}
+		metricsJSON, _ := json.Marshal(metricsConfig)
+		envForLauncher = append(envForLauncher, fmt.Sprintf("%s=%s", envLandlockMetricsConfig, string(metricsJSON)))
 	}
 
 	// Cgroup Setup
@@ -686,20 +759,21 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	// Create/Update ManagedApp State in the manager
 
 	appInstance := &ManagedApp{
-		InstanceID:    instanceID,
-		RunID:         currentRunID,
-		Spec:          spec,
-		Cmd:           cmd, // Store the top-level command (nsenter/unshare/launcher)
-		AuxCmds:       auxCmds,
-		Status:        StatusStarting,
-		ConfigHash:    appInfo.configHash,
-		BinaryPath:    binaryPath, // Path to the *actual application binary*
-		StdoutPipe:    stdoutPipe,
-		StderrPipe:    stderrPipe,
-		StopSignal:    make(chan struct{}),
-		processCtx:    processCtx,
-		processCancel: processCancel,
-		restartCount:  0,
+		InstanceID:      instanceID,
+		RunID:           currentRunID,
+		Spec:            spec,
+		Cmd:             cmd, // Store the top-level command (nsenter/unshare/launcher)
+		AuxCmds:         auxCmds,
+		Status:          StatusStarting,
+		ConfigHash:      appInfo.configHash,
+		BinaryPath:      binaryPath, // Path to the *actual application binary*
+		StdoutPipe:      stdoutPipe,
+		StderrPipe:      stderrPipe,
+		StopSignal:      make(chan struct{}),
+		processCtx:      processCtx,
+		processCancel:   processCancel,
+		restartCount:    0,
+		HostMetricsPort: hostMetricsPort,
 		// Cgroup info
 		cgroupPath:    cgroupPath,
 		cgroupFd:      cgroupFd, // Store the cgroup FD
@@ -1036,7 +1110,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		}
 	}
 
-	//Wait for logs to fully drain before processing exit status.
+	// Wait for logs to fully drain before processing exit status.
 	// Since Cmd.Wait() has returned, the process is dead and its pipes are closed (EOF).
 	// forwardLogs will exit, and LogWg will decrement.
 	// We wait here to ensure all error logs (like Landlock failures printed to stderr)
@@ -1519,4 +1593,23 @@ func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *
 		// VmHWM not found, or not Linux. Log less verbosely or not at all.
 		// logger.Debug("VmHWM not found in proc status or not on Linux, memory metric not updated this cycle", "pid", pid)
 	}
+}
+
+// Helper to pipe exec.Cmd output to slog (add this to process.go or a utils file)
+type logWriter struct {
+	logger *slog.Logger
+}
+
+func (nr *NodeRunner) newLogWriter(logger *slog.Logger) *logWriter {
+	return &logWriter{logger: logger}
+}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	lines := strings.Split(string(p), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			w.logger.Warn(line) // Log as Warn or Info
+		}
+	}
+	return len(p), nil
 }
