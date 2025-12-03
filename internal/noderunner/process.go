@@ -20,7 +20,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/akhenakh/narun/internal/crypto"
@@ -28,7 +27,6 @@ import (
 	"github.com/google/uuid"                     // For unique Run IDs
 	"github.com/hashicorp/go-set/v2"
 	"github.com/nats-io/nats.go/jetstream"
-	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -180,181 +178,6 @@ func flattenEnv(baseEnv []string, username, homeDir string, appEnv []EnvVar) []s
 	return result
 }
 
-// Cgroup Helper Functions
-const cgroupfsBase = "/sys/fs/cgroup"
-
-func (nr *NodeRunner) getFullCgroupParentPath(specCgroupParent string) string {
-	if filepath.IsAbs(specCgroupParent) { // Assumes it's /sys/fs/cgroup/...
-		return filepath.Clean(specCgroupParent)
-	}
-	return filepath.Join(cgroupfsBase, filepath.Clean(specCgroupParent))
-}
-
-func (nr *NodeRunner) createCgroup(spec *ServiceSpec, instanceID string, logger *slog.Logger) (cgroupPath string, cgroupFd int, cleanup func() error, err error) {
-	if runtime.GOOS != "linux" {
-		return "", -1, nil, fmt.Errorf("cgroups are only supported on Linux")
-	}
-	if spec.CgroupParent == "" {
-		return "", -1, nil, fmt.Errorf("cgroupParent must be specified in ServiceSpec to use cgroups")
-	}
-
-	parentPath := nr.getFullCgroupParentPath(spec.CgroupParent)
-	// Ensure parent cgroup exists and node-runner has perms to write cgroup.subtree_control
-	// This check is basic; real permission issues will surface on mkdir/write.
-	parentInfo, statErr := os.Stat(parentPath)
-	if statErr != nil {
-		return "", -1, nil, fmt.Errorf("cgroup parent path '%s' not accessible: %w", parentPath, statErr)
-	}
-	if !parentInfo.IsDir() {
-		return "", -1, nil, fmt.Errorf("cgroup parent path '%s' is not a directory", parentPath)
-	}
-
-	// Instance cgroup name, e.g., narun-myapp-0.scope
-	instanceCgroupName := fmt.Sprintf("narun-%s.scope", instanceID)
-	finalCgroupPath := filepath.Join(parentPath, instanceCgroupName)
-
-	logger.Info("Creating cgroup", "path", finalCgroupPath)
-
-	// Enable necessary controllers in the parent's cgroup.subtree_control
-	//    This allows the new cgroup to use these controllers.
-	//    The node-runner process needs write permission to this file.
-	subtreeControlPath := filepath.Join(parentPath, "cgroup.subtree_control")
-	controllersToEnable := "+cpu +memory" // Add others like +io if needed
-	if writeErr := os.WriteFile(subtreeControlPath, []byte(controllersToEnable), 0644); writeErr != nil {
-		// If EACCES, it's a permission issue.
-		// If EINVAL, controllers might already be enabled or not available.
-		// This part is tricky; robust error handling or pre-flight checks are ideal.
-		// For now, log warning and proceed, applyCgroupConstraints will fail if controllers not active.
-		logger.Warn("Potentially failed to enable controllers in parent cgroup. This might be okay if already enabled.",
-			"path", subtreeControlPath, "error", writeErr)
-	}
-
-	// Create the cgroup directory
-	if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
-		// Check if it already exists from a previous unclean shutdown
-		if os.IsExist(err) {
-			logger.Warn("Cgroup directory already exists, attempting to reuse.", "path", finalCgroupPath)
-			// Try to remove it first, in case it's in a bad state
-			// unix.Rmdir might fail if it has processes, but that's okay if we're about to put a new one in.
-			_ = unix.Rmdir(finalCgroupPath)
-			if err = os.Mkdir(finalCgroupPath, 0755); err != nil {
-				return "", -1, nil, fmt.Errorf("failed to create cgroup directory '%s' even after attempting cleanup: %w", finalCgroupPath, err)
-			}
-		} else {
-			return "", -1, nil, fmt.Errorf("failed to create cgroup directory '%s': %w", finalCgroupPath, err)
-		}
-	}
-
-	// Open the cgroup directory to get a file descriptor
-	fd, openErr := unix.Open(finalCgroupPath, unix.O_PATH|unix.O_CLOEXEC, 0)
-	if openErr != nil {
-		_ = unix.Rmdir(finalCgroupPath) // Attempt cleanup
-		return "", -1, nil, fmt.Errorf("failed to open cgroup path '%s' for fd: %w", finalCgroupPath, openErr)
-	}
-
-	cleanupFunc := func() error {
-		closeErr := unix.Close(fd)
-		rmErr := unix.Rmdir(finalCgroupPath) // This will fail if processes are still in it
-		if closeErr != nil && rmErr != nil {
-			return fmt.Errorf("cgroup cleanup: failed to close fd (%v) AND rmdir (%v)", closeErr, rmErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("cgroup cleanup: failed to close fd: %w", closeErr)
-		}
-		if rmErr != nil {
-			// Log this, as it might indicate an issue, but don't always fail the cleanup.
-			// Cgroup might be cleaned up by system eventually if it has no tasks.
-			logger.Warn("Failed to rmdir cgroup during cleanup (might have tasks or sub-cgroups)", "path", finalCgroupPath, "error", rmErr)
-			// Attempt to kill remaining processes in the cgroup
-			_ = nr.writeCgroupFile(finalCgroupPath, "cgroup.kill", "1")
-			// Retry rmdir after a short delay
-			time.Sleep(100 * time.Millisecond)
-			_ = unix.Rmdir(finalCgroupPath)
-		}
-		logger.Info("Cgroup cleaned up", "path", finalCgroupPath)
-		return nil
-	}
-
-	return finalCgroupPath, fd, cleanupFunc, nil
-}
-
-func (nr *NodeRunner) writeCgroupFile(cgroupPath, file, content string) error {
-	fullPath := filepath.Join(cgroupPath, file)
-	// Open with O_WRONLY | O_TRUNC. Some cgroup files require specific modes.
-	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open cgroup file '%s': %w", fullPath, err)
-	}
-	defer f.Close()
-	_, err = f.WriteString(content)
-	if err != nil {
-		return fmt.Errorf("failed to write to cgroup file '%s': %w", fullPath, err)
-	}
-	return nil
-}
-
-func (nr *NodeRunner) applyCgroupConstraints(spec *ServiceSpec, cgroupPath string, logger *slog.Logger) error {
-	logger.Info("Applying cgroup constraints", "path", cgroupPath)
-	// CPU Limit (cpu.max: quota period)
-	// Period is typically 100000 (100ms). Quota is how much of that period the cgroup can use.
-	// If CPUCores = 1.5, quota = 1.5 * 100000 = 150000.
-	if spec.CPUCores > 0 {
-		cpuPeriod := 100000 // Default CFS period in microseconds
-		cpuQuota := int(spec.CPUCores * float64(cpuPeriod))
-		cpuMaxContent := fmt.Sprintf("%d %d", cpuQuota, cpuPeriod)
-		if err := nr.writeCgroupFile(cgroupPath, "cpu.max", cpuMaxContent); err != nil {
-			logger.Warn("Failed to set cpu.max, CPU limits may not apply", "error", err)
-			// Don't fail entirely, but log. CPU controller might not be available/enabled.
-		} else {
-			logger.Debug("Set cpu.max", "value", cpuMaxContent)
-		}
-	}
-
-	// Memory Limits (in bytes)
-	if spec.MemoryMB > 0 {
-		memBytes := spec.MemoryMB * 1024 * 1024
-		memMaxBytes := memBytes
-		if spec.MemoryMaxMB > 0 {
-			memMaxBytes = spec.MemoryMaxMB * 1024 * 1024
-		}
-
-		// memory.low (soft limit)
-		if err := nr.writeCgroupFile(cgroupPath, "memory.low", strconv.FormatUint(memBytes, 10)); err != nil {
-			logger.Warn("Failed to set memory.low, memory reclaim might not be prioritized", "error", err)
-		} else {
-			logger.Debug("Set memory.low", "bytes", memBytes)
-		}
-
-		// memory.max (hard limit)
-		if err := nr.writeCgroupFile(cgroupPath, "memory.max", strconv.FormatUint(memMaxBytes, 10)); err != nil {
-			// This is more critical. If it fails, hard memory limit won't apply.
-			return fmt.Errorf("failed to set memory.max: %w. Ensure memory controller is enabled for parent cgroup.", err)
-		} else {
-			logger.Debug("Set memory.max", "bytes", memMaxBytes)
-		}
-		// Could also set memory.swap.max = 0 to disable swap for the cgroup
-		// if err := nr.writeCgroupFile(cgroupPath, "memory.swap.max", "0"); err != nil {
-		//    logger.Warn("Failed to disable swap (set memory.swap.max=0)", "error", err)
-		// }
-	}
-	return nil
-}
-
-func (nr *NodeRunner) killCgroup(cgroupPath string, logger *slog.Logger) error {
-	if cgroupPath == "" {
-		return nil
-	}
-	logger.Info("Attempting to kill all processes in cgroup", "path", cgroupPath)
-	// Writing "1" to cgroup.kill sends SIGKILL to all processes in the cgroup and its descendants.
-	// This requires the cgroup.kill file to be present (unified hierarchy / cgroup v2).
-	err := nr.writeCgroupFile(cgroupPath, "cgroup.kill", "1")
-	if err != nil {
-		logger.Error("Failed to write to cgroup.kill", "path", cgroupPath, "error", err)
-		return err
-	}
-	return nil
-}
-
 // Helper to find a free port on the host
 func getFreePort() (int, error) {
 	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
@@ -502,23 +325,6 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			socketPath := filepath.Join(socketsDir, "metrics.sock")
 			_ = os.Remove(socketPath)
 
-			// Host Side: Listen TCP (Public/Localhost), Connect to Unix Socket
-			// Host acts as the "Client" to the socket
-			// Note: We use UNIX-CONNECT here. The Guest must UNIX-LISTEN.
-			// Wait: Socat UNIX-CONNECT requires the socket to exist (created by listener).
-			// It is safer if Host Listens on Socket (file creator) and Guest Connects?
-			// No, strictly relying on connection direction: Scraper -> HostPort -> Socket -> GuestPort -> App.
-			// Traffic flows INTO guest.
-
-			// Reversal for stability:
-			// Host: TCP-LISTEN:HostPort -> UNIX-CONNECT:metrics.sock
-			// Guest: UNIX-LISTEN:metrics.sock -> TCP:127.0.0.1:AppPort
-			// PROBLEM: If Guest crashes/restarts, socket might linger or host socat might die if connection drops.
-			// Better approach for persistent tunnel:
-			// Host: TCP-LISTEN:HostPort,fork -> UNIX-LISTEN:metrics.sock,fork
-			// Guest: UNIX-CONNECT:metrics.sock -> TCP:127.0.0.1:AppPort
-			// This way Host owns the socket file.
-
 			socketPathHost := filepath.Join(socketsDir, "metrics_host.sock")
 			// Ensure clean state, though Guest will recreate
 			_ = os.Remove(socketPathHost)
@@ -650,14 +456,15 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		envForLauncher = append(envForLauncher, fmt.Sprintf("%s=%s", envLandlockMetricsConfig, string(metricsJSON)))
 	}
 
-	// Cgroup Setup
+	// Cgroup Setup (Platform specific)
 	var cgroupPath string
 	var cgroupFd int = -1
 	var cgroupCleanupFunc func() error // Changed to return error
 
 	if nr.usesCgroupsForResourceLimits(spec) {
 		var cgErr error
-		cgroupPath, cgroupFd, cgroupCleanupFunc, cgErr = nr.createCgroup(spec, instanceID, logger)
+		// Abstracted Cgroup creation
+		cgroupPath, cgroupFd, cgroupCleanupFunc, cgErr = nr.createCgroupPlatform(spec, instanceID, logger)
 		if cgErr != nil {
 			errMsg := fmt.Sprintf("Failed to create cgroup: %v", cgErr)
 			logger.Error(errMsg)
@@ -675,7 +482,8 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 				}
 			}
 		}()
-		if err := nr.applyCgroupConstraints(spec, cgroupPath, logger); err != nil {
+		// Abstracted Cgroup Constraints application
+		if err := nr.applyCgroupConstraintsPlatform(spec, cgroupPath, logger); err != nil {
 			errMsg := fmt.Sprintf("Failed to apply cgroup constraints: %v", err)
 			processCancel()
 			// cgroupCleanupFunc will be called by the defer above
@@ -683,65 +491,12 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		}
 	}
 
-	// Command Assembly
-	var cmd *exec.Cmd
-	var finalExecCommandParts []string // Stores [nsenter_or_unshare_or_launcher, arg1, arg2...]
-
-	landlockLauncherCmd := selfPath
-	landlockLauncherArgs := []string{internalLaunchFlag}
-
-	// Determine if we need nsenter/unshare wrappers
-	useNamespacingOrCgroups := nr.usesNamespacing(spec) || nr.usesCgroupsForResourceLimits(spec)
-
-	if useNamespacingOrCgroups && runtime.GOOS == "linux" {
-		var commandBuilder []string
-		// nsenter (if network namespace is specified)
-		if spec.NetworkNamespacePath != "" {
-			commandBuilder = append(commandBuilder, "nsenter", "--no-fork", fmt.Sprintf("--net=%s", spec.NetworkNamespacePath), "--")
-		}
-
-		// unshare (always use if namespacing or cgroups are involved on Linux)
-		unshareCmd := "unshare"
-		unshareArgsList := []string{
-			"--ipc",
-			"--net",
-			"--pid",
-			"--mount-proc",
-			"--fork",
-			"--kill-child=SIGKILL", // Kill child if unshare dies
-			// TODO: Add --map-root-user if needed for some scenarios (e.g. user namespaces for rootless containers)
-			// This requires more complex UID/GID mapping setup. For now, assume target user exists on host.
-			"--", // Separator for the command unshare will run
-		}
-		commandBuilder = append(commandBuilder, unshareCmd)
-		commandBuilder = append(commandBuilder, unshareArgsList...)
-
-		// The command to be run by unshare (which is our landlock launcher)
-		commandBuilder = append(commandBuilder, landlockLauncherCmd)
-		commandBuilder = append(commandBuilder, landlockLauncherArgs...)
-
-		finalExecCommandParts = commandBuilder
-	} else {
-		// Standard landlock launcher path (or direct exec if mode != "landlock")
-		// If on non-Linux, cgroups/namespacing are skipped.
-		if spec.Mode == "landlock" {
-			finalExecCommandParts = append([]string{landlockLauncherCmd}, landlockLauncherArgs...)
-		} else { // "exec" mode directly
-			finalExecCommandParts = append([]string{binaryPath}, spec.Args...)
-			envForLauncher = launcherTargetEnv // Direct exec uses target env
-		}
-	}
-
-	logger.Info("Final command to execute", "parts", finalExecCommandParts)
-	cmd = exec.CommandContext(processCtx, finalExecCommandParts[0], finalExecCommandParts[1:]...)
-	cmd.Env = envForLauncher // This env is for the landlock launcher, or direct exec
-	cmd.Dir = workDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if cgroupFd != -1 && nr.usesCgroupsForResourceLimits(spec) {
-		cmd.SysProcAttr.UseCgroupFD = true
-		cmd.SysProcAttr.CgroupFD = cgroupFd
-		logger.Debug("Configured command to use CgroupFD", "fd", cgroupFd)
+	// Command Assembly (Platform Specific)
+	// This delegates the construction of the exec.Cmd, including potential namespace wrappers
+	cmd, err := nr.configureCmdPlatform(processCtx, spec, workDir, envForLauncher, selfPath, binaryPath, cgroupFd, logger)
+	if err != nil {
+		processCancel()
+		return fmt.Errorf("failed to configure platform command: %w", err)
 	}
 
 	// Pipes
@@ -820,16 +575,6 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		return returnedErr
 	}
 
-	// If cgroupFd was used by cmd.Start(), it's consumed. We can close our copy if we still have it.
-	// However, the cgroupFd in ManagedApp (appInstance.cgroupFd) is the one unix.Open'd.
-	// The cgroupCleanupFunc is responsible for closing this original fd.
-	// The kernel duplicates the fd for the child process.
-	// Let's ensure the original descriptor passed to createCgroup is closed if distinct from what SysProcAttr needs,
-	// but unix.Open with O_CLOEXEC should handle this for non-child processes.
-	// For UseCgroupFD, the child inherits it. The pledge example closes fd *after* cmd.Start().
-	// This means our cgroupCleanup (which includes unix.Close(fd)) should be called when the instance *stops*, not immediately after start.
-	// The `defer` handling `returnedErr` already covers failure *during* start.
-
 	appInstance.Pid = cmd.Process.Pid // Get the PID of the started process
 	appInstance.StartTime = time.Now()
 	appInstance.Status = StatusRunning
@@ -905,17 +650,11 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 		close(appInstance.StopSignal)
 	}
 
-	// Send SIGTERM to the process group
-	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			logger.Warn("Stop request: Process already exited before SIGTERM", "pid", pid)
-			appInstance.processCancel() // Ensure monitor wakes up
-			return nil                  // Not an error if already gone
-		}
-		// Unexpected error sending signal
-		logger.Error("Failed to send SIGTERM", "pid", pid, "error", err)
+	// Platform specific termination logic
+	if err := nr.terminateProcessPlatform(appInstance.Cmd.Process, pid); err != nil {
+		logger.Error("Failed to send termination signal", "pid", pid, "error", err)
 		appInstance.processCancel() // Cancel context anyway
-		return fmt.Errorf("failed to send SIGTERM to %s (PID %d, RunID %s): %w", instanceID, pid, runID, err)
+		return fmt.Errorf("failed to terminate %s (PID %d, RunID %s): %w", instanceID, pid, runID, err)
 	}
 
 	// Wait for graceful shutdown or timeout
@@ -923,20 +662,16 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	defer termTimer.Stop()
 	select {
 	case <-termTimer.C:
-		logger.Warn("Graceful shutdown timed out. Sending SIGKILL.", "pid", pid)
-		// If cgroup is used and timeout, try to kill via cgroup first
+		logger.Warn("Graceful shutdown timed out. Sending Force Kill.", "pid", pid)
+		// Try to force kill via platform specific means (cgroup if available, then kill)
 		if appInstance.cgroupPath != "" && nr.usesCgroupsForResourceLimits(appInstance.Spec) {
-			logger.Info("Attempting to kill via cgroup.kill", "cgroup_path", appInstance.cgroupPath)
-			if err := nr.killCgroup(appInstance.cgroupPath, logger); err != nil {
-				logger.Error("Failed to kill cgroup, falling back to SIGKILL PID", "error", err)
-				if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-					logger.Error("Failed to send SIGKILL to pgid", "pid", pid, "error", killErr)
-				}
+			logger.Info("Attempting to kill via cgroup", "cgroup_path", appInstance.cgroupPath)
+			if err := nr.killCgroupPlatform(appInstance.cgroupPath, logger); err != nil {
+				logger.Error("Failed to kill cgroup, falling back to Process Kill", "error", err)
+				_ = nr.forceKillProcessPlatform(appInstance.Cmd.Process, pid)
 			}
 		} else {
-			if killErr := syscall.Kill(-pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-				logger.Error("Failed to send SIGKILL to pgid", "pid", pid, "error", killErr)
-			}
+			_ = nr.forceKillProcessPlatform(appInstance.Cmd.Process, pid)
 		}
 		appInstance.processCancel() // Ensure context is cancelled if timeout occurs
 	case <-appInstance.processCtx.Done():
@@ -1030,30 +765,26 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 
 	logger = logger.With("run_id", runID) // Add RunID to monitor's logger context
 
-	// Start periodic memory polling goroutine if on Linux
-	if runtime.GOOS == "linux" {
-		// This goroutine will periodically update the memory metric.
-		// It's managed by the appInstance.processCtx.
-		appInstance.LogWg.Add(1) // Add to a wait group to ensure it exits cleanly
-		go func() {
-			defer appInstance.LogWg.Done()
-			pollTicker := time.NewTicker(5 * time.Second)
-			defer pollTicker.Stop()
-			logger.Debug("Starting periodic memory metric poller for process")
-			for {
-				select {
-				case <-pollTicker.C:
-					// Check if process is still considered running before polling
-					if appInstance.Status == StatusRunning && appInstance.Pid > 0 {
-						nr.doPollMemoryAndUpdateMetric(appInstance, logger)
-					}
-				case <-appInstance.processCtx.Done():
-					logger.Debug("Stopping periodic memory metric poller due to process context done")
-					return
+	// Start periodic memory polling goroutine
+	appInstance.LogWg.Add(1) // Add to a wait group to ensure it exits cleanly
+	go func() {
+		defer appInstance.LogWg.Done()
+		pollTicker := time.NewTicker(5 * time.Second)
+		defer pollTicker.Stop()
+		logger.Debug("Starting periodic memory metric poller for process")
+		for {
+			select {
+			case <-pollTicker.C:
+				// Check if process is still considered running before polling
+				if appInstance.Status == StatusRunning && appInstance.Pid > 0 {
+					nr.pollMemoryPlatform(appInstance, logger)
 				}
+			case <-appInstance.processCtx.Done():
+				logger.Debug("Stopping periodic memory metric poller due to process context done")
+				return
 			}
-		}()
-	}
+		}
+	}()
 
 	defer func() {
 		appInstance.processCancel() // This will also stop the memory poller goroutine
@@ -1124,28 +855,12 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 
 	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
 
+	// Extract Rusage (Generic Wrapper)
 	if appInstance.Cmd.ProcessState != nil {
-		if rusage, ok := appInstance.Cmd.ProcessState.SysUsage().(*syscall.Rusage); ok && rusage != nil {
-			var rssBytes float64
-			if nr.localOS == "linux" {
-				rssBytes = float64(rusage.Maxrss * 1024)
-			} else if nr.localOS == "darwin" {
-				rssBytes = float64(rusage.Maxrss)
-			} else {
-				logger.Warn("MaxRSS reporting for OS not explicitly handled", "os", nr.localOS, "raw_maxrss", rusage.Maxrss)
-				rssBytes = float64(rusage.Maxrss)
-			}
-			logger.Debug("Rusage details on process exit",
-				"Maxrss_raw", rusage.Maxrss, "converted_rss_bytes", rssBytes,
-				"Utime_sec", rusage.Utime.Sec, "Utime_usec", rusage.Utime.Usec,
-				"Stime_sec", rusage.Stime.Sec, "Stime_usec", rusage.Stime.Usec)
-
-			metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(rssBytes)
-			metrics.NarunNodeRunnerInstanceCPUUserSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(metrics.TimevalToSeconds(rusage.Utime))
-			metrics.NarunNodeRunnerInstanceCPUSystemSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(metrics.TimevalToSeconds(rusage.Stime))
-		} else {
-			logger.Warn("Could not get Rusage for process")
-		}
+		rssBytes, uTime, sTime := nr.extractRusagePlatform(appInstance.Cmd.ProcessState, logger)
+		metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(rssBytes)
+		metrics.NarunNodeRunnerInstanceCPUUserSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(uTime)
+		metrics.NarunNodeRunnerInstanceCPUSystemSecondsTotal.WithLabelValues(appName, instanceID, nr.nodeID, runID).Add(sTime)
 	} else {
 		logger.Warn("ProcessState is nil, cannot get Rusage.")
 	}
@@ -1178,10 +893,14 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 				}
 			}
 			if !isLauncherFailure {
-				if status, okSys := exitErr.Sys().(syscall.WaitStatus); okSys && status.Signaled() {
-					sig := status.Signal()
+				// Platform specific check for signaling
+				isSignaled, sig := nr.isProcessSignaledPlatform(exitErr)
+				if isSignaled {
 					logger.Warn("Process killed by signal", "pid", appInstance.Pid, "signal", sig)
-					if (sig == syscall.SIGTERM || sig == syscall.SIGINT) && intentionalStop {
+					// Determine if signal was expected (SIGTERM/SIGINT during stop)
+					// Note: sig is generic string here, checking equality with "terminated" or similar depends on OS.
+					// For strict correctness, we assume intentionalStop handles most of this logic.
+					if intentionalStop {
 						finalStatus = StatusStopped
 					} else {
 						finalStatus = StatusCrashed
@@ -1231,7 +950,7 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		return
 	}
 	if !configHashMatches {
-		logger.Info("Configuration changed since instance run started. No restart.", "old_hash", appInstance.ConfigHash, "new_hash", appInfo.configHash)
+		logger.Info("Config changed since instance run started. No restart.", "old_hash", appInstance.ConfigHash, "new_hash", appInfo.configHash)
 		return
 	}
 
@@ -1526,72 +1245,6 @@ func (nr *NodeRunner) removeInstanceState(appName, instanceID string, logger *sl
 		logger.Info("Removed instance state.", "remaining_instances", len(newInstances))
 	} else {
 		logger.Warn("Attempted to remove instance state, but it was not found.")
-	}
-}
-
-// doPollMemoryAndUpdateMetric polls memory usage for a running instance (Linux specific for now)
-// and updates the Prometheus gauge.
-func (nr *NodeRunner) doPollMemoryAndUpdateMetric(instance *ManagedApp, logger *slog.Logger) {
-	if instance.Cmd == nil || instance.Cmd.Process == nil || instance.Pid <= 0 {
-		logger.Debug("Skipping memory poll, process or PID not valid", "pid", instance.Pid)
-		return
-	}
-
-	pid := instance.Pid
-	var VmHWMkB int64 = -1 // VmHWM (Peak resident set size) in KB
-
-	// This logic is Linux-specific, reading /proc/[pid]/status
-	if runtime.GOOS == "linux" {
-		filePath := fmt.Sprintf("/proc/%d/status", pid)
-		file, err := os.Open(filePath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				logger.Debug("Failed to open proc status file (process likely exited while polling)", "pid", pid, "path", filePath, "error", err)
-			} else {
-				logger.Warn("Failed to open proc status file", "pid", pid, "path", filePath, "error", err)
-			}
-			return
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "VmHWM:") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					val, parseErr := strconv.ParseInt(parts[1], 10, 64)
-					if parseErr == nil {
-						VmHWMkB = val
-						break
-					} else {
-						logger.Warn("Failed to parse VmHWM value from proc status", "pid", pid, "line", line, "error", parseErr)
-					}
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			logger.Warn("Error scanning proc status file", "pid", pid, "path", filePath, "error", err)
-			return
-		}
-	} else {
-		// For non-Linux, we don't poll live memory this way.
-		// The final Rusage will provide MaxRSS on exit.
-		return
-	}
-
-	if VmHWMkB != -1 {
-		memoryBytes := float64(VmHWMkB * 1024) // Convert KB to Bytes
-		metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(
-			InstanceIDToAppName(instance.InstanceID),
-			instance.InstanceID,
-			nr.nodeID,
-			instance.RunID,
-		).Set(memoryBytes)
-		logger.Debug("Updated live memory (VmHWM) metric", "pid", pid, "VmHWM_kB", VmHWMkB, "bytes", memoryBytes)
-	} else {
-		// VmHWM not found, or not Linux. Log less verbosely or not at all.
-		// logger.Debug("VmHWM not found in proc status or not on Linux, memory metric not updated this cycle", "pid", pid)
 	}
 }
 
