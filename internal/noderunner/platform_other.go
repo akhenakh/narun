@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !freebsd
 
 package noderunner
 
@@ -25,7 +25,7 @@ func (nr *NodeRunner) killCgroupPlatform(cgroupPath string, logger *slog.Logger)
 }
 
 // configureCmdPlatform stub for non-Linux
-func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, logger *slog.Logger) (*exec.Cmd, error) {
+func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, cgroupPath string, logger *slog.Logger) (*exec.Cmd, error) {
 	// Direct execution fallback, ignoring namespaces/landlock/cgroups
 	finalExecCommandParts := append([]string{binaryPath}, spec.Args...)
 	logger.Info("Final command to execute (Non-Linux Direct Exec)", "parts", finalExecCommandParts)

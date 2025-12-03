@@ -40,7 +40,7 @@ const (
 
 // Constants for landlock
 const (
-	internalLaunchFlag           = "--internal-landlock-launch"
+	internalLaunchFlag           = "--internal-launch"
 	envLandlockConfigJSON        = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
 	envLandlockTargetCmd         = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
 	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
@@ -492,8 +492,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	}
 
 	// Command Assembly (Platform Specific)
-	// This delegates the construction of the exec.Cmd, including potential namespace wrappers
-	cmd, err := nr.configureCmdPlatform(processCtx, spec, workDir, envForLauncher, selfPath, binaryPath, cgroupFd, logger)
+	cmd, err := nr.configureCmdPlatform(processCtx, spec, workDir, envForLauncher, selfPath, binaryPath, cgroupFd, cgroupPath, logger)
 	if err != nil {
 		processCancel()
 		return fmt.Errorf("failed to configure platform command: %w", err)

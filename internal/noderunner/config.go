@@ -83,6 +83,15 @@ type MetricsSpec struct {
 	Path string `yaml:"path,omitempty"` // The HTTP path for metrics (default: /metrics)
 }
 
+// JailSpec defines the configuration for FreeBSD Jails.
+type JailSpec struct {
+	Hostname         string   `yaml:"hostname,omitempty"`         // Hostname inside the jail
+	IP4Addresses     []string `yaml:"ip4Addresses,omitempty"`     // List of IPv4 addresses (aliases)
+	AllowRawSockets  bool     `yaml:"allowRawSockets,omitempty"`  // Allow raw sockets (ping, etc.)
+	DevfsRuleset     int      `yaml:"devfsRuleset,omitempty"`     // Devfs ruleset number (default 4)
+	MountSystemCerts bool     `yaml:"mountSystemCerts,omitempty"` // Mount host SSL certs
+}
+
 // ServiceSpec defines the desired configuration for an application managed by the node runner.
 // This structure is stored as YAML in the NATS KV store.
 type ServiceSpec struct {
@@ -94,6 +103,7 @@ type ServiceSpec struct {
 	Nodes    []NodeSelectorSpec `yaml:"nodes,omitempty"`    // List of nodes to deploy on and replica counts
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
+	Jail     JailSpec           `yaml:"jail,omitempty"`     // Jail specific configuration (FreeBSD)
 	Mounts   []MountSpec        `yaml:"mounts,omitempty"`   // Files to mount into the instance directory
 	NoNet    NoNetSpec          `yaml:"nonet,omitempty"`    // Disable guest network access, only localPorts
 	Metrics  MetricsSpec        `yaml:"metrics,omitempty"`  // Configuration for metrics scraping
@@ -152,12 +162,16 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		spec.Command = spec.Name // Default command (will use local binary path later)
 	}
 
-	// Default and Validate Mode
-	if spec.Mode == "" {
-		spec.Mode = "exec" // Default mode
+	if spec.Mode != "exec" && spec.Mode != "landlock" && spec.Mode != "jail" {
+		return nil, fmt.Errorf("invalid mode '%s': must be 'exec', 'landlock', or 'jail'", spec.Mode)
 	}
-	if spec.Mode != "exec" && spec.Mode != "landlock" {
-		return nil, fmt.Errorf("invalid mode '%s': must be 'exec' or 'landlock'", spec.Mode)
+
+	// Mode validation logic
+	if spec.Mode == "landlock" && runtime.GOOS != "linux" {
+		fmt.Printf("Warning: Landlock mode specified for app '%s', but OS is %s.\n", spec.Name, runtime.GOOS)
+	}
+	if spec.Mode == "jail" && runtime.GOOS != "freebsd" {
+		fmt.Printf("Warning: Jail mode specified for app '%s', but OS is %s.\n", spec.Name, runtime.GOOS)
 	}
 
 	// Validate Landlock spec only if mode is landlock

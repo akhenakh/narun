@@ -16,16 +16,23 @@ import (
 )
 
 const (
-	internalLaunchFlag              = "--internal-landlock-launch"
-	envLandlockConfigJSON           = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
-	envLandlockTargetCmd            = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
-	envLandlockTargetArgsJSON       = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
-	envLandlockInstanceRoot         = "NARUN_INTERNAL_INSTANCE_ROOT"
-	envLandlockMountInfosJSON       = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
-	envLandlockLocalPorts           = "NARUN_INTERNAL_LOCAL_PORTS"
-	envLandlockMetricsConfig        = "NARUN_INTERNAL_METRICS_CONFIG" // New Env var for metrics
-	envTargetUID                    = "NARUN_TARGET_UID"
-	envTargetGID                    = "NARUN_TARGET_GID"
+	internalLaunchFlag        = "--internal-launch"
+	internalJailLaunchFlag    = "--internal-jail-launch"
+	envLandlockConfigJSON     = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
+	envLandlockTargetCmd      = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
+	envLandlockTargetArgsJSON = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
+	envLandlockInstanceRoot   = "NARUN_INTERNAL_INSTANCE_ROOT"
+	envLandlockMountInfosJSON = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
+	envLandlockLocalPorts     = "NARUN_INTERNAL_LOCAL_PORTS"
+	envLandlockMetricsConfig  = "NARUN_INTERNAL_METRICS_CONFIG" // New Env var for metrics
+	envTargetUID              = "NARUN_TARGET_UID"
+	envTargetGID              = "NARUN_TARGET_GID"
+
+	// FreeBSD specific
+	envJailID        = "NARUN_INTERNAL_JAIL_ID"
+	envJailTargetCmd = "NARUN_INTERNAL_JAIL_TARGET_CMD"
+
+	// Linux specific
 	landlockLauncherErrCode         = 120 // Specific exit code for launcher errors
 	landlockUnsupportedErrCode      = 121 // Specific exit code if landlock unsupported
 	landlockLockFailedErrCode       = 122 // Specific exit code if l.Lock fails
@@ -35,15 +42,21 @@ const (
 )
 
 func main() {
-	// Early Check for Internal Landlock Launch Mode
-	// it will become the launcher process in the fork/exec sequence.
+	// Check for generic internal launch flag
+	// For backward compatibility or clarity, we can check for the specific landlock one too
+	// or unify them. Let's use the one passed by launcher_freebsd.go which is likely internalLaunchFlag
+
 	isInternalLaunch := slices.Contains(os.Args, internalLaunchFlag)
 
 	if isInternalLaunch {
-		// This execution is the intermediate launcher process.
-		// Implementation depends on the build tag (launcher_linux.go or launcher_other.go)
-		runLandlockLauncher()
-		// If runLandlockLauncher returns, it means syscall.Exec failed or OS is unsupported.
+		// Depending on build tag (launcher_linux.go or launcher_freebsd.go)
+		// the runLandlockLauncher (or rename to runPlatformLauncher) will be called.
+
+		// In launcher_freebsd.go we defined runJailLauncher.
+		// In launcher_linux.go we defined runLandlockLauncher.
+		// We need a unified interface function `runLauncher()`.
+
+		runLauncher()
 		os.Exit(landlockTargetExecFailedCode)
 	}
 
