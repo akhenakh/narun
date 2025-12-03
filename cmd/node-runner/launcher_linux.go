@@ -15,9 +15,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// runLandlockLauncher is executed by the child "launcher" process.
+// runLauncher is executed by the child "launcher" process.
 // It applies Landlock and then replaces itself with the target application.
-func runLandlockLauncher() {
+func runLauncher() {
 	// Use stderr for launcher logs as stdout might be piped
 	fmt.Fprintf(os.Stderr, "[narun-launcher] Process started in Landlock launcher mode.\n")
 

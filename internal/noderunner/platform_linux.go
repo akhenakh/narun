@@ -188,7 +188,7 @@ func (nr *NodeRunner) killCgroupPlatform(cgroupPath string, logger *slog.Logger)
 }
 
 // configureCmdPlatform prepares the exec.Cmd with platform specific attributes (SysProcAttr, namespaces, etc.)
-func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, logger *slog.Logger) (*exec.Cmd, error) {
+func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, cgroupPath string, logger *slog.Logger) (*exec.Cmd, error) {
 	landlockLauncherCmd := selfPath
 	landlockLauncherArgs := []string{internalLaunchFlag}
 
