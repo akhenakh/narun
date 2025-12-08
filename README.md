@@ -15,14 +15,15 @@ WORK IN PROGRESS, do not use in production unless you want to suffer.
 ## Concepts & Decisions
 
 Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive.
-Narun aims to provide a simpler and more lightweight alternative for edge devices.
-It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.
-So no need for stateful services, anything else is stateless and ephemeral.
+Narun aims to provide a simpler and more lightweight alternative for edge devices.  
+It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.  
+So no need for stateful services, anything else is stateless and ephemeral.  
 Modern developments ecosystem, Rust, Go, Zig or Deno, do not require full containerized operating systems, static binaries are good enough in many situations.
-No need to ship containers so no need for a full fledge registry.
-NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.
-No support for multi tenancy.
-Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some options like firecracker.
+No need to ship containers so no need for a full fledge registry.  
+NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.  
+No support for multi tenancy.  
+Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some options like firecracker.  
+Support for FreeBSD relying on jails.  
 
 
 ## Components
