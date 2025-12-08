@@ -11,21 +11,20 @@ import (
 	"syscall"
 )
 
-// Cgroup Stubs
-func (nr *NodeRunner) createCgroupPlatform(spec *ServiceSpec, instanceID string, logger *slog.Logger) (cgroupPath string, cgroupFd int, cleanup func() error, err error) {
-	return "", -1, nil, fmt.Errorf("cgroups are only supported on Linux")
+func (nr *NodeRunner) createIsolationPlatform(spec *ServiceSpec, instanceID string, logger *slog.Logger) (isolationID string, isolationFd int, cleanup func() error, err error) {
+	return "", -1, nil, fmt.Errorf("isolation is only supported on Linux (Cgroups) and FreeBSD (Jails)")
 }
 
-func (nr *NodeRunner) applyCgroupConstraintsPlatform(spec *ServiceSpec, cgroupPath string, logger *slog.Logger) error {
+func (nr *NodeRunner) applyResourceLimitsPlatform(spec *ServiceSpec, isolationID string, logger *slog.Logger) error {
 	return nil
 }
 
-func (nr *NodeRunner) killCgroupPlatform(cgroupPath string, logger *slog.Logger) error {
+func (nr *NodeRunner) destroyIsolationPlatform(isolationID string, logger *slog.Logger) error {
 	return nil
 }
 
 // configureCmdPlatform stub for non-Linux
-func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, cgroupPath string, logger *slog.Logger) (*exec.Cmd, error) {
+func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, isolationFd int, isolationID string, logger *slog.Logger) (*exec.Cmd, error) {
 	// Direct execution fallback, ignoring namespaces/landlock/cgroups
 	finalExecCommandParts := append([]string{binaryPath}, spec.Args...)
 	logger.Info("Final command to execute (Non-Linux Direct Exec)", "parts", finalExecCommandParts)

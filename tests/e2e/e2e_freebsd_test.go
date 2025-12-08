@@ -31,8 +31,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os/exec"
-	"strings"
+	"os"
+	"syscall"
 )
 
 func main() {
@@ -40,23 +40,20 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		// Check Jail Status via sysctl
-		cmd := exec.Command("sysctl", "-n", "security.jail.jailed")
-		out, err := cmd.CombinedOutput()
-
+		// Check Jail Status via syscall
+		jailed, err := syscall.SysctlUint32("security.jail.jailed")
 		isJailed := "0"
 		if err == nil {
-			isJailed = strings.TrimSpace(string(out))
+			isJailed = fmt.Sprintf("%d", jailed)
 		}
 
 		// Check Hostname
-		cmdHost := exec.Command("hostname")
-		outHost, _ := cmdHost.CombinedOutput()
+		hostname, _ := os.Hostname()
 
 		resp := map[string]string{
 			"status": "ok",
 			"jailed": isJailed, // Should be 1
-			"hostname": strings.TrimSpace(string(outHost)),
+			"hostname": hostname,
 		}
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -71,9 +68,25 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 		t.Skip("Skipping FreeBSD Jail test: Requires root privileges to create jails/rctl")
 	}
 
-	// 1. Setup NATS
+	// 0. Pre-test Cleanup
+	jailName := "narun_test_jail_0"
+	exec.Command("jail", "-r", jailName).Run()
+	exec.Command("ifconfig", "lo0", "inet", "127.0.0.50", "-alias").Run()
+
+	// Check if RACCT/RCTL is enabled
+	racctEnabled := false
+	cmdSysctl := exec.Command("sysctl", "-n", "kern.racct.enable")
+	outSysctl, err := cmdSysctl.Output()
+	if err == nil && strings.TrimSpace(string(outSysctl)) == "1" {
+		racctEnabled = true
+	} else {
+		t.Log("RACCT not enabled. Skipping resource limit tests.")
+	}
+
+	// Setup NATS
 	storeDir := t.TempDir()
 	opts := &server.Options{
+		Host:      "127.0.0.1",
 		Port:      -1,
 		JetStream: true,
 		StoreDir:  storeDir,
@@ -89,35 +102,42 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 	defer ns.Shutdown()
 	natsURL := ns.ClientURL()
 
-	// 2. Setup NATS Resources
-	nc, _ := nats.Connect(natsURL)
+	// Setup NATS Resources
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("Failed to connect to NATS: %v", err)
+	}
 	defer nc.Close()
-	js, _ := jetstream.New(nc)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("Failed to create JetStream: %v", err)
+	}
 	ctx := context.Background()
 
-	// Create Buckets
 	js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: noderunner.AppConfigKVBucket})
 	js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: noderunner.NodeStateKVBucket})
 	js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: noderunner.SecretKVBucket})
 	binStore, _ := js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: noderunner.AppBinariesOSBucket})
 	js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{Bucket: noderunner.FileOSBucket})
 
-	// 3. Build Artifacts
+	// Build Artifacts
 	tempDir := t.TempDir()
 
-	// Build node-runner
+	// Build node-runner (Static) with -buildvcs=false
 	rootDir, _ := filepath.Abs("../../")
 	runnerBinPath := filepath.Join(tempDir, "node-runner")
-	cmdBuildRunner := exec.Command("go", "build", "-o", runnerBinPath, filepath.Join(rootDir, "cmd/node-runner"))
+	cmdBuildRunner := exec.Command("go", "build", "-buildvcs=false", "-tags", "netgo", "-ldflags", "-extldflags -static", "-o", runnerBinPath, filepath.Join(rootDir, "cmd/node-runner"))
+	cmdBuildRunner.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmdBuildRunner.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build node-runner: %v\nOutput: %s", err, out)
 	}
 
-	// Build Workload
+	// Build Workload (Static) with -buildvcs=false
 	workloadSrcPath := filepath.Join(tempDir, "main.go")
 	os.WriteFile(workloadSrcPath, []byte(freebsdWorkloadSource), 0644)
 	workloadBinPath := filepath.Join(tempDir, "workload")
-	cmdBuildWorkload := exec.Command("go", "build", "-o", workloadBinPath, workloadSrcPath)
+	cmdBuildWorkload := exec.Command("go", "build", "-buildvcs=false", "-tags", "netgo", "-ldflags", "-extldflags -static", "-o", workloadBinPath, workloadSrcPath)
+	cmdBuildWorkload.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmdBuildWorkload.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build workload: %v\nOutput: %s", err, out)
 	}
@@ -136,9 +156,11 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 	}
 	binStore.Put(ctx, meta, bytes.NewReader(workloadData))
 
-	// 4. Start Node Runner
+	// Subscribe to Logs for Debugging
+	logSub, _ := nc.SubscribeSync("logs.>")
+
+	// Start Node Runner
 	runnerDataDir := filepath.Join(tempDir, "runner-data")
-	// Pick a random port for Metrics
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	metricsPort := l.Addr().(*net.TCPAddr).Port
 	l.Close()
@@ -158,13 +180,37 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 		t.Fatalf("Failed to start node-runner: %v", err)
 	}
 	defer func() {
+		// Dump any collected logs if failed
+		if t.Failed() {
+			for {
+				msg, err := logSub.NextMsg(10 * time.Millisecond)
+				if err != nil {
+					break
+				}
+				t.Logf("[NATS LOG] %s: %s", msg.Subject, string(msg.Data))
+			}
+		}
 		runnerCmd.Process.Signal(os.Interrupt)
 		runnerCmd.Wait()
+		// Manual cleanup of jail resources to prevent "busy" errors in TempDir cleanup
+		exec.Command("jail", "-r", jailName).Run()
+		// Ensure devfs is unmounted with force
+		devfsPath := filepath.Join(runnerDataDir, "instances/test-jail-0/work/dev")
+		if err := exec.Command("umount", "-f", devfsPath).Run(); err != nil {
+			// If force unmount failed, try one more time after a short delay
+			time.Sleep(100 * time.Millisecond)
+			exec.Command("umount", "-f", devfsPath).Run()
+		}
+		exec.Command("ifconfig", "lo0", "inet", "127.0.0.50", "-alias").Run()
 	}()
 	time.Sleep(2 * time.Second)
 
-	// 5. Deploy Config with Jail Spec
-	// We use 127.0.0.50 as the jail alias
+	// Ensure Alias exists BEFORE deploy to prevent network race condition
+	if err := exec.Command("ifconfig", "lo0", "inet", "127.0.0.50/32", "alias").Run(); err != nil {
+		t.Fatalf("Failed to set IP alias: %v", err)
+	}
+
+	// Deploy Config
 	spec := noderunner.ServiceSpec{
 		Name: "test-jail",
 		Tag:  "v1",
@@ -177,8 +223,9 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 			IP4Addresses: []string{"127.0.0.50"},
 			DevfsRuleset: 4,
 		},
-		// Set a memory limit to verify RCTL rules
-		MemoryMB: 64,
+	}
+	if racctEnabled {
+		spec.MemoryMB = 64
 	}
 
 	specBytes, _ := yaml.Marshal(spec)
@@ -187,7 +234,7 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 
 	t.Log("Deployed Jail Config. Waiting for status...")
 
-	// 6. Monitor Status
+	// Monitor Status
 	statusSubject := "status.test-jail.freebsd-node"
 	subStatus, err := nc.SubscribeSync(statusSubject)
 	if err != nil {
@@ -196,16 +243,6 @@ func TestFreeBSD_Jail_EndToEnd(t *testing.T) {
 
 	timeout := time.After(30 * time.Second)
 	isRunning := false
-
-	// Ensure the alias is cleaned up if test fails/exits
-	defer exec.Command("ifconfig", "lo0", "inet", "127.0.0.50", "-alias").Run()
-
-	// Manually add alias for the jail to bind to (usually node-runner doesn't create interface aliases, just uses them)
-	// In a real setup, lo0 aliases are pre-configured or handled by networking scripts.
-	// For E2E test, we add it now.
-	if out, err := exec.Command("ifconfig", "lo0", "alias", "127.0.0.50/32").CombinedOutput(); err != nil {
-		t.Fatalf("Failed to add test alias IP: %s", out)
-	}
 
 loop:
 	for {
@@ -235,13 +272,22 @@ loop:
 		t.Fatal("App did not reach running state")
 	}
 
-	// 7. Verify Jail Isolation
+	// Verify Jail
 	t.Log("Verifying Jail Isolation via HTTP...")
+	var resp *http.Response
+	var connectErr error
+	deadline := time.Now().Add(10 * time.Second)
 
-	// Connect to the Jail IP
-	resp, err := http.Get("http://127.0.0.50:8080/")
-	if err != nil {
-		t.Fatalf("Failed to connect to jailed app: %v", err)
+	for time.Now().Before(deadline) {
+		resp, connectErr = http.Get("http://127.0.0.50:8080/")
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if connectErr != nil {
+		t.Fatalf("Failed to connect to jailed app: %v", connectErr)
 	}
 	defer resp.Body.Close()
 
@@ -259,24 +305,18 @@ loop:
 		t.Errorf("Expected hostname 'jailed-app', got '%s'", result["hostname"])
 	}
 
-	// 8. Verify RCTL Rules
-	// We expect a rule for the jail limiting memory
-	t.Log("Verifying RCTL rules...")
-	// Need to find the JID. The Instance ID is test-jail-0
-	// Jail name in platform_freebsd.go is fmt.Sprintf("narun_%s", strings.ReplaceAll(instanceID, "-", "_"))
-	jailName := "narun_test_jail_0"
-
-	cmdRctl := exec.Command("rctl", "-h", fmt.Sprintf("jail:%s", jailName))
-	outRctl, err := cmdRctl.CombinedOutput()
-	if err != nil {
-		t.Errorf("Failed to query rctl: %v", err)
-	}
-	rules := string(outRctl)
-	t.Logf("RCTL Rules for %s:\n%s", jailName, rules)
-
-	// Check for memoryuse limit (64MB = 67108864 bytes)
-	if !strings.Contains(rules, "memoryuse:deny=67108864") {
-		t.Errorf("Expected memory limit rule not found in rctl output")
+	if racctEnabled {
+		t.Log("Verifying RCTL rules...")
+		cmdRctl := exec.Command("rctl", "-h", fmt.Sprintf("jail:%s", jailName))
+		outRctl, err := cmdRctl.CombinedOutput()
+		if err != nil {
+			t.Errorf("Failed to query rctl: %v", err)
+		}
+		rules := string(outRctl)
+		t.Logf("RCTL Rules for %s:\n%s", jailName, rules)
+		if !strings.Contains(rules, "memoryuse:deny=67108864") {
+			t.Errorf("Expected memory limit rule not found")
+		}
 	}
 
 	t.Log("FreeBSD Jail E2E Test Passed")

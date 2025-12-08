@@ -211,9 +211,13 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 		// e.g. "system.slice" or "mycompany.slice/services.slice"
 		// The runner will then form /sys/fs/cgroup/<CgroupParent>/narun-<app>-<id>.scope
 	}
-	if (spec.MemoryMB > 0 || spec.CPUCores > 0) && spec.CgroupParent == "" {
-		return nil, fmt.Errorf("cgroupParent must be specified when memoryMB or cpuCores limits are set")
+
+	// Enforce CgroupParent only if limits are set AND mode is NOT jail.
+	// FreeBSD Jails use RCTL and do not use CgroupParent.
+	if (spec.MemoryMB > 0 || spec.CPUCores > 0) && spec.CgroupParent == "" && spec.Mode != "jail" {
+		return nil, fmt.Errorf("cgroupParent must be specified when memoryMB or cpuCores limits are set (unless mode is 'jail')")
 	}
+
 	if spec.CgroupParent != "" && runtime.GOOS != "linux" {
 		fmt.Printf("Warning: cgroupParent specified for app '%s', but current OS is not Linux (%s). Cgroup limits will be ignored.\n", spec.Name, runtime.GOOS)
 	}

@@ -5,9 +5,12 @@ package noderunner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -16,27 +19,24 @@ import (
 	"github.com/akhenakh/narun/internal/metrics"
 )
 
-// createCgroupPlatform creates a FreeBSD Jail.
-// In the current architecture, "Cgroup" abstraction is used for Isolation + Resource Control.
-// On FreeBSD, we create the Jail structure here.
-func (nr *NodeRunner) createCgroupPlatform(spec *ServiceSpec, instanceID string, logger *slog.Logger) (cgroupPath string, cgroupFd int, cleanup func() error, err error) {
+// createIsolationPlatform creates a FreeBSD Jail.
+// Returns the JID as the isolationID string.
+func (nr *NodeRunner) createIsolationPlatform(spec *ServiceSpec, instanceID string, logger *slog.Logger) (isolationID string, isolationFd int, cleanup func() error, err error) {
 	if spec.Mode != "jail" {
-		// If not in jail mode, we don't create an isolation context (jail) here.
-		// Returns empty path/cleanup which is fine for 'exec' mode.
 		return "", -1, nil, nil
 	}
 
-	// We use the instanceID as the Jail Name
 	jailName := fmt.Sprintf("narun_%s", strings.ReplaceAll(instanceID, "-", "_"))
-
-	// Determine the Jail Root. Using the instance work directory.
-	// NOTE: process.go creates the work dir before calling this.
-	// We reconstruct the path based on known structure: dataDir/instances/instanceID/work
 	jailPath := fmt.Sprintf("%s/instances/%s/work", nr.dataDir, instanceID)
 
-	// Ensure directory exists (process.go should have done it, but double check)
 	if _, err := os.Stat(jailPath); os.IsNotExist(err) {
 		return "", -1, nil, fmt.Errorf("jail root path does not exist: %s", jailPath)
+	}
+
+	// 1. Manage IP Aliases on Host Interfaces
+	// We must do this BEFORE creating the jail so the IPs are valid on the host.
+	if err := nr.manageIpAliases(spec.Jail.IP4Addresses, true, logger); err != nil {
+		return "", -1, nil, fmt.Errorf("failed to add IP aliases: %w", err)
 	}
 
 	cfg := fbjail.JailConfig{
@@ -48,12 +48,11 @@ func (nr *NodeRunner) createCgroupPlatform(spec *ServiceSpec, instanceID string,
 		DevfsRuleset:     spec.Jail.DevfsRuleset,
 		EnforceStatfs:    2,
 		AllowRawSockets:  spec.Jail.AllowRawSockets,
-		Persist:          true, // Required to keep jail alive for the launcher to attach
+		Persist:          true,
 		CopyResolvConf:   true,
 		MountSystemCerts: spec.Jail.MountSystemCerts,
 	}
 
-	// If Hostname not set, default to App Name
 	if cfg.Hostname == "" {
 		cfg.Hostname = spec.Name
 	}
@@ -62,27 +61,110 @@ func (nr *NodeRunner) createCgroupPlatform(spec *ServiceSpec, instanceID string,
 
 	logger.Info("Creating Jail", "name", jailName, "path", jailPath)
 	if err := manager.Create(); err != nil {
+		// Cleanup aliases if creation fails
+		_ = nr.manageIpAliases(spec.Jail.IP4Addresses, false, logger)
 		return "", -1, nil, fmt.Errorf("failed to create jail: %w", err)
 	}
 
 	cleanupFunc := func() error {
 		logger.Info("Stopping Jail", "name", jailName)
-		// We should also remove RCTL limits if we added any,
-		// though removing the jail usually clears rules attached to the jail subject.
 		_ = exec.Command("rctl", "-r", fmt.Sprintf("jail:%s", jailName)).Run()
-		return manager.Stop()
+		stopErr := manager.Stop()
+		// Remove aliases after stop
+		aliasErr := nr.manageIpAliases(spec.Jail.IP4Addresses, false, logger)
+
+		if stopErr != nil {
+			return stopErr
+		}
+		return aliasErr
 	}
 
-	// Return the Jail Name as the "cgroupPath" (identifier) and JID as fd (casted) if needed,
-	// though we primarily use the name/JID string.
-	// We return the JID in the path string for easier parsing later if needed.
 	return strconv.Itoa(manager.JID), -1, cleanupFunc, nil
 }
 
-// applyCgroupConstraintsPlatform applies RCTL resource limits to the Jail.
-func (nr *NodeRunner) applyCgroupConstraintsPlatform(spec *ServiceSpec, cgroupPath string, logger *slog.Logger) error {
-	// cgroupPath here holds the JID string from createCgroupPlatform
-	jid := cgroupPath
+// manageIpAliases adds or removes IP aliases from host interfaces based on subnet matching.
+func (nr *NodeRunner) manageIpAliases(ips []string, add bool, logger *slog.Logger) error {
+	if len(ips) == 0 {
+		return nil
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("failed to list interfaces: %w", err)
+	}
+
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			logger.Warn("Invalid IP format in config, skipping alias", "ip", ipStr)
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			logger.Warn("Only IPv4 aliases supported currently, skipping", "ip", ipStr)
+			continue
+		}
+
+		// Find suitable interface
+		var targetIface string
+
+		// 1. Check Loopback
+		if ip4.IsLoopback() {
+			targetIface = "lo0" // Default freebsd loopback
+		} else {
+			// 2. Scan interfaces for matching subnet
+			for _, iface := range interfaces {
+				addrs, err := iface.Addrs()
+				if err != nil {
+					continue
+				}
+				for _, addr := range addrs {
+					if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+						// Check if our IP fits in this subnet
+						if ipNet.Contains(ip4) {
+							targetIface = iface.Name
+							break
+						}
+					}
+				}
+				if targetIface != "" {
+					break
+				}
+			}
+		}
+
+		if targetIface == "" {
+			logger.Warn("Could not find matching host interface subnet for IP. Alias NOT added. Jail networking might fail.", "ip", ipStr)
+			continue
+		}
+
+		// Execute ifconfig
+		// ifconfig <iface> <ip>/32 alias
+		// ifconfig <iface> <ip>/32 -alias
+		action := "alias"
+		if !add {
+			action = "-alias"
+		}
+
+		// Use /32 for aliases to avoid subnet overlap issues
+		cidr := fmt.Sprintf("%s/32", ipStr)
+
+		logger.Info("Managing IP alias", "action", action, "interface", targetIface, "ip", cidr)
+		cmd := exec.Command("ifconfig", targetIface, "inet", cidr, action)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// Ignore "Can't assign requested address" on delete if it was already gone
+			if !add && strings.Contains(string(out), "Can't assign requested address") {
+				continue
+			}
+			return fmt.Errorf("ifconfig failed for %s on %s: %v (%s)", cidr, targetIface, err, string(out))
+		}
+	}
+	return nil
+}
+
+// applyResourceLimitsPlatform applies RCTL resource limits to the Jail (isolationID is the JID).
+func (nr *NodeRunner) applyResourceLimitsPlatform(spec *ServiceSpec, isolationID string, logger *slog.Logger) error {
+	jid := isolationID
 	if jid == "" || spec.Mode != "jail" {
 		return nil
 	}
@@ -122,15 +204,14 @@ func (nr *NodeRunner) applyCgroupConstraintsPlatform(spec *ServiceSpec, cgroupPa
 	return nil
 }
 
-// killCgroupPlatform destroys the jail.
-func (nr *NodeRunner) killCgroupPlatform(cgroupPath string, logger *slog.Logger) error {
-	// cgroupPath is the JID
-	if cgroupPath == "" {
+// destroyIsolationPlatform kills the jail.
+func (nr *NodeRunner) destroyIsolationPlatform(isolationID string, logger *slog.Logger) error {
+	if isolationID == "" {
 		return nil
 	}
-	jid, err := strconv.Atoi(cgroupPath)
+	jid, err := strconv.Atoi(isolationID)
 	if err != nil {
-		return fmt.Errorf("invalid JID: %s", cgroupPath)
+		return fmt.Errorf("invalid JID: %s", isolationID)
 	}
 
 	logger.Info("Killing Jail via fbjail", "jid", jid)
@@ -138,38 +219,54 @@ func (nr *NodeRunner) killCgroupPlatform(cgroupPath string, logger *slog.Logger)
 }
 
 // configureCmdPlatform configures the command to run.
-// If mode is "jail", it sets up the internal launcher to attach to the jail.
-func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, cgroupFd int, logger *slog.Logger) (*exec.Cmd, error) {
-
+func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, isolationFd int, isolationID string, logger *slog.Logger) (*exec.Cmd, error) {
 	if spec.Mode == "jail" {
-		// cgroupFd is unused on FreeBSD, we need the JID which was passed in applyCgroupConstraintsPlatform.
-		// However, createCgroupPlatform returns the JID as the first string return value.
-		// In process.go, `cgroupPath` (returned string) is available in the ManagedApp struct,
-		// but here we are inside startAppInstance before the struct is fully populated.
-		// Wait... process.go calls createCgroupPlatform, gets cgroupPath, then calls configureCmdPlatform.
-		// BUT process.go does NOT pass cgroupPath to configureCmdPlatform, it passes cgroupFd.
+		if isolationID == "" {
+			return nil, fmt.Errorf("jail mode requested but no JID (isolationID) provided")
+		}
 
-		// To fix this without changing the generic Linux interface in process.go too much:
-		// We rely on the fact that for FreeBSD, we won't use FDs.
-		// We need to fetch the JID.
-		// Since we cannot pass the JID string easily via the existing signature without changing generic code,
-		// we will modify process.go to pass cgroupPath string as well, or we cheat.
-		//
-		// CHEAT/HACK for compatibility: process.go logic uses `createCgroupPlatform` to get `cgroupPath`.
-		// It's available in the scope of `startAppInstance`.
-		// I will update process.go to pass cgroupPath to configureCmdPlatform.
-		// See step 5 below.
+		// The target binary must be accessible INSIDE the jail.
+		// Copy/Hardlink it to the jail root (workDir).
+		// Host path: workDir/app_binary
+		// Jail path: /app_binary
+		jailBinaryName := "app_binary"
+		hostBinaryDest := filepath.Join(workDir, jailBinaryName)
 
-		// Assuming process.go is updated to pass cgroupPath:
-		// We set up the launcher.
+		// Remove if exists to ensure clean state
+		os.Remove(hostBinaryDest)
 
-		// Note: The actual JID string needs to be passed in env.
-		// We will assume `cgroupFd` parameter is hijacked or we update signature.
-		// Let's assume updated signature in process.go (requires update to other platform files too).
-		return nil, fmt.Errorf("configureCmdPlatform requires signature update to accept cgroupPath string on FreeBSD")
+		// Try hardlink first (fast), fallback to copy
+		if err := os.Link(binaryPath, hostBinaryDest); err != nil {
+			logger.Debug("Hardlink failed, falling back to copy", "error", err)
+			if err := copyFile(binaryPath, hostBinaryDest); err != nil {
+				return nil, fmt.Errorf("failed to copy binary to jail root: %w", err)
+			}
+			if err := os.Chmod(hostBinaryDest, 0755); err != nil {
+				return nil, fmt.Errorf("failed to chmod jail binary: %w", err)
+			}
+		}
+
+		// Prepare the launcher (internal self-call)
+		launcherArgs := []string{
+			internalLaunchFlag, // --internal-launch (shared flag)
+		}
+
+		// Add Jail specific Env vars
+		// We pass the JID (isolationID) to the launcher so it knows what to attach to
+		env = append(env, fmt.Sprintf("%s=%s", envJailID, isolationID))
+		// TARGET CMD MUST BE PATH INSIDE JAIL
+		env = append(env, fmt.Sprintf("%s=/%s", envJailTargetCmd, jailBinaryName))
+
+		logger.Info("Configuring Jail Launcher", "jid", isolationID, "binary_internal", "/"+jailBinaryName)
+
+		cmd := exec.CommandContext(ctx, selfPath, launcherArgs...)
+		cmd.Env = env
+		cmd.Dir = workDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return cmd, nil
 	}
 
-	// Exec mode (Standard)
+	// Normal Exec
 	finalExecCommandParts := append([]string{binaryPath}, spec.Args...)
 	logger.Info("Final command to execute (FreeBSD Direct)", "parts", finalExecCommandParts)
 
@@ -181,72 +278,45 @@ func (nr *NodeRunner) configureCmdPlatform(ctx context.Context, spec *ServiceSpe
 	return cmd, nil
 }
 
-// RE-IMPLEMENTATION of configureCmdPlatform assuming process.go signature update
-// To make this cleaner, I will update process.go to pass `cgroupPath` string to this function.
-
-func (nr *NodeRunner) configureCmdPlatformWithJID(ctx context.Context, spec *ServiceSpec, workDir string, env []string, selfPath, binaryPath string, jidStr string, logger *slog.Logger) (*exec.Cmd, error) {
-	if spec.Mode == "jail" {
-		if jidStr == "" {
-			return nil, fmt.Errorf("jail mode requested but no JID provided")
-		}
-
-		// Prepare the launcher
-		launcherArgs := []string{
-			internalLaunchFlag, // --internal-jail-launch
-		}
-
-		// Add Jail specific Env vars
-		env = append(env, fmt.Sprintf("%s=%s", envJailID, jidStr))
-		env = append(env, fmt.Sprintf("%s=%s", envJailTargetCmd, binaryPath))
-
-		// We need to serialize args for the target
-		// We can reuse the JSON approach from Linux Landlock or simple env vars
-		// Reusing common env var names from main.go
-		// Note: main.go needs to define the FreeBSD specific flags/consts.
-
-		logger.Info("Configuring Jail Launcher", "jid", jidStr, "binary", binaryPath)
-
-		cmd := exec.CommandContext(ctx, selfPath, launcherArgs...)
-		cmd.Env = env
-		cmd.Dir = workDir
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		return cmd, nil
-	}
-
-	// Normal Exec
-	finalExecCommandParts := append([]string{binaryPath}, spec.Args...)
-	cmd := exec.CommandContext(ctx, finalExecCommandParts[0], finalExecCommandParts[1:]...)
-	cmd.Env = env
-	cmd.Dir = workDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	return cmd, nil
-}
-
-
 func (nr *NodeRunner) pollMemoryPlatform(instance *ManagedApp, logger *slog.Logger) {
-	// On FreeBSD we can rely on extractRusagePlatform which is called on exit.
-	// For live polling, we could use `ps` or `procstat`, but Go's syscall.Getrusage
-	// only works for the current process or children via Wait.
-	// We can try to read /proc/pid/status if procfs is mounted (common in FreeBSD servers).
-
-	pid := instance.Pid
-	filePath := fmt.Sprintf("/proc/%d/status", pid)
-	file, err := os.Open(filePath)
-	if err != nil {
-		// Fail silently/debug as procfs might not be mounted
+	// On FreeBSD, isolationID holds the JID string.
+	if instance.isolationID == "" {
 		return
 	}
-	defer file.Close()
 
-	// FreeBSD /proc/pid/status format is different from Linux.
-	// Usually space separated fields. Field 10 is usually RSS in pages?
-	// It's safer to not implement fragile parsing here without `libproc`.
-	// Leaving empty for now, relying on exit stats.
+	// Use rctl to query the jail's resource usage.
+	cmd := exec.Command("rctl", "-u", "jail:"+instance.isolationID)
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		// Look for the memoryuse usage line
+		if strings.Contains(line, ":memoryuse:usage=") {
+			parts := strings.Split(line, "=")
+			if len(parts) == 2 {
+				valStr := strings.TrimSpace(parts[1])
+				memBytes, err := strconv.ParseFloat(valStr, 64)
+				if err == nil {
+					metrics.NarunNodeRunnerInstanceMemoryMaxRSSBytes.WithLabelValues(
+						InstanceIDToAppName(instance.InstanceID),
+						instance.InstanceID,
+						nr.nodeID,
+						instance.RunID,
+					).Set(memBytes)
+					return // Found and updated
+				} else {
+					logger.Debug("Failed to parse rctl memory value", "value", valStr, "error", err)
+				}
+			}
+		}
+	}
 }
 
 func (nr *NodeRunner) extractRusagePlatform(state *os.ProcessState, logger *slog.Logger) (rssBytes float64, uTime float64, sTime float64) {
 	if rusage, ok := state.SysUsage().(*syscall.Rusage); ok && rusage != nil {
-		// FreeBSD: Maxrss is in Kilobytes
 		rssBytes = float64(rusage.Maxrss * 1024)
 		uTime = metrics.TimevalToSeconds(rusage.Utime)
 		sTime = metrics.TimevalToSeconds(rusage.Stime)
@@ -270,4 +340,22 @@ func (nr *NodeRunner) isProcessSignaledPlatform(exitErr *exec.ExitError) (bool, 
 		}
 	}
 	return false, ""
+}
+
+// Helper function to copy file
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }
