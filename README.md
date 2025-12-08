@@ -15,14 +15,15 @@ WORK IN PROGRESS, do not use in production unless you want to suffer.
 ## Concepts & Decisions
 
 Kubernetes is great for managing containerized applications at scale, but it can be complex and resource-intensive.
-Narun aims to provide a simpler and more lightweight alternative for edge devices.
-It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.
-So no need for stateful services, anything else is stateless and ephemeral.
+Narun aims to provide a simpler and more lightweight alternative for edge devices.  
+It relies on NATS clusters for any stateful needs: Object Storage, Database, Cache, Queues.  
+So no need for stateful services, anything else is stateless and ephemeral.  
 Modern developments ecosystem, Rust, Go, Zig or Deno, do not require full containerized operating systems, static binaries are good enough in many situations.
-No need to ship containers so no need for a full fledge registry.
-NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.
-No support for multi tenancy.
-Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some options like firecracker.
+No need to ship containers so no need for a full fledge registry.  
+NATS pub/sub mechanism, solves service discovery and load balancing, so no need for a regular API Gateway.  
+No support for multi tenancy.  
+Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some options like firecracker.  
+Support for FreeBSD relying on jails.  
 
 
 ## Components
@@ -106,6 +107,34 @@ Mandatory support Linux on amd64, arm64, and RISC-V, this is removing some optio
     curl -X POST -d '{"name":"NATS User"}' http://gateway-address:8080/hello/
     ```
 7.  **Flow:** Gateway -> NATS Request (to subject "hello") -> `hello-consumer` (listening on "hello") -> NATS Reply -> Gateway -> Client Response.
+
+## FreeBSD Deployment
+
+Narun supports deploying applications in FreeBSD Jails for isolation. The `node-runner` maps standard resource limits to RCTL rules.
+
+Example `ServiceSpec` configuration for a FreeBSD Jail:
+
+```yaml
+name: "hello-jail"
+tag: "v1.0.0"
+mode: "jail" # Explicitly set execution mode to 'jail'
+nodes:
+  - name: "freebsd-node-1"
+    replicas: 1
+
+# FreeBSD specific configuration block
+jail:
+  hostname: "hello-jail"       # Hostname visible inside the jail
+  ip4Addresses: ["127.0.1.10"] # IPv4 aliases assigned to the jail
+  allowRawSockets: true        # Allow ping, traceroute, etc.
+  devfsRuleset: 4              # Device filesystem ruleset (default is 4)
+  mountSystemCerts: true       # Mount /etc/ssl and /usr/share/certs from host (read-only)
+
+# Resource limits (Mapped to RCTL)
+cpuCores: 0.5        # Limits jail:pcpu:deny
+memoryMB: 128        # Limits jail:memoryuse:deny (soft)
+memoryMaxMB: 256     # Limits jail:memoryuse:deny (hard)
+```
 
 ## Building
 
@@ -317,6 +346,8 @@ This model aims to provide strong isolation and apply the principle of least pri
 - [X] the object store path of a binary needs to be prefixed by the service name
 - the logs output from the apps are not working anymore with cgroups
 - one nats service app registering the same name as another can hijack it
+- socat metrics FreeBSD not working
+  {"time":"2025-12-07T21:24:08.390852474-05:00","level":"WARN","source":{"function":"github.com/akhenakh/narun/internal/noderunner.(*logWriter).Write","file":"/home/akh/dev/narun/internal/noderunner/process.go","line":1285},"msg":"2025/12/07 21:24:08 socat[6684] E connect(, LEN=106 AF=1 \"/home/akh/dev/narun/narun-data/instances/hello-0/sockets/metrics_host.sock\", 106): No such file or directory","node_id":"freebsd","component":"node-runner","app":"hello","instance_id":"hello-0","run_id":"8172e6e9-db91-4b38-8a03-94863aba93d1","tag":"v16","mode":"jail","component":"socat-metrics"}
 
 ## Ideas
 - add a node status command

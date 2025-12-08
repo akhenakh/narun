@@ -40,7 +40,7 @@ const (
 
 // Constants for landlock
 const (
-	internalLaunchFlag           = "--internal-landlock-launch"
+	internalLaunchFlag           = "--internal-launch"
 	envLandlockConfigJSON        = "NARUN_INTERNAL_LANDLOCK_CONFIG_JSON"
 	envLandlockTargetCmd         = "NARUN_INTERNAL_LANDLOCK_TARGET_CMD"
 	envLandlockTargetArgsJSON    = "NARUN_INTERNAL_LANDLOCK_TARGET_ARGS_JSON"
@@ -48,10 +48,12 @@ const (
 	envLandlockMountInfosJSON    = "NARUN_INTERNAL_MOUNT_INFOS_JSON"
 	envLandlockLocalPorts        = "NARUN_INTERNAL_LOCAL_PORTS"    // network ports
 	envLandlockMetricsConfig     = "NARUN_INTERNAL_METRICS_CONFIG" // for metrics
-	landlockLauncherErrCode      = 120                             // Generic launcher setup error
-	landlockUnsupportedErrCode   = 121                             // Landlock not supported on OS/Kernel
-	landlockLockFailedErrCode    = 122                             // l.Lock() failed
-	landlockTargetExecFailedCode = 123                             // syscall.Exec() failed
+	envJailID                    = "NARUN_INTERNAL_JAIL_ID"        // FreeBSD Jail ID
+	envJailTargetCmd             = "NARUN_INTERNAL_JAIL_TARGET_CMD"
+	landlockLauncherErrCode      = 120 // Generic launcher setup error
+	landlockUnsupportedErrCode   = 121 // Landlock not supported on OS/Kernel
+	landlockLockFailedErrCode    = 122 // l.Lock() failed
+	landlockTargetExecFailedCode = 123 // syscall.Exec() failed
 )
 
 type statusUpdate struct {
@@ -100,9 +102,18 @@ func generateRunID() string {
 	return uuid.NewString()
 }
 
-// Helper to check if cgroup based resource limiting should be attempted
-func (nr *NodeRunner) usesCgroupsForResourceLimits(spec *ServiceSpec) bool {
-	return runtime.GOOS == "linux" && spec.CgroupParent != "" && (spec.MemoryMB > 0 || spec.CPUCores > 0)
+// Helper to check if platform isolation/resource limiting should be attempted
+// Replaces usesCgroupsForResourceLimits
+func (nr *NodeRunner) usesIsolation(spec *ServiceSpec) bool {
+	if runtime.GOOS == "linux" {
+		// On Linux, we use Cgroups for isolation if limits are set
+		return spec.CgroupParent != "" && (spec.MemoryMB > 0 || spec.CPUCores > 0)
+	}
+	if runtime.GOOS == "freebsd" {
+		// On FreeBSD, we use Jails if mode is "jail"
+		return spec.Mode == "jail"
+	}
+	return false
 }
 
 // Helper to check if namespacing (user, pid, ipc) should be attempted
@@ -399,13 +410,22 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 	// For landlock launcher env, not the intermediate unshare/nsenter
 	// These will be inherited by the target app via the launcher.
 	launcherTargetEnv := flattenEnv(baseOsEnv, spec.User, targetHomeDir, resolvedAppEnv)
+
+	// Determine the Instance Root for the application environment
+	// If in Jail mode, the root is / because we are chrooted.
+	// If in Landlock/Exec mode, it's the host path.
+	appInstanceRoot := workDir
+	if spec.Mode == "jail" {
+		appInstanceRoot = "/"
+	}
+
 	launcherTargetEnv = append(launcherTargetEnv,
 		fmt.Sprintf("NARUN_APP_NAME=%s", appName),
 		fmt.Sprintf("NARUN_INSTANCE_ID=%s", instanceID),
 		fmt.Sprintf("NARUN_RUN_ID=%s", currentRunID),
 		fmt.Sprintf("NARUN_REPLICA_INDEX=%d", replicaIndex),
 		fmt.Sprintf("NARUN_NODE_ID=%s", nr.nodeID),
-		fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", workDir), // This is for the target app
+		fmt.Sprintf("NARUN_INSTANCE_ROOT=%s", appInstanceRoot), // Use the adjusted path
 		fmt.Sprintf("NARUN_NODE_OS=%s", nr.localOS),
 		fmt.Sprintf("NARUN_NODE_ARCH=%s", nr.localArch),
 	)
@@ -434,6 +454,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		fmt.Sprintf("%s=%s", envLandlockTargetCmd, binaryPath), // Target app binary
 		fmt.Sprintf("%s=%s", envLandlockTargetArgsJSON, string(targetArgsJSON)),
 		fmt.Sprintf("%s=%s", envLandlockMountInfosJSON, string(mountInfosJSON)),
+		// NARUN_INTERNAL_INSTANCE_ROOT must be the HOST path for the launcher to perform setup/chroot
 		fmt.Sprintf("%s=%s", envLandlockInstanceRoot, workDir),
 		fmt.Sprintf("NARUN_TARGET_UID=%d", targetUID), // Pass Target UID/GID to Launcher via Environment
 		fmt.Sprintf("NARUN_TARGET_GID=%d", targetGID),
@@ -456,44 +477,44 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		envForLauncher = append(envForLauncher, fmt.Sprintf("%s=%s", envLandlockMetricsConfig, string(metricsJSON)))
 	}
 
-	// Cgroup Setup (Platform specific)
-	var cgroupPath string
-	var cgroupFd int = -1
-	var cgroupCleanupFunc func() error // Changed to return error
+	// Isolation Setup (Platform specific: Cgroup or Jail)
+	var isolationID string
+	var isolationFd int = -1
+	var isolationCleanupFunc func() error // Changed to return error
 
-	if nr.usesCgroupsForResourceLimits(spec) {
-		var cgErr error
-		// Abstracted Cgroup creation
-		cgroupPath, cgroupFd, cgroupCleanupFunc, cgErr = nr.createCgroupPlatform(spec, instanceID, logger)
-		if cgErr != nil {
-			errMsg := fmt.Sprintf("Failed to create cgroup: %v", cgErr)
+	if nr.usesIsolation(spec) {
+		var isoErr error
+		// Abstracted Isolation creation
+		isolationID, isolationFd, isolationCleanupFunc, isoErr = nr.createIsolationPlatform(spec, instanceID, logger)
+		if isoErr != nil {
+			errMsg := fmt.Sprintf("Failed to create isolation context: %v", isoErr)
 			logger.Error(errMsg)
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 			processCancel()
 			return fmt.Errorf(errMsg)
 		}
-		// Defer cleanup only if cgroup was successfully created and we might fail later in start
+		// Defer cleanup only if isolation was successfully created and we might fail later in start
 		defer func() {
-			if returnedErr != nil && cgroupCleanupFunc != nil {
-				logger.Warn("Cleaning up cgroup due to start failure", "error", returnedErr)
-				if err := cgroupCleanupFunc(); err != nil {
-					logger.Error("Error during cgroup cleanup on start failure", "cgroup_path", cgroupPath, "error", err)
+			if returnedErr != nil && isolationCleanupFunc != nil {
+				logger.Warn("Cleaning up isolation context due to start failure", "error", returnedErr)
+				if err := isolationCleanupFunc(); err != nil {
+					logger.Error("Error during isolation cleanup on start failure", "id", isolationID, "error", err)
 				}
 			}
 		}()
-		// Abstracted Cgroup Constraints application
-		if err := nr.applyCgroupConstraintsPlatform(spec, cgroupPath, logger); err != nil {
-			errMsg := fmt.Sprintf("Failed to apply cgroup constraints: %v", err)
+		// Abstracted Resource Limits application
+		if err := nr.applyResourceLimitsPlatform(spec, isolationID, logger); err != nil {
+			errMsg := fmt.Sprintf("Failed to apply resource limits: %v", err)
 			processCancel()
-			// cgroupCleanupFunc will be called by the defer above
+			// isolationCleanupFunc will be called by the defer above
 			return fmt.Errorf(errMsg)
 		}
 	}
 
 	// Command Assembly (Platform Specific)
-	// This delegates the construction of the exec.Cmd, including potential namespace wrappers
-	cmd, err := nr.configureCmdPlatform(processCtx, spec, workDir, envForLauncher, selfPath, binaryPath, cgroupFd, logger)
+	// Pass isolationID (string) and isolationFd (int)
+	cmd, err := nr.configureCmdPlatform(processCtx, spec, workDir, envForLauncher, selfPath, binaryPath, isolationFd, isolationID, logger)
 	if err != nil {
 		processCancel()
 		return fmt.Errorf("failed to configure platform command: %w", err)
@@ -501,12 +522,12 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 
 	// Pipes
 	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+	if err != nil { /* ... handle error, cancel context, cleanup isolation if any ... */
 		processCancel()
 		return err
 	}
 	stderrPipe, err := cmd.StderrPipe()
-	if err != nil { /* ... handle error, cancel context, cleanup cgroup if any ... */
+	if err != nil { /* ... handle error, cancel context, cleanup isolation if any ... */
 		processCancel()
 		return err
 	}
@@ -529,10 +550,10 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		processCancel:   processCancel,
 		restartCount:    0,
 		HostMetricsPort: hostMetricsPort,
-		// Cgroup info
-		cgroupPath:    cgroupPath,
-		cgroupFd:      cgroupFd, // Store the cgroup FD
-		cgroupCleanup: cgroupCleanupFunc,
+		// Isolation info
+		isolationID:      isolationID,
+		isolationFd:      isolationFd,
+		isolationCleanup: isolationCleanupFunc,
 	}
 
 	// Find and replace or append logic
@@ -571,7 +592,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 		metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 		nr.removeInstanceState(appName, instanceID, logger)
 		nr.cleanupInstanceMetrics(appInstance)
-		// The defer for cgroupCleanupFunc will run here if cgroup was created
+		// The defer for isolationCleanupFunc will run here if isolation was created
 		return returnedErr
 	}
 
@@ -663,11 +684,11 @@ func (nr *NodeRunner) stopAppInstance(appInstance *ManagedApp, intentional bool)
 	select {
 	case <-termTimer.C:
 		logger.Warn("Graceful shutdown timed out. Sending Force Kill.", "pid", pid)
-		// Try to force kill via platform specific means (cgroup if available, then kill)
-		if appInstance.cgroupPath != "" && nr.usesCgroupsForResourceLimits(appInstance.Spec) {
-			logger.Info("Attempting to kill via cgroup", "cgroup_path", appInstance.cgroupPath)
-			if err := nr.killCgroupPlatform(appInstance.cgroupPath, logger); err != nil {
-				logger.Error("Failed to kill cgroup, falling back to Process Kill", "error", err)
+		// Try to force kill via platform specific means (isolation context if available, then kill)
+		if appInstance.isolationID != "" && nr.usesIsolation(appInstance.Spec) {
+			logger.Info("Attempting to kill via isolation context", "id", appInstance.isolationID)
+			if err := nr.destroyIsolationPlatform(appInstance.isolationID, logger); err != nil {
+				logger.Error("Failed to kill isolation context, falling back to Process Kill", "error", err)
 				_ = nr.forceKillProcessPlatform(appInstance.Cmd.Process, pid)
 			}
 		} else {
@@ -791,13 +812,13 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		appInstance.LogWg.Wait()    // Wait for log forwarders AND memory poller
 		logger.Debug("Monitor finished and auxiliary goroutines (logs, memory poller) completed")
 
-		// Cgroup cleanup is crucial here
-		if appInstance.cgroupCleanup != nil {
-			logger.Info("Cleaning up cgroup for instance", "path", appInstance.cgroupPath)
-			if err := appInstance.cgroupCleanup(); err != nil {
-				logger.Error("Error during cgroup cleanup", "cgroup_path", appInstance.cgroupPath, "error", err)
+		// Isolation cleanup is crucial here
+		if appInstance.isolationCleanup != nil {
+			logger.Info("Cleaning up isolation context", "id", appInstance.isolationID)
+			if err := appInstance.isolationCleanup(); err != nil {
+				logger.Error("Error during isolation cleanup", "id", appInstance.isolationID, "error", err)
 			}
-			appInstance.cgroupCleanup = nil // Prevent double cleanup
+			appInstance.isolationCleanup = nil // Prevent double cleanup
 		}
 
 		shouldCleanupDisk := false

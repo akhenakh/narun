@@ -46,10 +46,10 @@ type ManagedApp struct {
 	// Metrics info
 	HostMetricsPort int // The ephemeral port on the host mapped to the guest metrics port
 
-	// cgroups related
-	cgroupPath    string       // Absolute path to the instance's cgroup
-	cgroupFd      int          // File descriptor for the cgroup directory (for UseCgroupFD)
-	cgroupCleanup func() error // Function to clean up the cgroup
+	// Isolation info (Cgroups on Linux, Jails on FreeBSD)
+	isolationID      string       // Unique ID for the isolation (Path on Linux, JID on FreeBSD)
+	isolationFd      int          // File descriptor (for Linux Cgroup FD)
+	isolationCleanup func() error // Function to clean up the isolation context
 }
 
 // appInfo holds the state for all instances of a single application on this node.
