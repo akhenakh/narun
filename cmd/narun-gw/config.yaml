@@ -2,6 +2,7 @@
 
 nats_url: "nats://localhost:4222" # URL of your NATS server
 server_addr: ":8080" # Address for the main HTTP gateway to listen on
+nkey_seed_file: "" # Optional: Path to NKey seed file for authentication
 grpc_addr: ":8081" # Address for the gRPC gateway (optional, remove if no gRPC routes)
 metrics_addr: ":9090" # Address for the Prometheus metrics endpoint
 request_timeout_seconds: 15 # Max time (seconds) to wait for a NATS reply
@@ -9,15 +10,15 @@ request_timeout_seconds: 15 # Max time (seconds) to wait for a NATS reply
 # Define routes: map HTTP path/method OR gRPC service to NATS service
 routes:
   # --- HTTP Route Example ---
-  - path: "/" # Incoming HTTP request path
-    methods: ["GET"] # Incoming HTTP request methods
-    service: "caradioamateur" # Target NATS service name for these HTTP requests
+  #- path: "/3eee" # Incoming HTTP request path
+  #  methods: ["GET"] # Incoming HTTP request methods
+  #  service: "caradioamateur" # Target NATS service name for these HTTP requests
 
   # --- gRPC Route Example ---
-  - grpc: "hello.v1.Greeter" # Fully qualified gRPC service name
-    service: "grpc-hello-service" # NATS Micro service name the consumer listens on
+  #- grpc: "hello.v1.Greeter" # Fully qualified gRPC service name
+  #  service: "grpc-hello-service" # NATS Micro service name the consumer listens on
 
   # --- Another HTTP Route ---
-  - path: "/goodbye"
-    methods: ["GET"]
-    service: "goodbye"
+  - path: "/hello/"
+    methods: ["POST"]
+    service: "hello"

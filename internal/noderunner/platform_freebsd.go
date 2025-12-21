@@ -33,7 +33,7 @@ func (nr *NodeRunner) createIsolationPlatform(spec *ServiceSpec, instanceID stri
 		return "", -1, nil, fmt.Errorf("jail root path does not exist: %s", jailPath)
 	}
 
-	// 1. Manage IP Aliases on Host Interfaces
+	// Manage IP Aliases on Host Interfaces
 	// We must do this BEFORE creating the jail so the IPs are valid on the host.
 	if err := nr.manageIpAliases(spec.Jail.IP4Addresses, true, logger); err != nil {
 		return "", -1, nil, fmt.Errorf("failed to add IP aliases: %w", err)
@@ -108,11 +108,11 @@ func (nr *NodeRunner) manageIpAliases(ips []string, add bool, logger *slog.Logge
 		// Find suitable interface
 		var targetIface string
 
-		// 1. Check Loopback
+		// Check Loopback
 		if ip4.IsLoopback() {
 			targetIface = "lo0" // Default freebsd loopback
 		} else {
-			// 2. Scan interfaces for matching subnet
+			//  Scan interfaces for matching subnet
 			for _, iface := range interfaces {
 				addrs, err := iface.Addrs()
 				if err != nil {

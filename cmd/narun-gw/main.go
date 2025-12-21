@@ -51,7 +51,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	nc, err := natsutil.ConnectNATS(cfg.NatsURL)
+	nc, err := natsutil.ConnectNATS(cfg.NatsURL, cfg.NKeySeedFile)
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "url", cfg.NatsURL, "error", err)
 		os.Exit(1)

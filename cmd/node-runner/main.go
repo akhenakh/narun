@@ -61,6 +61,7 @@ func main() {
 	}
 
 	natsURL := flag.String("nats-url", "nats://localhost:4222", "NATS server URL")
+	nkeyFile := flag.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file for NATS authentication")
 	nodeID := flag.String("node-id", "", "Unique ID for this node (defaults to hostname)")
 	dataDir := flag.String("data-dir", "./narun-data", "Directory for storing binaries and data")
 	logLevel := flag.String("log-level", os.Getenv("LOG_LEVEL"), "Log level (debug, info, warn, error)")
@@ -99,7 +100,7 @@ func main() {
 	}
 
 	// Create Node Runner
-	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *dataDir, *masterKey, *metricsAddr, *adminAddr, logger)
+	runner, err := noderunner.NewNodeRunner(*nodeID, *natsURL, *nkeyFile, *dataDir, *masterKey, *metricsAddr, *adminAddr, logger)
 	if err != nil {
 		logger.Error("Failed to initialize node runner", "error", err)
 		os.Exit(1)

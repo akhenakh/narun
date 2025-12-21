@@ -13,14 +13,11 @@ http://localhost:8080 {
 	}
 
 	# Route specific paths through narun to NATS Micro services
-	route /hello/* {
+	route /* {
 		narun {
 			nats_url localhost:4222 # Or nats://localhost:4222
 			request_timeout 15s
-			# Define routes: map HTTP path/method to NATS Micro service name
-			# route <path> <service_name> [METHOD...]
-			route /hello/ hello POST PUT # Handle POST/PUT for /hello/* -> service 'hello'
-			# Add more routes here if this narun block handles multiple services/paths
+			service caradioamateur
 		}
 	}
 
@@ -29,8 +26,7 @@ http://localhost:8080 {
 		narun {
 			nats_url localhost:4222
 			request_timeout 10s
-
-			route /goodbye goodbye GET # Handle GET for /goodbye -> service 'goodbye'
+			service goodbye
 		}
 	}
 

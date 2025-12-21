@@ -41,8 +41,9 @@ type RouteConfig struct {
 type Config struct {
 	NatsURL               string        `yaml:"nats_url"`
 	ServerAddr            string        `yaml:"server_addr"`
-	GrpcAddr              string        `yaml:"grpc_addr,omitempty"` // Optional gRPC listen address
-	MetricsAddr           string        `yaml:"metrics_addr"`        // metrics server listen address
+	NKeySeedFile          string        `yaml:"nkey_seed_file,omitempty"` // Path to NKey seed file
+	GrpcAddr              string        `yaml:"grpc_addr,omitempty"`      // Optional gRPC listen address
+	MetricsAddr           string        `yaml:"metrics_addr"`             // metrics server listen address
 	RequestTimeoutSeconds int           `yaml:"request_timeout_seconds"`
 	RequestTimeout        time.Duration `yaml:"-"` // Calculated field
 	Routes                []RouteConfig `yaml:"routes"`
