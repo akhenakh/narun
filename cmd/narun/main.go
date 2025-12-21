@@ -125,6 +125,7 @@ Commands:
 
 Common Options (apply to multiple commands where relevant):
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file for authentication (or use NARUN_NKEY_FILE)
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], DefaultNatsURL, DefaultTimeout)
@@ -133,6 +134,7 @@ Common Options (apply to multiple commands where relevant):
 func printDeployUsage() {
 	deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
 	deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	deployFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional).")
 	deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	deployFlags.String("name", "", "Application name (required if -config is not used)")
@@ -191,6 +193,7 @@ Subcommands:
 
 Common Options (apply to all 'service' subcommands):
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
 Use "%s service <subcommand> -h" for subcommand-specific help.
@@ -204,6 +207,7 @@ Lists deployed services and their status on nodes.
 
 Options:
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
 `, os.Args[0], DefaultNatsURL, DefaultTimeout)
 }
@@ -218,6 +222,7 @@ Arguments:
 
 Options:
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
 `, os.Args[0], DefaultNatsURL, DefaultTimeout)
 }
@@ -233,6 +238,7 @@ Arguments:
 
 Options:
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
   -y              Skip confirmation prompt.
 `, os.Args[0], DefaultNatsURL, DefaultTimeout)
@@ -242,6 +248,7 @@ Options:
 func handleDeployCmd(args []string) {
 	deployFlags := flag.NewFlagSet("deploy", flag.ExitOnError)
 	natsURL := deployFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := deployFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	configFile := deployFlags.String("config", "", "Path to the application ServiceSpec YAML configuration file (optional). If provided, overrides -name, -tag, -node, -replicas.")
 	timeout := deployFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	appNameFlag := deployFlags.String("name", "", "Application name (required if -config is not used)")
@@ -349,7 +356,7 @@ func handleDeployCmd(args []string) {
 	ctxAll, cancelAll := context.WithCancel(context.Background())
 	defer cancelAll()
 	connectCtx, connectCancel := context.WithTimeout(ctxAll, *timeout)
-	nc, js, err := connectNATS(connectCtx, *natsURL, "narun-cli-deploy")
+	nc, js, err := connectNATS(connectCtx, *natsURL, *nkeyFile, "narun-cli-deploy")
 	connectCancel()
 	if err != nil {
 		slog.Error("Deploy Error: NATS connection failed", "error", err)
@@ -450,6 +457,7 @@ func handleDeployCmd(args []string) {
 func handleLogsCmd(args []string) {
 	logsFlags := flag.NewFlagSet("logs", flag.ExitOnError)
 	natsURL := logsFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := logsFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	appName := logsFlags.String("app", "", "Filter logs by application name")
 	nodeID := logsFlags.String("node", "", "Filter logs by node ID")
 	instanceID := logsFlags.String("instance", "", "Filter logs by specific instance ID (requires -app)")
@@ -491,7 +499,7 @@ Options:
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, _, err := connectNATS(ctx, *natsURL, "narun-cli-logs")
+	nc, _, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-logs")
 	if err != nil {
 		slog.Error("Logs Error: NATS connection failed", "error", err)
 		os.Exit(1)
@@ -548,6 +556,7 @@ Options:
 func handleListImagesCmd(args []string) {
 	listImagesFlags := flag.NewFlagSet("list-images", flag.ExitOnError)
 	natsURL := listImagesFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := listImagesFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := listImagesFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	listImagesFlags.Usage = func() {
@@ -569,7 +578,7 @@ Options:
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-list-images")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-list-images")
 	if err != nil {
 		slog.Error("Error connecting to NATS", "error", err)
 		os.Exit(1)
@@ -634,6 +643,7 @@ Options:
 func handleServiceListCmd(args []string) {
 	listServicesFlags := flag.NewFlagSet("service list", flag.ExitOnError)
 	natsURL := listServicesFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := listServicesFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := listServicesFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	listServicesFlags.Usage = printServiceListUsage // Use specific usage
@@ -647,7 +657,7 @@ func handleServiceListCmd(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-service-list")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-service-list")
 	if err != nil {
 		slog.Error("Error connecting to NATS", "error", err)
 		os.Exit(1)
@@ -830,6 +840,7 @@ func isAppRunningAnywhere(appName string, nodeStates map[string]noderunner.NodeS
 func handleServiceInfoCmd(args []string) {
 	infoFlags := flag.NewFlagSet("service info", flag.ExitOnError)
 	natsURL := infoFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := infoFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := infoFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	infoFlags.Usage = printServiceInfoUsage // Use specific usage
@@ -849,7 +860,7 @@ func handleServiceInfoCmd(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-service-info")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-service-info")
 	if err != nil {
 		slog.Error("Error connecting to NATS", "error", err)
 		os.Exit(1)
@@ -992,6 +1003,7 @@ func handleServiceInfoCmd(args []string) {
 func handleServiceDeleteCmd(args []string) {
 	deleteServiceFlags := flag.NewFlagSet("service delete", flag.ExitOnError)
 	natsURL := deleteServiceFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := deleteServiceFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := deleteServiceFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	skipConfirm := deleteServiceFlags.Bool("y", false, "Skip confirmation prompt")
 
@@ -1024,7 +1036,7 @@ func handleServiceDeleteCmd(args []string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-service-delete")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-service-delete")
 	if err != nil {
 		slog.Error("Delete Service Error: NATS connection failed", "error", err)
 		os.Exit(1)
@@ -1098,6 +1110,7 @@ Subcommands:
 
 Common Options (apply to all subcommands):
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
 Options for 'add':
@@ -1115,6 +1128,7 @@ Options for 'delete':
 func handleFilesAddCmd(args []string) {
 	addFlags := flag.NewFlagSet("files add", flag.ExitOnError)
 	natsURL := addFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := addFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := addFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	addFlags.Usage = func() {
@@ -1169,7 +1183,7 @@ Options:
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files-add")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-files-add")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -1223,6 +1237,7 @@ Options:
 func handleFilesListCmd(args []string) {
 	listFlags := flag.NewFlagSet("files list", flag.ExitOnError)
 	natsURL := listFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := listFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := listFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	listFlags.Usage = func() {
@@ -1247,7 +1262,7 @@ Options:
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files-list")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-files-list")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -1299,6 +1314,7 @@ Options:
 func handleFilesDeleteCmd(args []string) {
 	deleteFlags := flag.NewFlagSet("files delete", flag.ExitOnError)
 	natsURL := deleteFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := deleteFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := deleteFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	skipConfirm := deleteFlags.Bool("y", false, "Skip confirmation prompt")
 
@@ -1339,7 +1355,7 @@ Options:
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-files-delete")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-files-delete")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -1368,7 +1384,7 @@ Options:
 	slog.Info("File deleted successfully", "name", fileName)
 }
 
-func connectNATS(ctx context.Context, url string, clientNamePrefix string) (*nats.Conn, jetstream.JetStream, error) {
+func connectNATS(ctx context.Context, url string, nkeyFile string, clientNamePrefix string) (*nats.Conn, jetstream.JetStream, error) {
 	if clientNamePrefix == "" {
 		clientNamePrefix = "narun-cli-unknown"
 	}
@@ -1376,9 +1392,10 @@ func connectNATS(ctx context.Context, url string, clientNamePrefix string) (*nat
 	clientName := fmt.Sprintf("%s-%d", clientNamePrefix, time.Now().UnixNano()%10000)
 
 	slog.Debug("Connecting to NATS server...", "url", url, "client_name", clientName)
-	nc, err := nats.Connect(url,
+
+	opts := []nats.Option{
 		nats.Name(clientName),
-		nats.Timeout(10*time.Second), // Increased CLI timeout for connect
+		nats.Timeout(10 * time.Second), // Increased CLI timeout for connect
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
 				log.Printf("WARN: NATS disconnected: %v", err) // Use standard log for CLI disconnects
@@ -1386,7 +1403,17 @@ func connectNATS(ctx context.Context, url string, clientNamePrefix string) (*nat
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) { slog.Debug("INFO: NATS reconnected", "url", nc.ConnectedUrl()) }),
 		nats.ClosedHandler(func(nc *nats.Conn) { slog.Debug("INFO: NATS connection closed.") }),
-	)
+	}
+
+	if nkeyFile != "" {
+		opt, err := nats.NkeyOptionFromSeed(nkeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to load nkey seed from %s: %w", nkeyFile, err)
+		}
+		opts = append(opts, opt)
+	}
+
+	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to NATS: %w", err)
 	}

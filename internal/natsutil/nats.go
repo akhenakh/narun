@@ -11,13 +11,13 @@ import (
 )
 
 // ConnectNATS establishes a connection to the NATS server.
-func ConnectNATS(url string) (*nats.Conn, error) {
-	nc, err := nats.Connect(url,
+func ConnectNATS(url, nkeySeedFile string) (*nats.Conn, error) {
+	opts := []nats.Option{
 		nats.Name("NATS HTTP Gateway"),
-		nats.Timeout(10*time.Second),
-		nats.PingInterval(20*time.Second),
+		nats.Timeout(10 * time.Second),
+		nats.PingInterval(20 * time.Second),
 		nats.MaxPingsOutstanding(5),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.MaxReconnects(-1), // Retry forever
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			// Use default logger or inject one if needed for consistent logging
@@ -29,7 +29,17 @@ func ConnectNATS(url string) (*nats.Conn, error) {
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			slog.Info("NATS connection closed.")
 		}),
-	)
+	}
+
+	if nkeySeedFile != "" {
+		opt, err := nats.NkeyOptionFromSeed(nkeySeedFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load nkey seed from %s: %w", nkeySeedFile, err)
+		}
+		opts = append(opts, opt)
+	}
+
+	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS at %s: %w", url, err)
 	}

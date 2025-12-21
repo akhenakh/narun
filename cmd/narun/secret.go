@@ -58,6 +58,7 @@ Subcommands:
 
 Common Options (apply to all subcommands):
   -nats <url>     NATS server URL (default: %s)
+  -nkey-file <path>  Path to NKey seed file
   -timeout <dur>  Timeout for NATS operations (default: %s)
 
 Options for 'set':
@@ -81,6 +82,7 @@ Options for 'delete':
 func handleSecretSetCmd(args []string) {
 	setFlags := flag.NewFlagSet("secret set", flag.ExitOnError)
 	natsURL := setFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := setFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := setFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	masterKeyBase64 := setFlags.String("master-key", os.Getenv("NARUN_MASTER_KEY"), "Base64 encoded AES-256 master key")
 	masterKeyPath := setFlags.String("master-key-path", os.Getenv("NARUN_MASTER_KEY_PATH"), "Path to file containing the master key")
@@ -155,7 +157,7 @@ Options:
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-set")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-secret-set")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -199,6 +201,7 @@ Options:
 func handleSecretListCmd(args []string) {
 	listFlags := flag.NewFlagSet("secret list", flag.ExitOnError)
 	natsURL := listFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := listFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := listFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 
 	listFlags.Usage = func() {
@@ -222,7 +225,7 @@ Options:
 	slog.Info("Listing secrets...")
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-list")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-secret-list")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)
@@ -288,6 +291,7 @@ listLoop:
 func handleSecretDeleteCmd(args []string) {
 	deleteFlags := flag.NewFlagSet("secret delete", flag.ExitOnError)
 	natsURL := deleteFlags.String("nats", DefaultNatsURL, "NATS server URL")
+	nkeyFile := deleteFlags.String("nkey-file", os.Getenv("NARUN_NKEY_FILE"), "Path to NKey seed file")
 	timeout := deleteFlags.Duration("timeout", DefaultTimeout, "Timeout for NATS operations")
 	skipConfirm := deleteFlags.Bool("y", false, "Skip confirmation prompt")
 
@@ -327,7 +331,7 @@ Options:
 	slog.Info("Deleting secret...", "name", secretName)
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	nc, js, err := connectNATS(ctx, *natsURL, "narun-cli-secret-delete")
+	nc, js, err := connectNATS(ctx, *natsURL, *nkeyFile, "narun-cli-secret-delete")
 	if err != nil {
 		slog.Error("Failed to connect to NATS", "error", err)
 		os.Exit(1)

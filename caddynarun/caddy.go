@@ -29,6 +29,7 @@ func init() {
 type Handler struct {
 	// Configuration
 	NatsURL        string         `json:"nats_url,omitempty"`
+	NKeySeedFile   string         `json:"nkey_seed_file,omitempty"` // Optional NKey seed
 	RequestTimeout caddy.Duration `json:"request_timeout,omitempty"`
 	Service        string         `json:"service,omitempty"` // Target NATS service name
 
@@ -88,20 +89,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			clientName = clientName[:128]
 		}
 
-		h.logger.Info("Attempting initial NATS connection",
-			zap.String("url", h.NatsURL),
-			zap.String("service", h.Service),
-			zap.String("nats_client_name", clientName),
-		)
-
-		// Ensure RetryOnFailedConnect is true, so nats.Connect returns a conn object
-		// that will attempt to reconnect in the background even if the first attempt fails.
-		conn, err := nats.Connect(h.NatsURL,
+		natsOpts := []nats.Option{
 			nats.Name(clientName),
-			nats.Timeout(10*time.Second),             // Timeout for the initial Connect() call itself
-			nats.RetryOnFailedConnect(true),          // CRITICAL: Allows returning a conn for background retries
-			nats.MaxReconnects(-1),                   // Retry forever
-			nats.ReconnectWait(300*time.Millisecond), // Time to wait between reconnect attempts
+			nats.Timeout(10 * time.Second),             // Timeout for the initial Connect() call itself
+			nats.RetryOnFailedConnect(true),            // CRITICAL: Allows returning a conn for background retries
+			nats.MaxReconnects(-1),                     // Retry forever
+			nats.ReconnectWait(300 * time.Millisecond), // Time to wait between reconnect attempts
 			nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 				logFields := []zap.Field{zap.String("service", h.Service)}
 				if err != nil {
@@ -130,7 +123,28 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 				}
 				h.logger.Error(errMsg, logFields...)
 			}),
+		}
+
+		if h.NKeySeedFile != "" {
+			opt, err := nats.NkeyOptionFromSeed(h.NKeySeedFile)
+			if err != nil {
+				h.logger.Error("Failed to load nkey seed", zap.String("file", h.NKeySeedFile), zap.Error(err))
+				// We can't return error from initOnce, but connection will likely fail or we can set initErr
+				h.initErr = fmt.Errorf("failed to load nkey seed: %w", err)
+				return
+			}
+			natsOpts = append(natsOpts, opt)
+		}
+
+		h.logger.Info("Attempting initial NATS connection",
+			zap.String("url", h.NatsURL),
+			zap.String("service", h.Service),
+			zap.String("nats_client_name", clientName),
 		)
+
+		// Ensure RetryOnFailedConnect is true, so nats.Connect returns a conn object
+		// that will attempt to reconnect in the background even if the first attempt fails.
+		conn, err := nats.Connect(h.NatsURL, natsOpts...)
 
 		// 'conn' should be non-nil if RetryOnFailedConnect is true, even if 'err' is non-nil.
 		// 'err' here signifies that the *initial* attempt within nats.Connect (respecting its Timeout) failed.
@@ -338,6 +352,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		switch option {
 		case "nats_url":
 			if !d.AllArgs(&h.NatsURL) {
+				return d.ArgErr()
+			}
+		case "nkey_seed_file":
+			if !d.AllArgs(&h.NKeySeedFile) {
 				return d.ArgErr()
 			}
 		case "request_timeout":

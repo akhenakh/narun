@@ -54,6 +54,7 @@ func clearHeader(h nats.Header) {
 // Options configure the NATS Micro service
 type Options struct {
 	NATSURL       string
+	NKeySeedFile  string // Optional: Path to NKey seed file
 	ServiceName   string // Required: The NATS Micro service name
 	Description   string
 	Version       string
@@ -99,12 +100,22 @@ func ListenAndServe(opts Options, handler http.Handler) error {
 		nats.ReconnectHandler(func(nc *nats.Conn) { logger.Debug("NATS client reconnected", "url", nc.ConnectedUrl()) }),
 		nats.ClosedHandler(func(nc *nats.Conn) { logger.Debug("NATS client connection closed") }),
 	}
+
+	if opts.NKeySeedFile != "" {
+		opt, err := nats.NkeyOptionFromSeed(opts.NKeySeedFile)
+		if err != nil {
+			return fmt.Errorf("failed to load nkey seed from %s: %w", opts.NKeySeedFile, err)
+		}
+		natsOpts = append(natsOpts, opt)
+	}
+
 	natsOpts = append(natsOpts, opts.NATSOptions...)
 	nc, err := nats.Connect(opts.NATSURL, natsOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to connect to NATS at %s: %w", opts.NATSURL, err)
 	}
 	defer nc.Close()
+
 	logger.Info("Connected to NATS", "url", nc.ConnectedUrl())
 
 	config := micro.Config{

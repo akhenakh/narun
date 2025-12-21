@@ -61,7 +61,7 @@ type NodeRunner struct {
 }
 
 // NewNodeRunner creates and initializes a new NodeRunner.
-func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, adminAddr string, logger *slog.Logger) (*NodeRunner, error) {
+func NewNodeRunner(nodeID, natsURL, nkeyFile, dataDir, masterKeyBase64, metricsAddr, adminAddr string, logger *slog.Logger) (*NodeRunner, error) {
 	if nodeID == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -102,10 +102,10 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 		// Allow running without a key, but secret resolution will fail
 	}
 
-	// NATS connection
-	nc, err := nats.Connect(natsURL,
+	// NATS options
+	natsOpts := []nats.Option{
 		nats.Name(fmt.Sprintf("node-runner-%s", nodeID)),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.MaxReconnects(-1),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			if err != nil {
@@ -120,7 +120,18 @@ func NewNodeRunner(nodeID, natsURL, dataDir, masterKeyBase64, metricsAddr, admin
 		nats.ClosedHandler(func(_ *nats.Conn) {
 			logger.Info("NATS connection closed")
 		}),
-	)
+	}
+
+	if nkeyFile != "" {
+		opt, err := nats.NkeyOptionFromSeed(nkeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load nkey seed from %s: %w", nkeyFile, err)
+		}
+		natsOpts = append(natsOpts, opt)
+	}
+
+	// NATS connection
+	nc, err := nats.Connect(natsURL, natsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsURL, err)
 	}
