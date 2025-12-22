@@ -15,8 +15,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
+	"github.com/openpcc/bhttp"
 	"go.uber.org/zap" // Caddy uses Zap logger
 )
 

@@ -12,8 +12,8 @@ import (
 
 	"github.com/akhenakh/narun/internal/gwconfig"
 	"github.com/akhenakh/narun/internal/metrics"
-	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
+	"github.com/openpcc/bhttp"
 )
 
 // Helper to check NATS errors - needed for errors.Is

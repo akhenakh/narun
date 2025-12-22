@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/akhenakh/narun/internal/metrics"
-	"github.com/confidentsecurity/bhttp"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
+	"github.com/openpcc/bhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
