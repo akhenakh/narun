@@ -375,7 +375,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 			processCancel()
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 		logger.Info("Target user resolved", "user", spec.User, "uid", targetUID, "gid", targetGID)
 	} else {
@@ -492,7 +492,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			nr.publishStatusUpdate(instanceID, StatusFailed, nil, nil, errMsg)
 			metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, currentRunID).Set(0)
 			processCancel()
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 		// Defer cleanup only if isolation was successfully created and we might fail later in start
 		defer func() {
@@ -508,7 +508,7 @@ func (nr *NodeRunner) startAppInstance(ctx context.Context, appInfo *appInfo, re
 			errMsg := fmt.Sprintf("Failed to apply resource limits: %v", err)
 			processCancel()
 			// isolationCleanupFunc will be called by the defer above
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 	}
 
@@ -808,9 +808,9 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	}()
 
 	defer func() {
-		appInstance.processCancel() // This will also stop the memory poller goroutine
-		appInstance.LogWg.Wait()    // Wait for log forwarders AND memory poller
-		logger.Debug("Monitor finished and auxiliary goroutines (logs, memory poller) completed")
+		// LogWg.Wait() was already called before this defer, so goroutines are done.
+		// Just perform cleanup.
+		logger.Debug("Monitor finished, performing final cleanup")
 
 		// Isolation cleanup is crucial here
 		if appInstance.isolationCleanup != nil {
@@ -854,27 +854,32 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 
 	logger.Info("Monitoring process instance", "pid", appInstance.Pid)
 	waitErr := appInstance.Cmd.Wait()
+	logger.Info("Process wait returned", "pid", appInstance.Pid, "error", waitErr)
 
-	// Ensure any remaining AuxCmds are killed when main process exits
-	for _, c := range appInstance.AuxCmds {
-		if c.Process != nil {
-			_ = c.Process.Kill()
-		}
-	}
-
-	// Wait for logs to fully drain before processing exit status.
-	// Since Cmd.Wait() has returned, the process is dead and its pipes are closed (EOF).
-	// forwardLogs will exit, and LogWg will decrement.
-	// We wait here to ensure all error logs (like Landlock failures printed to stderr)
-	// are published to NATS before we publish the 'Crashed' status update.
-	appInstance.LogWg.Wait()
-
+	// Check if this was an intentional stop BEFORE we cancel the context.
+	// This must be done first because processCancel() will set processCtx.Err() to Canceled.
 	exitCode := -1
 	intentionalStop := false
 	errMsg := ""
 	finalStatus := StatusStopped
 
 	metrics.NarunNodeRunnerInstanceUp.WithLabelValues(appName, instanceID, nr.nodeID, runID).Set(0)
+
+	// Check StopSignal first
+	select {
+	case <-appInstance.StopSignal:
+		intentionalStop = true
+		logger.Info("Process exit detected after intentional stop signal")
+	default:
+	}
+
+	// NOW cancel process context to stop memory poller goroutine
+	appInstance.processCancel()
+
+	// Wait for logs to fully drain before processing exit status.
+	logger.Info("Waiting for log forwarding to complete...")
+	appInstance.LogWg.Wait()
+	logger.Info("Log forwarding complete, processing exit status")
 
 	// Extract Rusage (Generic Wrapper)
 	if appInstance.Cmd.ProcessState != nil {
@@ -892,11 +897,6 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 		logger.Info("Process exit detected after intentional stop signal")
 	default:
 	}
-	if appInstance.processCtx.Err() == context.Canceled && !intentionalStop {
-		intentionalStop = true
-		logger.Info("Process exit detected after context cancellation")
-	}
-
 	if waitErr != nil {
 		errMsg = waitErr.Error()
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -1001,10 +1001,6 @@ func (nr *NodeRunner) monitorAppInstance(appInstance *ManagedApp, logger *slog.L
 	case <-restartTimer.C:
 	case <-nr.globalCtx.Done():
 		logger.Info("Restart canceled due to runner shutdown.")
-		restartTimer.Stop()
-		return
-	case <-appInstance.processCtx.Done(): // Should be current run's context
-		logger.Warn("Instance run context cancelled during restart delay?")
 		restartTimer.Stop()
 		return
 	case <-appInstance.StopSignal: // Should be current run's stop signal

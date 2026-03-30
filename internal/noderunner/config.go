@@ -72,8 +72,9 @@ type NoNetSpec struct {
 }
 
 // NodeSelectorSpec defines which node should run the service and how many replicas.
+// If Name is empty, the replicas are balanced across all healthy nodes.
 type NodeSelectorSpec struct {
-	Name     string `yaml:"name"`     // Node ID (matches node-runner's ID)
+	Name     string `yaml:"name"`     // Node ID. Empty means "balance across healthy nodes"
 	Replicas int    `yaml:"replicas"` // Number of instances on this node
 }
 
@@ -95,12 +96,19 @@ type JailSpec struct {
 // ServiceSpec defines the desired configuration for an application managed by the node runner.
 // This structure is stored as YAML in the NATS KV store.
 type ServiceSpec struct {
-	Name     string             `yaml:"name"`               // Name of the service/app, used as KV key
-	Command  string             `yaml:"command,omitempty"`  // Optional: command to run (defaults to binary name)
-	Args     []string           `yaml:"args,omitempty"`     // Arguments to pass to the command
-	Env      []EnvVar           `yaml:"env,omitempty"`      // Environment variables to set
-	Tag      string             `yaml:"tag"`                // Tag for the binary
-	Nodes    []NodeSelectorSpec `yaml:"nodes,omitempty"`    // List of nodes to deploy on and replica counts
+	Name    string   `yaml:"name"`              // Name of the service/app, used as KV key
+	Command string   `yaml:"command,omitempty"` // Optional: command to run (defaults to binary name)
+	Args    []string `yaml:"args,omitempty"`    // Arguments to pass to the command
+	Env     []EnvVar `yaml:"env,omitempty"`     // Environment variables to set
+	Tag     string   `yaml:"tag"`               // Tag for the binary
+
+	// Global desired instances. If Nodes is empty, the scheduler
+	// balances these across all healthy nodes.
+	Replicas int `yaml:"replicas,omitempty"`
+
+	// Explicit node targeting (Node Affinity).
+	// Can be mixed with global Replicas for hybrid scheduling.
+	Nodes    []NodeSelectorSpec `yaml:"nodes,omitempty"`
 	Mode     string             `yaml:"mode,omitempty"`     // Execution mode: "exec" (default) or "landlock"
 	Landlock LandlockSpec       `yaml:"landlock,omitempty"` // Landlock specific configuration
 	Jail     JailSpec           `yaml:"jail,omitempty"`     // Jail specific configuration (FreeBSD)
@@ -278,16 +286,21 @@ func ParseServiceSpec(data []byte) (*ServiceSpec, error) {
 
 	nodeNames := make(map[string]bool)
 	for i, nodeSpec := range spec.Nodes {
-		if strings.TrimSpace(nodeSpec.Name) == "" {
-			return nil, fmt.Errorf("node selector at index %d: 'name' cannot be empty", i)
-		}
 		if nodeSpec.Replicas <= 0 {
-			return nil, fmt.Errorf("node selector for '%s': 'replicas' must be positive, got %d", nodeSpec.Name, nodeSpec.Replicas)
+			return nil, fmt.Errorf("node selector at index %d: 'replicas' must be positive, got %d", i, nodeSpec.Replicas)
 		}
-		if nodeNames[nodeSpec.Name] {
-			return nil, fmt.Errorf("duplicate node selector for name '%s'", nodeSpec.Name)
+		// Empty name is allowed - means "balance across healthy nodes"
+		if nodeSpec.Name != "" {
+			if nodeNames[nodeSpec.Name] {
+				return nil, fmt.Errorf("duplicate node selector for name '%s'", nodeSpec.Name)
+			}
+			nodeNames[nodeSpec.Name] = true
 		}
-		nodeNames[nodeSpec.Name] = true
+	}
+
+	// Validate: if no nodes specified, root replicas must be set
+	if len(spec.Nodes) == 0 && spec.Replicas <= 0 {
+		return nil, fmt.Errorf("either 'replicas' or 'nodes' must be specified")
 	}
 
 	return &spec, nil
@@ -302,4 +315,40 @@ func (s *ServiceSpec) FindTargetReplicas(nodeID string) int {
 		}
 	}
 	return 0 // Not targeted for this node
+}
+
+// GetBalancedReplicas returns the total count of replicas that should be
+// distributed across all healthy nodes. This includes:
+// - Root-level Replicas field
+// - Sum of Replicas from Nodes entries with empty Name
+func (s *ServiceSpec) GetBalancedReplicas() int {
+	total := s.Replicas
+	for _, nodeSpec := range s.Nodes {
+		if nodeSpec.Name == "" {
+			total += nodeSpec.Replicas
+		}
+	}
+	return total
+}
+
+// GetPinnedReplicas returns a map of nodeID -> replica count for nodes
+// that are explicitly targeted (non-empty Name in Nodes entries).
+func (s *ServiceSpec) GetPinnedReplicas() map[string]int {
+	result := make(map[string]int)
+	for _, nodeSpec := range s.Nodes {
+		if nodeSpec.Name != "" {
+			result[nodeSpec.Name] += nodeSpec.Replicas
+		}
+	}
+	return result
+}
+
+// HasPinnedReplicas returns true if there are any explicit node targets.
+func (s *ServiceSpec) HasPinnedReplicas() bool {
+	for _, nodeSpec := range s.Nodes {
+		if nodeSpec.Name != "" {
+			return true
+		}
+	}
+	return false
 }

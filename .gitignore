@@ -15,14 +15,3 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
-caddynarun/caddy
-consumers/cmd/hello/hello
-consumers/cmd/grpc-hello/grpc-hello
-cmd/narun-gw/narun-gw
-cmd/narun-deploy/narun-deploy
-narun-data
-master.key
-chat/
-bin/
-cmd/narun/narun
-cmd/node-runner/node-runner
