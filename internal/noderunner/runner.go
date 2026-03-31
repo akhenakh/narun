@@ -39,6 +39,7 @@ type NodeRunner struct {
 	nc            *nats.Conn
 	js            jetstream.JetStream
 	kvAppConfigs  jetstream.KeyValue
+	kvAppScheds   jetstream.KeyValue
 	kvNodeStates  jetstream.KeyValue
 	appBinaries   jetstream.ObjectStore
 	fileStore     jetstream.ObjectStore // Add handle for file store
@@ -58,6 +59,7 @@ type NodeRunner struct {
 	metricsServer *http.Server // HTTP server for metrics
 	adminAddr     string       // Address for admin UI HTTP endpoint
 	adminServer   *http.Server // HTTP server for admin UI
+	scheduler     *Scheduler
 }
 
 // NewNodeRunner creates and initializes a new NodeRunner.
@@ -166,6 +168,17 @@ func NewNodeRunner(nodeID, natsURL, nkeyFile, dataDir, masterKeyBase64, metricsA
 	}
 	logger.Debug("Bound to Node State KV store", "bucket", NodeStateKVBucket, "ttl", NodeStateKVTTL)
 
+	// Bind to App Schedule KV
+	kvAppScheds, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
+		Bucket:      AppSchedulesKVBucket,
+		Description: "Stores calculated placements of apps to nodes.",
+	})
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("failed to bind/create KV store '%s': %w", AppSchedulesKVBucket, err)
+	}
+	logger.Debug("Bound to App Schedules KV store", "bucket", AppSchedulesKVBucket)
+
 	// Bind to Secret KV Store
 	kvSecrets, err := js.CreateOrUpdateKeyValue(setupCtx, jetstream.KeyValueConfig{
 		Bucket:      SecretKVBucket,
@@ -207,6 +220,7 @@ func NewNodeRunner(nodeID, natsURL, nkeyFile, dataDir, masterKeyBase64, metricsA
 		js:           js,
 		kvAppConfigs: kvAppConfigs,
 		kvNodeStates: kvNodeStates,
+		kvAppScheds:  kvAppScheds,
 		kvSecrets:    kvSecrets, // Store handle
 		masterKey:    masterKey, // Store decoded key
 		fileStore:    fileStore, // Store handle for file store
@@ -224,11 +238,23 @@ func NewNodeRunner(nodeID, natsURL, nkeyFile, dataDir, masterKeyBase64, metricsA
 		globalCancel: gCancel,
 	}
 
+	// Initialize the scheduler (it will sit idle until it wins an election)
+	scheduler, err := NewScheduler(nodeID, js, logger)
+	if err != nil {
+		return nil, err
+	}
+	// Add scheduler to NodeRunner struct
+	runner.scheduler = scheduler
+
 	return runner, nil
 }
 
 // Run starts the node runner's main loop.
 func (nr *NodeRunner) Run() error {
+	// Start the scheduler election loop
+	nr.scheduler.Start()
+	defer nr.scheduler.Stop()
+
 	nr.logger.Info("Starting node runner", "version", nr.version, "os", nr.localOS, "arch", nr.localArch)
 	defer nr.logger.Info("Node runner stopped")
 
@@ -296,17 +322,17 @@ func (nr *NodeRunner) Run() error {
 	}
 	syncCancel()
 
-	// Watch for configuration changes
-	watcher, err := nr.kvAppConfigs.WatchAll(nr.globalCtx) // Watch all operations, including deletes
+	// Watch for schedule changes (NOT config changes directly)
+	watcher, err := nr.kvAppScheds.WatchAll(nr.globalCtx)
 	if err != nil {
 		if nr.globalCtx.Err() != nil {
 			nr.logger.Info("Failed to start KV watcher due to shutdown signal")
 			return nr.globalCtx.Err()
 		}
-		return fmt.Errorf("failed to start KV watcher on '%s': %w", AppConfigKVBucket, err)
+		return fmt.Errorf("failed to start KV watcher on '%s': %w", AppSchedulesKVBucket, err)
 	}
-	defer watcher.Stop() // Ensure watcher is stopped on exit from Run
-	nr.logger.Info("Started watching for app configuration changes", "bucket", AppConfigKVBucket)
+	defer watcher.Stop()
+	nr.logger.Info("Started watching for app schedule changes", "bucket", AppSchedulesKVBucket)
 
 	// Watcher Loop
 	nr.shutdownWg.Add(1)
@@ -335,7 +361,7 @@ func (nr *NodeRunner) Run() error {
 					nr.logger.Debug("Received nil update from watcher")
 					continue
 				}
-				nr.handleAppConfigUpdate(nr.globalCtx, entry) // Pass context
+				nr.handleAppScheduleUpdate(nr.globalCtx, entry)
 			}
 		}
 	}()
@@ -425,63 +451,255 @@ func (nr *NodeRunner) Run() error {
 	return nil
 }
 
-// handleAdminUI serves the admin interface HTML.
+// handleAdminUI serves the admin interface HTML showing cluster-wide state.
 func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Fetch cluster-wide state from NATS KV
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Get all node states
+	allNodes := nr.getAllNodeStates(ctx)
+
+	// Get all app configs
+	allApps := nr.getAllAppConfigs(ctx)
+
+	// Get all schedules
+	allSchedules := nr.getAllSchedules(ctx)
 
 	// Basic HTML structure and styling
 	fmt.Fprintf(w, `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="10">
-    <title>Narun Node Runner Admin - %s</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; margin: 20px; background-color: #f8f9fa; color: #212529; line-height: 1.6; }
-        h1, h2 { color: #007bff; border-bottom: 2px solid #007bff; padding-bottom: 0.3em; }
-        table { width: 100%%; border-collapse: collapse; margin-bottom: 25px; background-color: #fff; box-shadow: 0 2px 15px rgba(0,0,0,0.05); border-radius: 5px; overflow: hidden; }
-        th, td { border: 1px solid #dee2e6; padding: 12px 15px; text-align: left; }
-        th { background-color: #007bff; color: white; font-weight: 600; }
-        tr:nth-child(even) { background-color: #f2f2f2; }
-        tr:hover { background-color: #e9ecef; }
-        .status-running { color: #28a745; font-weight: bold; }
-        .status-starting { color: #ffc107; font-weight: bold; }
-        .status-stopping { color: #fd7e14; font-weight: bold; }
-        .status-stopped { color: #6c757d; }
-        .status-failed, .status-crashed { color: #dc3545; font-weight: bold; }
-        .container { max-width: 1400px; margin: auto; padding: 0 15px; }
-        .header-info { background-color: #e9ecef; padding: 20px; margin-bottom: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); }
-        .header-info p { margin: 0.5em 0; }
-        .footer { text-align: center; margin-top: 30px; font-size: 0.9em; color: #6c757d; }
-		.code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; background-color: #eef; padding: 2px 4px; border-radius: 3px; font-size: 0.9em; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="10">
+<title>Narun Cluster Admin - %s</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background-color: #f8f9fa; color: #212529; line-height: 1.6; }
+h1, h2, h3 { color: #007bff; border-bottom: 2px solid #007bff; padding-bottom: 0.3em; }
+table { width: 100%%; border-collapse: collapse; margin-bottom: 25px; background-color: #fff; box-shadow: 0 2px 15px rgba(0,0,0,0.05); border-radius: 5px; overflow: hidden; }
+th, td { border: 1px solid #dee2e6; padding: 12px 15px; text-align: left; }
+th { background-color: #007bff; color: white; font-weight: 600; }
+tr:nth-child(even) { background-color: #f2f2f2; }
+tr:hover { background-color: #e9ecef; }
+.status-running { color: #28a745; font-weight: bold; }
+.status-starting { color: #ffc107; font-weight: bold; }
+.status-stopping { color: #fd7e14; font-weight: bold; }
+.status-stopped { color: #6c757d; }
+.status-failed, .status-crashed { color: #dc3545; font-weight: bold; }
+.status-pending { color: #6c757d; font-style: italic; }
+.container { max-width: 1400px; margin: auto; padding: 0 15px; }
+.header-info { background-color: #e9ecef; padding: 20px; margin-bottom: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); }
+.header-info p { margin: 0.5em 0; }
+.footer { text-align: center; margin-top: 30px; font-size: 0.9em; color: #6c757d; }
+.code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; background-color: #eef; padding: 2px 4px; border-radius: 3px; font-size: 0.9em; }
+.section { margin-bottom: 40px; }
+.node-offline { color: #dc3545; }
+.node-online { color: #28a745; font-weight: bold; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.85em; margin-left: 5px; }
+.badge-local { background-color: #17a2b8; color: white; }
+</style>
 </head>
 <body>
 <div class="container">
-    <h1>Narun Node Runner Admin</h1>
-    <div class="header-info">
-        <p><strong>Node ID:</strong> <span class="code">%s</span></p>
-        <p><strong>Runner Version:</strong> <span class="code">%s</span></p>
-        <p><strong>Runner Started:</strong> %s (Uptime: %s)</p>
-        <p><strong>Current Time:</strong> %s</p>
-    </div>
+<h1>🔮 Narun Cluster Admin</h1>
+<div class="header-info">
+<p><strong>Local Node ID:</strong> <span class="code">%s</span></p>
+<p><strong>Runner Version:</strong> <span class="code">%s</span></p>
+<p><strong>Runner Started:</strong> %s (Uptime: %s)</p>
+<p><strong>Current Time:</strong> %s</p>
+<p><strong>Cluster Nodes:</strong> %d online / %d total</p>
+</div>
 `, html.EscapeString(nr.nodeID), html.EscapeString(nr.nodeID), html.EscapeString(nr.version),
 		nr.startTime.Format(time.RFC1123), time.Since(nr.startTime).Truncate(time.Second).String(),
-		time.Now().Format(time.RFC1123))
+		time.Now().Format(time.RFC1123), countOnlineNodes(allNodes), len(allNodes))
 
+	// Section 1: Cluster Nodes
+	fmt.Fprintf(w, `<div class="section"><h2>🖥️ Cluster Nodes</h2>`)
+	if len(allNodes) == 0 {
+		fmt.Fprintf(w, "<p><em>No nodes found in cluster.</em></p>")
+	} else {
+		fmt.Fprintf(w, `
+<table>
+<thead>
+<tr>
+<th>Node ID</th>
+<th>Status</th>
+<th>Platform</th>
+<th>Version</th>
+<th>Last Seen</th>
+<th>Managed Instances</th>
+<th>Started</th>
+</tr>
+</thead>
+<tbody>`)
+		// Sort nodes by ID
+		nodeIDs := make([]string, 0, len(allNodes))
+		for id := range allNodes {
+			nodeIDs = append(nodeIDs, id)
+		}
+		sort.Strings(nodeIDs)
+
+		for _, nodeID := range nodeIDs {
+			node := allNodes[nodeID]
+			statusClass := "node-online"
+			statusText := "Online"
+			if time.Since(node.LastSeen) > NodeStateKVTTL {
+				statusClass = "node-offline"
+				statusText = "Offline"
+			}
+			isLocal := nodeID == nr.nodeID
+			localBadge := ""
+			if isLocal {
+				localBadge = `<span class="badge badge-local">Local</span>`
+			}
+
+			fmt.Fprintf(w, `
+<tr>
+<td><span class="code">%s</span>%s</td>
+<td class="%s">%s</td>
+<td><span class="code">%s/%s</span></td>
+<td><span class="code">%s</span></td>
+<td>%s</td>
+<td>%d</td>
+<td>%s</td>
+</tr>`,
+				html.EscapeString(nodeID), localBadge,
+				statusClass, statusText,
+				html.EscapeString(node.OS), html.EscapeString(node.Arch),
+				html.EscapeString(node.Version),
+				node.LastSeen.Format(time.RFC1123),
+				len(node.ManagedInstances),
+				node.StartTime.Format(time.RFC1123))
+		}
+		fmt.Fprintf(w, `</tbody></table>`)
+	}
+	fmt.Fprintf(w, `</div>`)
+
+	// Section 2: Deployed Applications
+	fmt.Fprintf(w, `<div class="section"><h2>📦 Deployed Applications</h2>`)
+	if len(allApps) == 0 {
+		fmt.Fprintf(w, "<p><em>No applications deployed.</em></p>")
+	} else {
+		appNames := make([]string, 0, len(allApps))
+		for name := range allApps {
+			appNames = append(appNames, name)
+		}
+		sort.Strings(appNames)
+
+		for _, appName := range appNames {
+			spec := allApps[appName]
+			schedule := allSchedules[appName]
+
+			fmt.Fprintf(w, `<h3>App: <span class="code">%s</span></h3>`, html.EscapeString(appName))
+			fmt.Fprintf(w, `<p><strong>Tag:</strong> <span class="code">%s</span> | <strong>Mode:</strong> <span class="code">%s</span>`,
+				html.EscapeString(spec.Tag), html.EscapeString(spec.Mode))
+
+			// Show scheduling info
+			if schedule != nil {
+				totalReplicas := 0
+				for _, r := range schedule.Assignments {
+					totalReplicas += r
+				}
+				pendingReplicas := 0
+				for _, r := range schedule.Pending {
+					pendingReplicas += r
+				}
+				fmt.Fprintf(w, ` | <strong>Assigned:</strong> %d | <strong>Pending:</strong> %d`,
+					totalReplicas, pendingReplicas)
+			}
+			fmt.Fprintf(w, `</p>`)
+
+			// Show schedule assignments
+			if schedule != nil && len(schedule.Assignments) > 0 {
+				fmt.Fprintf(w, `
+<table>
+<thead>
+<tr>
+<th>Node</th>
+<th>Replicas</th>
+<th>Status</th>
+<th>Local Instances</th>
+</tr>
+</thead>
+<tbody>`)
+
+				// Sort node IDs for consistent display
+				nodeIDs := make([]string, 0, len(schedule.Assignments))
+				for nodeID := range schedule.Assignments {
+					nodeIDs = append(nodeIDs, nodeID)
+				}
+				sort.Strings(nodeIDs)
+
+				for _, nodeID := range nodeIDs {
+					replicas := schedule.Assignments[nodeID]
+					nodeState := allNodes[nodeID]
+					isOnline := nodeState != nil && time.Since(nodeState.LastSeen) <= NodeStateKVTTL
+
+					statusClass := "status-running"
+					statusText := "Running"
+					if !isOnline {
+						statusClass = "status-stopped"
+						statusText = "Node Offline"
+					}
+
+					// Show local instances if this is the current node
+					localInstances := "-"
+					if nodeID == nr.nodeID {
+						appInfo := nr.state.GetAppInfo(appName)
+						appInfo.mu.RLock()
+						if len(appInfo.instances) > 0 {
+							instanceIDs := make([]string, len(appInfo.instances))
+							for i, inst := range appInfo.instances {
+								instanceIDs[i] = inst.InstanceID
+							}
+							localInstances = strings.Join(instanceIDs, ", ")
+						}
+						appInfo.mu.RUnlock()
+					}
+
+					fmt.Fprintf(w, `
+<tr>
+<td><span class="code">%s</span>%s</td>
+<td>%d</td>
+<td class="%s">%s</td>
+<td>%s</td>
+</tr>`,
+						html.EscapeString(nodeID), func() string {
+							if nodeID == nr.nodeID {
+								return ` <span class="badge badge-local">Local</span>`
+							}
+							return ""
+						}(),
+						replicas,
+						statusClass, statusText,
+						html.EscapeString(localInstances))
+				}
+				fmt.Fprintf(w, `</tbody></table>`)
+			}
+
+			// Show pending replicas
+			if schedule != nil && len(schedule.Pending) > 0 {
+				fmt.Fprintf(w, `<p><strong>⚠️ Pending Replicas (waiting for offline nodes):</strong><br>`)
+				for nodeID, replicas := range schedule.Pending {
+					fmt.Fprintf(w, `<span class="code">%s</span>: %d replicas, `,
+						html.EscapeString(nodeID), replicas)
+				}
+				fmt.Fprintf(w, `</p>`)
+			}
+		}
+	}
+	fmt.Fprintf(w, `</div>`)
+
+	// Section 3: Local Instances (detailed view)
+	fmt.Fprintf(w, `<div class="section"><h2>🔧 Local Instances (Detailed)</h2>`)
 	allAppInfos := nr.state.GetAllAppInfos()
 	if len(allAppInfos) == 0 {
-		fmt.Fprintf(w, "<p>No applications are currently managed by this node.</p>")
+		fmt.Fprintf(w, "<p><em>No applications are currently managed by this node.</em>")
 	}
 
-	appNames := make([]string, 0, len(allAppInfos))
-	for name := range allAppInfos {
-		appNames = append(appNames, name)
-	}
-	sort.Strings(appNames) // Sort app names for consistent display
-
-	// Temporary struct to hold a snapshot of instance data for safe rendering
 	type uiInstanceView struct {
 		InstanceID   string
 		RunID        string
@@ -495,112 +713,190 @@ func (nr *NodeRunner) handleAdminUI(w http.ResponseWriter, r *http.Request) {
 		BinaryPath   string
 	}
 
-	for _, appName := range appNames {
-		appInfo := allAppInfos[appName]
-		appInfo.mu.RLock() // Read lock for accessing this app's info
+	// Get sorted app names from allApps (cluster-wide), filtered to those that have local instances
+	localAppNames := make([]string, 0)
+	for name := range allAppInfos {
+		localAppNames = append(localAppNames, name)
+	}
+	sort.Strings(localAppNames)
 
-		fmt.Fprintf(w, "<h2>Application: <span class=\"code\">%s</span></h2>", html.EscapeString(appName))
-
-		if appInfo.spec == nil {
-			fmt.Fprintf(w, "<p><em>No specification loaded for this application (possibly deleted or in error state).</em></p>")
+	for _, appName := range localAppNames {
+		appInfo, exists := allAppInfos[appName]
+		if !exists {
+			continue
+		}
+		appInfo.mu.RLock()
+		if len(appInfo.instances) == 0 {
 			appInfo.mu.RUnlock()
 			continue
 		}
 
-		fmt.Fprintf(w, "<p><strong>Tag:</strong> <span class=\"code\">%s</span> | <strong>Mode:</strong> <span class=\"code\">%s</span> | <strong>Config Hash:</strong> <span class=\"code\">%s</span></p>",
-			html.EscapeString(appInfo.spec.Tag), html.EscapeString(appInfo.spec.Mode), html.EscapeString(appInfo.configHash))
+		fmt.Fprintf(w, "<h3>App: <span class=\"code\">%s</span> (Local Instances)</h3>",
+			html.EscapeString(appName))
 
 		instanceViews := make([]uiInstanceView, 0, len(appInfo.instances))
-		if len(appInfo.instances) == 0 {
-			fmt.Fprintf(w, "<p><em>No instances running for this application on this node.</em></p>")
-		} else {
-			// Create a snapshot of instance data under lock
-			tempSortedInstances := make([]*ManagedApp, len(appInfo.instances))
-			copy(tempSortedInstances, appInfo.instances)
-			// Sort the copy of instances by ID for consistent display
-			sort.Slice(tempSortedInstances, func(i, j int) bool {
-				return tempSortedInstances[i].InstanceID < tempSortedInstances[j].InstanceID
-			})
+		tempSortedInstances := make([]*ManagedApp, len(appInfo.instances))
+		copy(tempSortedInstances, appInfo.instances)
+		sort.Slice(tempSortedInstances, func(i, j int) bool {
+			return tempSortedInstances[i].InstanceID < tempSortedInstances[j].InstanceID
+		})
 
-			for _, instance := range tempSortedInstances {
-				pidStr := "-"
-				if instance.Pid > 0 {
-					pidStr = fmt.Sprintf("%d", instance.Pid)
-				}
-				startTimeStr := "-"
-				uptimeStr := "-"
-				if !instance.StartTime.IsZero() {
-					startTimeStr = instance.StartTime.Format(time.RFC1123)
-					if instance.Status == StatusRunning || instance.Status == StatusStarting {
-						uptimeStr = time.Since(instance.StartTime).Truncate(time.Second).String()
-					}
-				}
-				exitCodeStr := "-"
-				if instance.lastExitCode != nil {
-					exitCodeStr = fmt.Sprintf("%d", *instance.lastExitCode)
-				}
-				instanceViews = append(instanceViews, uiInstanceView{
-					InstanceID:   instance.InstanceID,
-					RunID:        instance.RunID,
-					Status:       instance.Status,
-					StatusClass:  "status-" + strings.ToLower(string(instance.Status)),
-					PID:          pidStr,
-					StartTime:    startTimeStr,
-					Uptime:       uptimeStr,
-					RestartCount: instance.restartCount,
-					ExitCode:     exitCodeStr,
-					BinaryPath:   instance.BinaryPath,
-				})
+		for _, instance := range tempSortedInstances {
+			pidStr := "-"
+			if instance.Pid > 0 {
+				pidStr = fmt.Sprintf("%d", instance.Pid)
 			}
+			startTimeStr := "-"
+			uptimeStr := "-"
+			if !instance.StartTime.IsZero() {
+				startTimeStr = instance.StartTime.Format(time.RFC1123)
+				if instance.Status == StatusRunning || instance.Status == StatusStarting {
+					uptimeStr = time.Since(instance.StartTime).Truncate(time.Second).String()
+				}
+			}
+			exitCodeStr := "-"
+			if instance.lastExitCode != nil {
+				exitCodeStr = fmt.Sprintf("%d", *instance.lastExitCode)
+			}
+			instanceViews = append(instanceViews, uiInstanceView{
+				InstanceID:   instance.InstanceID,
+				RunID:        instance.RunID,
+				Status:       instance.Status,
+				StatusClass:  "status-" + strings.ToLower(string(instance.Status)),
+				PID:          pidStr,
+				StartTime:    startTimeStr,
+				Uptime:       uptimeStr,
+				RestartCount: instance.restartCount,
+				ExitCode:     exitCodeStr,
+				BinaryPath:   instance.BinaryPath,
+			})
 		}
-		appInfo.mu.RUnlock() // Unlock after all data for this app is copied
+		appInfo.mu.RUnlock()
 
-		// Render from the snapshot (instanceViews)
 		if len(instanceViews) > 0 {
 			fmt.Fprintf(w, `
-    <table>
-        <thead>
-            <tr>
-                <th>Instance ID</th>
-                <th>Run ID</th>
-                <th>Status</th>
-                <th>PID</th>
-                <th>Started</th>
-                <th>Uptime</th>
-                <th>Restarts</th>
-                <th>Exit Code</th>
-                <th>Binary Path</th>
-            </tr>
-        </thead>
-        <tbody>`)
+<table>
+<thead>
+<tr>
+<th>Instance ID</th>
+<th>Run ID</th>
+<th>Status</th>
+<th>PID</th>
+<th>Started</th>
+<th>Uptime</th>
+<th>Restarts</th>
+<th>Exit Code</th>
+<th>Binary Path</th>
+</tr>
+</thead>
+<tbody>`)
 			for _, view := range instanceViews {
 				fmt.Fprintf(w, `
-            <tr>
-                <td><span class="code">%s</span></td>
-                <td><span class="code">%s</span></td>
-                <td class="%s">%s</td>
-                <td>%s</td>
-                <td>%s</td>
-                <td>%s</td>
-                <td>%d</td>
-                <td>%s</td>
-                <td><span class="code">%s</span></td>
-            </tr>`,
+<tr>
+<td><span class="code">%s</span></td>
+<td><span class="code">%s</span></td>
+<td class="%s">%s</td>
+<td>%s</td>
+<td>%s</td>
+<td>%s</td>
+<td>%d</td>
+<td>%s</td>
+<td><span class="code">%s</span></td>
+</tr>`,
 					html.EscapeString(view.InstanceID), html.EscapeString(view.RunID),
 					view.StatusClass, html.EscapeString(string(view.Status)),
-					view.PID, view.StartTime, view.Uptime, view.RestartCount, view.ExitCode, html.EscapeString(view.BinaryPath))
+					view.PID, view.StartTime, view.Uptime, view.RestartCount, view.ExitCode,
+					html.EscapeString(view.BinaryPath))
 			}
 			fmt.Fprintf(w, `</tbody></table>`)
 		}
 	}
+	fmt.Fprintf(w, `</div>`)
 
 	fmt.Fprintf(w, `
-    <div class="footer">
-        <p>Narun Node Runner Admin UI &copy; %d</p>
-    </div>
+<div class="footer">
+<p>Narun Cluster Admin UI &copy; %d</p>
+</div>
 </div>
 </body>
 </html>`, time.Now().Year())
+}
+
+// getAllNodeStates fetches all node states from the KV store
+func (nr *NodeRunner) getAllNodeStates(ctx context.Context) map[string]*NodeState {
+	states := make(map[string]*NodeState)
+	lister, err := nr.kvNodeStates.ListKeys(ctx)
+	if err != nil {
+		return states
+	}
+	defer lister.Stop()
+
+	for k := range lister.Keys() {
+		entry, err := nr.kvNodeStates.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var state NodeState
+		if err := json.Unmarshal(entry.Value(), &state); err == nil {
+			states[k] = &state
+		}
+	}
+	return states
+}
+
+// getAllAppConfigs fetches all app configurations from the KV store
+func (nr *NodeRunner) getAllAppConfigs(ctx context.Context) map[string]*ServiceSpec {
+	configs := make(map[string]*ServiceSpec)
+	lister, err := nr.kvAppConfigs.ListKeys(ctx)
+	if err != nil {
+		return configs
+	}
+	defer lister.Stop()
+
+	for k := range lister.Keys() {
+		entry, err := nr.kvAppConfigs.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		spec, err := ParseServiceSpec(entry.Value())
+		if err == nil {
+			configs[k] = spec
+		}
+	}
+	return configs
+}
+
+// getAllSchedules fetches all app schedules from the KV store
+func (nr *NodeRunner) getAllSchedules(ctx context.Context) map[string]*AppSchedule {
+	schedules := make(map[string]*AppSchedule)
+	lister, err := nr.kvAppScheds.ListKeys(ctx)
+	if err != nil {
+		return schedules
+	}
+	defer lister.Stop()
+
+	for k := range lister.Keys() {
+		entry, err := nr.kvAppScheds.Get(ctx, k)
+		if err != nil {
+			continue
+		}
+		var sched AppSchedule
+		if err := json.Unmarshal(entry.Value(), &sched); err == nil {
+			schedules[k] = &sched
+		}
+	}
+	return schedules
+}
+
+// countOnlineNodes returns the number of nodes that are currently online
+func countOnlineNodes(nodes map[string]*NodeState) int {
+	count := 0
+	for _, node := range nodes {
+		if time.Since(node.LastSeen) <= NodeStateKVTTL {
+			count++
+		}
+	}
+	return count
 }
 
 // heartbeatLoop periodically updates the node's state in the KV store.
@@ -713,13 +1009,13 @@ func (nr *NodeRunner) updateNodeState(status string) error {
 // syncAllApps gets all current configurations and ensures apps are running.
 func (nr *NodeRunner) syncAllApps(ctx context.Context) error {
 	nr.logger.Info("Performing initial synchronization of all applications...")
-	keysLister, err := nr.kvAppConfigs.ListKeys(ctx)
+	keysLister, err := nr.kvAppScheds.ListKeys(ctx)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrNoKeysFound) {
 			nr.logger.Info("No existing app configurations found in KV store.")
 			return nil
 		}
-		return fmt.Errorf("failed to start listing keys from KV store '%s': %w", AppConfigKVBucket, err)
+		return fmt.Errorf("failed to start listing keys from KV store '%s': %w", AppSchedulesKVBucket, err)
 	}
 	defer keysLister.Stop()
 
@@ -758,12 +1054,12 @@ syncLoop:
 				entryCtx, entryCancel := context.WithTimeout(ctx, 20*time.Second) // Shorter timeout for individual GET
 				defer entryCancel()
 
-				entry, getErr := nr.kvAppConfigs.Get(entryCtx, k)
+				entry, getErr := nr.kvAppScheds.Get(entryCtx, k)
 				if getErr != nil {
 					if errors.Is(getErr, jetstream.ErrKeyNotFound) {
 						// This case should be rare if ListKeys is consistent, but handle defensively
 						nr.logger.Warn("App config key disappeared during sync, treating as deleted", "key", k)
-						nr.handleAppConfigUpdate(entryCtx, &simulatedDeleteEntry{key: k, bucket: AppConfigKVBucket})
+						nr.handleAppScheduleUpdate(entryCtx, &simulatedDeleteEntry{key: k, bucket: AppSchedulesKVBucket})
 					} else {
 						nr.logger.Error("Failed to get KV entry during sync", "key", k, "error", getErr)
 						select {
@@ -773,7 +1069,7 @@ syncLoop:
 					}
 					return
 				}
-				nr.handleAppConfigUpdate(entryCtx, entry) // Process the update
+				nr.handleAppScheduleUpdate(entryCtx, entry)
 			}(key)
 		}
 	}
@@ -812,6 +1108,157 @@ syncLoop:
 	nr.logger.Info("App pruning complete.")
 
 	return nil
+}
+
+// handleAppScheduleUpdate processes a schedule KV entry update.
+func (nr *NodeRunner) handleAppScheduleUpdate(ctx context.Context, entry jetstream.KeyValueEntry) {
+	if entry.Bucket() != AppSchedulesKVBucket {
+		return
+	}
+	appName := entry.Key()
+	logger := nr.logger.With("app", appName)
+	if entry.Operation() != jetstream.KeyValueDelete && entry.Operation() != jetstream.KeyValuePurge {
+		logger = logger.With("kv_revision", entry.Revision())
+	}
+	logger = logger.With("kv_operation", entry.Operation().String())
+
+	appInfo := nr.state.GetAppInfo(appName)
+	appInfo.mu.Lock()
+	defer appInfo.mu.Unlock()
+
+	// Helper function for quick cleanup
+	cleanupApp := func() {
+		instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+		nr.stopAllInstancesForApp(ctx, appInfo, logger)
+		for _, inst := range instancesToCleanup {
+			nr.cleanupInstanceMetrics(inst)
+		}
+		appInfo.spec = nil
+		appInfo.configHash = ""
+		appInfo.instances = make([]*ManagedApp, 0)
+		nr.state.DeleteApp(appName)
+	}
+
+	if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
+		logger.Info("Processing schedule delete/purge request")
+		cleanupApp()
+		return
+	}
+
+	// 1. Parse the Schedule
+	var schedule AppSchedule
+	if err := json.Unmarshal(entry.Value(), &schedule); err != nil {
+		logger.Error("Failed to parse schedule", "error", err)
+		cleanupApp()
+		return
+	}
+
+	// 2. See how many replicas WE are assigned
+	targetReplicas := schedule.Assignments[nr.nodeID]
+
+	// 2b. Log if we have pending replicas (offline targeted nodes)
+	if len(schedule.Pending) > 0 {
+		logger.Warn("Schedule has pending replicas (waiting for offline nodes)", "pending", schedule.Pending)
+	}
+
+	// 3. Fetch the actual Configuration (Spec) for this App
+	configEntry, err := nr.kvAppConfigs.Get(ctx, appName)
+	if err != nil {
+		logger.Error("Failed to fetch app config for schedule", "error", err)
+		cleanupApp()
+		return
+	}
+
+	spec, err := ParseServiceSpec(configEntry.Value())
+	if err != nil {
+		logger.Error("Failed to parse service spec from KV", "error", err)
+		cleanupApp()
+		return
+	}
+
+	newConfigHash, err := calculateSpecHash(spec)
+	if err != nil {
+		logger.Error("Failed to hash service spec", "error", err)
+		cleanupApp()
+		return
+	}
+
+	// Update spec and hash in appInfo
+	configHashChanged := appInfo.configHash != newConfigHash
+	appInfo.spec = spec
+	appInfo.configHash = newConfigHash
+	currentReplicas := len(appInfo.instances)
+
+	logger.Info("Reconciling instances based on schedule", "target", targetReplicas, "current", currentReplicas, "hash_changed", configHashChanged)
+
+	if configHashChanged {
+		logger.Info("Configuration hash changed, restarting all instances")
+		instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+		nr.stopAllInstancesForApp(ctx, appInfo, logger)
+		for _, inst := range instancesToCleanup {
+			nr.cleanupInstanceMetrics(inst)
+		}
+		appInfo.instances = make([]*ManagedApp, 0, targetReplicas)
+		currentReplicas = 0
+	}
+
+	// Adjust Replicas (Same logic as before)
+	if targetReplicas > currentReplicas {
+		needed := targetReplicas - currentReplicas
+		logger.Info("Scaling up instances", "needed", needed)
+		for range needed {
+			replicaIndex := findNextReplicaIndex(appInfo.instances, targetReplicas)
+			if replicaIndex == -1 {
+				break
+			}
+			if err := nr.startAppInstance(ctx, appInfo, replicaIndex); err != nil {
+				logger.Error("Failed to start new instance during scale up", "error", err)
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	} else if targetReplicas < currentReplicas {
+		excess := currentReplicas - targetReplicas
+		logger.Info("Scaling down instances", "excess", excess)
+		sortedInstances := append([]*ManagedApp{}, appInfo.instances...)
+		sort.Slice(sortedInstances, func(i, j int) bool {
+			return extractReplicaIndex(sortedInstances[i].InstanceID) > extractReplicaIndex(sortedInstances[j].InstanceID)
+		})
+
+		instancesToStop := sortedInstances
+		if excess <= len(sortedInstances) {
+			instancesToStop = sortedInstances[:excess]
+		}
+
+		remainingInstancesMap := make(map[string]*ManagedApp)
+		for _, inst := range appInfo.instances {
+			remainingInstancesMap[inst.InstanceID] = inst
+		}
+
+		for _, instToStop := range instancesToStop {
+			logger.Info("Stopping excess instance", "instance_id", instToStop.InstanceID)
+			if err := nr.stopAppInstance(instToStop, true); err != nil {
+				logger.Error("Error stopping excess instance", "error", err)
+			}
+			nr.cleanupInstanceMetrics(instToStop)
+			delete(remainingInstancesMap, instToStop.InstanceID)
+		}
+
+		newInstancesSlice := make([]*ManagedApp, 0, len(remainingInstancesMap))
+		for _, inst := range remainingInstancesMap {
+			newInstancesSlice = append(newInstancesSlice, inst)
+		}
+		appInfo.instances = newInstancesSlice
+	} else if targetReplicas == 0 {
+		if len(appInfo.instances) > 0 {
+			instancesToCleanup := append([]*ManagedApp{}, appInfo.instances...)
+			nr.stopAllInstancesForApp(ctx, appInfo, logger)
+			for _, inst := range instancesToCleanup {
+				nr.cleanupInstanceMetrics(inst)
+			}
+			appInfo.instances = make([]*ManagedApp, 0)
+		}
+	}
 }
 
 // handleAppConfigUpdate processes a single KV entry update (PUT or DELETE).
@@ -900,7 +1347,7 @@ func (nr *NodeRunner) handleAppConfigUpdate(ctx context.Context, entry jetstream
 		if targetReplicas > currentReplicas {
 			needed := targetReplicas - currentReplicas
 			logger.Info("Scaling up instances", "needed", needed)
-			for i := 0; i < needed; i++ {
+			for range needed {
 				replicaIndex := findNextReplicaIndex(appInfo.instances, targetReplicas)
 				if replicaIndex == -1 {
 					logger.Error("Could not find available replica index slot", "target", targetReplicas, "current_count", len(appInfo.instances))
@@ -1186,7 +1633,7 @@ func findNextReplicaIndex(currentInstances []*ManagedApp, targetReplicas int) in
 			usedIndices[idx] = true
 		}
 	}
-	for i := 0; i < targetReplicas; i++ {
+	for i := range targetReplicas {
 		if !usedIndices[i] {
 			return i
 		}

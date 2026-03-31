@@ -59,6 +59,65 @@ You can either provide a full `ServiceSpec` configuration file (`-config`) or sp
       - name: node-arm64
         replicas: 2
     ```
+
+`replicas: count` can be defined at the root level instead, letting the scheduler decide where to deploy the app.
+
+## Scheduling Modes
+
+Narun supports multiple scheduling modes for deploying applications:
+
+### 1. Global Replicas (Balanced)
+Set `replicas` at the root level to have the scheduler distribute instances across all healthy nodes:
+```yaml
+name: my-app
+tag: v1
+replicas: 3  # Balanced across all healthy nodes
+```
+
+### 2. Explicit Node Targeting (Pinned)
+Pin replicas to specific nodes using the `nodes` field with non-empty names:
+```yaml
+name: my-app
+tag: v1
+nodes:
+  - name: node-A
+    replicas: 2  # Always runs on node-A
+  - name: node-B
+    replicas: 1  # Always runs on node-B
+```
+
+### 3. Empty Name (Balanced via Nodes)
+Use an empty name in the `nodes` field to add balanced replicas:
+```yaml
+name: my-app
+tag: v1
+nodes:
+  - name: ""
+    replicas: 3  # Balanced across all healthy nodes
+```
+
+### 4. Hybrid Scheduling
+Combine pinned and balanced replicas:
+```yaml
+name: my-app
+tag: v1
+replicas: 2           # 2 balanced replicas
+nodes:
+  - name: node-A
+    replicas: 2       # 2 pinned to node-A
+  - name: ""
+    replicas: 3       # 3 additional balanced replicas
+# Total: 2 (pinned) + 5 (balanced = 2 + 3)
+```
+
+### Node Failure Behavior
+
+When a node goes offline:
+
+- **Balanced replicas**: Automatically redistributed to remaining healthy nodes
+- **Pinned replicas** (explicit node name): Marked as "pending" and wait for the node to return. An error is logged.
+
+When the offline node comes back online, its pending replicas are automatically assigned.
 2.  **Build binaries:**
     ```bash
     GOOS=linux GOARCH=amd64 go build -o ./hello-linux-amd64 ./my-app-src
